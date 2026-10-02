@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>ALEXIAI · Omni edition</title>
+<link rel="manifest" href="/app.webmanifest">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<header class="masthead">
+  <h1 class="wordmark">ALEXIAI<span class="heart">&lt;3</span></h1>
+  <p class="edition">Omni edition · GAIA-MLX-QUANT · fully offline</p>
+  <div class="field" id="field" aria-live="polite"></div>
+</header>
+
+<main>
+  <section class="panel" id="panel-transcript">
+    <div id="transcript" class="transcript">
+      <p class="empty">The field is folded. Say something.</p>
+    </div>
+
+    <form id="composer" class="composer">
+      <label class="sr-only" for="prompt">Prompt</label>
+      <textarea id="prompt" rows="3" placeholder="ask the local model…" autocomplete="off" spellcheck="false"></textarea>
+      <button type="submit" id="send">send</button>
+    </form>
+  </section>
+
+  <aside class="panel side">
+    <div class="block">
+      <h2>sovereignty</h2>
+      <dl id="sovereignty"><dd class="pending">checking…</dd></dl>
+    </div>
+    <div class="block">
+      <h2>local model</h2>
+      <dl id="models"><dd class="pending">discovering…</dd></dl>
+    </div>
+    <div class="block">
+      <h2>substrate</h2>
+      <dl id="substrate"><dd class="pending">measuring…</dd></dl>
+    </div>
+  </aside>
+</main>
+
+<footer>
+  <span>no third-party LLM usage · no CDN · no telemetry</span>
+  <span class="sign">the field holds · vaked.dev</span>
+</footer>
+
+<script src="/app.js" type="module"></script>
+</body>
+</html>

@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="ALEXIAI">
+  <defs>
+    <radialGradient id="g" cx="50%" cy="42%" r="62%">
+      <stop offset="0%" stop-color="#1a2033"/>
+      <stop offset="100%" stop-color="#07080c"/>
+    </radialGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#g)"/>
+  <g fill="none" stroke="#ff5c8a" stroke-width="9" stroke-linecap="round">
+    <circle cx="256" cy="256" r="132" opacity=".28"/>
+    <circle cx="256" cy="256" r="92" opacity=".5"/>
+  </g>
+  <text x="256" y="292" text-anchor="middle"
+        font-family="Helvetica Neue, Inter, system-ui, sans-serif"
+        font-size="150" font-weight="800" letter-spacing="-6" fill="#dfe3ee">A</text>
+  <text x="256" y="404" text-anchor="middle"
+        font-family="ui-monospace, Menlo, monospace"
+        font-size="44" fill="#ff5c8a">&lt;3</text>
+</svg>

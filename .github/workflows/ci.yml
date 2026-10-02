@@ -1,0 +1,21 @@
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: test
+        run: node --test test/*.test.js
+      - name: cli smoke
+        run: |
+          node src/cli.js gaia "hello"
+          node src/cli.js bench --dim 64
