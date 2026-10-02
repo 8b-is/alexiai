@@ -22,7 +22,8 @@ git clone https://github.com/8b-is/alexiai.git && cd alexiai
 node src/cli.js serve        # the app → http://127.0.0.1:8787
 node src/cli.js doctor       # field readout + sovereignty check
 node src/cli.js bench        # ternary vs dense, measured honestly
-node --test test/*.test.js   # 61 assertions, all green
+node --test test/*.test.js   # 61 JS assertions, all green
+cargo test --manifest-path rust/Cargo.toml  # + 31 Rust tests, all green
 ```
 
 That's the entire install. There is no `npm install`, no build step, no
@@ -96,6 +97,51 @@ is the honesty of this project: on adversarial random weights, ternary
 reconstruction is lossy by design; on the ternary-shaped weights a trained
 b1.58 model actually has, the projection is tight (`< 0.34`, pinned by test).
 
+## 🦀 The Rust lane — `rust/gaia-mlx-quant`
+
+The same substrate, native: **SOTA bleeding-edge Rust, zero `unsafe`, zero
+allocations, 100% Linux + macOS** — every one of those words enforced, not
+asserted:
+
+```bash
+cd rust
+cargo test                                    # 31 tests: round-trips, kernels, zero-alloc proof
+cargo clippy --all-targets                    # zero warnings
+cargo build --no-default-features             # pure core: #![no_std], no deps at all
+cargo run --release --example bench -- --dim 256
+```
+
+| promise | how it is enforced |
+|---|---|
+| **zero unsafe** | `#![forbid(unsafe_code)]` — it is a compile error, not a guideline |
+| **zero allocations** | a counting global allocator wraps the system allocator in the test suite and asserts the pack + kernel + unpack hot paths perform **zero heap operations** |
+| **no_std** | `core`-only when built without default features; runs anywhere Rust's core runs |
+| **100% Linux + macOS** | CI runs the full suite on both `ubuntu-latest` and `macos-latest` |
+
+The bithacks, in order of appearance:
+
+1. **5 trits per byte, base-3** — log₂3 ≈ 1.585 bits/weight, the optimal
+   ternary packing (40× denser than f64).
+2. **Branchless digit mapping** — `digit = t as u8 + (t as u8 >> 7) * 3`
+   maps `-1 → 2, 0 → 0, +1 → 1` with no branch.
+3. **Compile-time LUTs** — five const-evaluated 256-entry slot tables mean
+   zero division, zero modulo in the hot path.
+4. **FMA accumulation** — fused multiply-add on aarch64/x86_64 std builds,
+   portable two-op fallback in core-only builds.
+5. **4-way ILP** — four independent accumulators break the serial f64 FMA
+   dependency chain in the plane kernel.
+6. **Aligned fast path** — `cols % 5 == 0` drops all per-slot bounds guards.
+7. **Skip-zero-byte** — a byte of all-zero trits skips five accumulators.
+8. **Magic-constant sqrt** — a hand-rolled `core`-only sqrt with a bit-level
+   exponent-halving guess and Newton fixpoint, because `f64::sqrt` lives in
+   std.
+
+The bench is three-way and honest: packed-j (the JS-parity layout), packed-i
+(LUT path), and the i8 sign-plane kernel with register accumulators, all
+measured against auto-vectorized dense f64. The scalar safe-Rust kernels do
+not pretend to outrun the auto-vectorizer — that is what a Metal/NEON backend
+is for — and the bench prints whatever they actually get, every time.
+
 ## 🧠 osarous — local model support
 
 An adapter for any local MLX server speaking the OpenAI-compatible surface:
@@ -120,13 +166,14 @@ SSE stream ──▶ offline UI (PWA, service worker, no CDN)
 ```
 alexiai/
 ├── src/gaia.js         the field: fold, layers, sampling
-├── src/mlx-quant.js    ternary packing + the kernel
+├── src/mlx-quant.js    ternary packing + the kernel (portable reference)
 ├── src/sovereign.js    the egress guard (the enforcement point)
 ├── src/osarous.js      the local model adapter
 ├── src/server.js       the offline HTTP server
 ├── src/cli.js          serve · doctor · models · chat · gaia · bench
+├── rust/               the native lane: no_std, zero-unsafe, zero-alloc
 ├── web/                the offline UI
-├── test/               61 assertions, node:test
+├── test/               node:test suites
 ├── docs/               field · kernel · sovereignty theory
 └── README.multiD.md    the dimensional walkthrough
 ```

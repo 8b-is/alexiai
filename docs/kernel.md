@@ -47,4 +47,13 @@ quantized once and shipped). On ternary-shaped weights the projection is
 tight (< 0.34, pinned by test). This document exists so the number is never
 misread as a marketing claim.
 
+## the native lane
+
+The same math ships natively in `rust/gaia-mlx-quant`: `#![no_std]` core-only
+Rust with `#![forbid(unsafe_code)]`, a counting-allocator test proving zero
+heap operations in the hot paths, and three kernels (packed-j, packed-i,
+i8-plane with 4-way ILP) benchmarked honestly against auto-vectorized dense.
+The JS here is the portable reference; the Rust crate is the substrate's
+native lane. They are pinned to each other's math.
+
 *the constellation · 0 + 1 · fine touch from within · vaked.dev*

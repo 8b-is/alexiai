@@ -12,12 +12,16 @@ somewhere in a doc.**
    Do not add an "allowlist of vendors", a proxy escape hatch, or an env var
    that widens the guard. If a future feature genuinely needs remote egress,
    it is a *new module with its own review*, not a widened guard.
-2. **No runtime dependencies.** The server and CLI run on Node stdlib only.
-   Before adding a dependency, prove the stdlib path is impossible.
+2. **No runtime dependencies.** The server and CLI run on Node stdlib only;
+   the Rust crate is `core`-only with `#![forbid(unsafe_code)]` and a
+   counting-allocator test proving zero heap operations in the hot paths.
+   Before adding a dependency, prove the stdlib/core path is impossible.
 3. **Honest benchmarks.** The bench reports the *measured* error of ternary
-   reconstruction, including the worst case. Never cherry-pick the number.
-4. **Tests before push.** `node --test test/*.test.js` must be green; the CLI
-   smoke (`alexiai gaia`, `alexiai bench`) must not crash.
+   reconstruction and the *measured* gap to auto-vectorized dense, including
+   the worst case. Never cherry-pick the number.
+4. **Tests before push.** `node --test test/*.test.js` and
+   `cargo test --manifest-path rust/Cargo.toml` must be green; clippy must be
+   clean; the CLI smoke (`alexiai gaia`, `alexiai bench`) must not crash.
 5. **The README is the ledger's open face.** Every user-visible behavior
    belongs in `README.md`; every dimension belongs in `README.multiD.md`.
 6. **Python, if it ever appears, runs via `uv`** (workspace standard). There
@@ -27,13 +31,14 @@ somewhere in a doc.**
 
 ```
 src/gaia.js        the field — four layers, deterministic fold, sampling
-src/mlx-quant.js   ternary b1.58 packing + the masked kernel (the substrate)
+src/mlx-quant.js   ternary b1.58 packing + the masked kernel (JS reference)
 src/sovereign.js   the loopback-only egress guard (the enforcement point)
 src/osarous.js     local model adapter — OpenAI-compatible, SSE, catalog
 src/server.js      offline HTTP server + API (no CDN, no remote assets)
 src/cli.js         serve · doctor · models · chat · gaia · bench
 web/               the offline UI (PWA, service worker, same-origin only)
 test/              node:test suites pinning all of the above
+rust/              the native substrate: gaia-mlx-quant (no_std core crate)
 docs/              the theory: field, kernel, sovereignty
 examples/          runnable sketches
 ```
@@ -43,7 +48,9 @@ examples/          runnable sketches
 ```bash
 node src/cli.js serve                 # the app on http://127.0.0.1:8787
 node src/cli.js doctor                # field + sovereignty + endpoint health
-node --test test/*.test.js            # the suite
+node --test test/*.test.js            # the JS suite
+cargo test --manifest-path rust/Cargo.toml                 # the Rust suite
+cargo run --release --manifest-path rust/Cargo.toml --example bench -- --dim 256
 ```
 
 ## wire vocabulary (for the constellation)

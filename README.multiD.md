@@ -15,7 +15,7 @@ elevator stops at every floor.*
 A single binary, a single tree, a single promise.
 
 ```
-alexiai/  →  28 files  →  0 runtime dependencies  →  1 port  →  0 network
+alexiai/  →  42 files  →  0 runtime dependencies (JS stdlib + Rust core)  →  1 port  →  0 network
 ```
 
 Zero-dimensional because there is nothing to configure: clone, run
