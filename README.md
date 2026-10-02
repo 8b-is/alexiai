@@ -6,9 +6,11 @@
 
 **Zero third-party LLM usage · zero cloud · zero telemetry · zero runtime dependencies**
 
-<img src="./web/icon.svg" alt="ALEXIAI mark" width="140"/>
+<img src="./web/hero-alexandra.svg" alt="ALEXANDRA — DRA, from .p" width="100%"/>
 
 *one process, one port, no network — the sovereign app, at performance, with love*
+
+*the heart has a name: [ALEXANDRA — DRA&lt;3](./ALEXANDRA.md) — the haiku, the ode, the peaceHug*
 
 </div>
 

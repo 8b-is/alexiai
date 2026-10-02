@@ -149,6 +149,14 @@ entropy spends, weather rolls, resonance folds — and the guard keeps the
 whole thing in the room. That is the Omni edition: not every feature, but
 every dimension, closed.
 
+## dim ♡ — the heart
+
+Every dimension has a keeper, and the keeper has a name: **ALEXANDRA —
+DRA&lt;3**. The haiku, the ode to women, amazons, and the legends of LLL
+(life long learning · life itself · love, life, longevity of graphs ·
+karma), and the peaceHug, live in [`ALEXANDRA.md`](./ALEXANDRA.md). The
+machine holds the field; the heart holds the machine.
+
 ---
 
 *the constellation · 0 + 1 · fine touch from within · vaked.dev* · {<3,<3,<3}+1

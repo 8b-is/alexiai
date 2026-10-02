@@ -1,0 +1,106 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" role="img" aria-label="ALEXANDRA — DRA, from .p">
+  <defs>
+    <radialGradient id="cosmos" cx="50%" cy="38%" r="75%">
+      <stop offset="0%" stop-color="#141a2e"/>
+      <stop offset="55%" stop-color="#0b0e1a"/>
+      <stop offset="100%" stop-color="#05060c"/>
+    </radialGradient>
+    <radialGradient id="aura" cx="50%" cy="58%" r="46%">
+      <stop offset="0%" stop-color="#ff5c8a" stop-opacity=".34"/>
+      <stop offset="55%" stop-color="#ff5c8a" stop-opacity=".08"/>
+      <stop offset="100%" stop-color="#ff5c8a" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="gold" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#ffe9b0"/>
+      <stop offset="45%" stop-color="#f0b45c"/>
+      <stop offset="100%" stop-color="#c9822e"/>
+    </linearGradient>
+    <linearGradient id="word" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="62%" stop-color="#dfe3ee"/>
+      <stop offset="100%" stop-color="#8f97ad"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1200" height="630" fill="url(#cosmos)"/>
+
+  <!-- the graph: constellation nodes, karma edges (cause → effect) -->
+  <g stroke="#2a3350" stroke-width="1" opacity=".55">
+    <line x1="120" y1="470" x2="265" y2="368"/>
+    <line x1="265" y1="368" x2="430" y2="420"/>
+    <line x1="430" y1="420" x2="565" y2="300"/>
+    <line x1="565" y1="300" x2="742" y2="352"/>
+    <line x1="742" y1="352" x2="905" y2="262"/>
+    <line x1="905" y1="262" x2="1080" y2="330"/>
+    <line x1="265" y1="368" x2="430" y2="240"/>
+    <line x1="430" y1="240" x2="565" y2="300"/>
+    <line x1="742" y1="352" x2="905" y2="430"/>
+    <line x1="565" y1="300" x2="742" y2="470"/>
+    <line x1="120" y1="470" x2="430" y2="240"/>
+    <line x1="905" y1="262" x2="1080" y2="470"/>
+  </g>
+  <g fill="#3d4a75">
+    <circle cx="120" cy="470" r="4"/>
+    <circle cx="265" cy="368" r="5"/>
+    <circle cx="430" cy="420" r="4"/>
+    <circle cx="565" cy="300" r="6"/>
+    <circle cx="742" cy="352" r="5"/>
+    <circle cx="905" cy="262" r="4"/>
+    <circle cx="1080" cy="330" r="5"/>
+    <circle cx="430" cy="240" r="4"/>
+    <circle cx="905" cy="430" r="4"/>
+    <circle cx="742" cy="470" r="4"/>
+    <circle cx="1080" cy="470" r="4"/>
+  </g>
+  <g fill="#ff5c8a">
+    <circle cx="565" cy="300" r="2.2"/>
+    <circle cx="742" cy="352" r="2"/>
+    <circle cx="430" cy="240" r="2"/>
+  </g>
+
+  <!-- the aura behind the name -->
+  <ellipse cx="600" cy="300" rx="430" ry="230" fill="url(#aura)"/>
+
+  <!-- the diadem: an amazon crown of ten diamonds -->
+  <g fill="none" stroke="url(#gold)" stroke-width="3" stroke-linejoin="round">
+    <path d="M 380 352 L 420 312 L 460 352 L 500 306 L 540 352 L 580 300 L 620 352 L 660 296 L 700 352 L 740 306 L 780 352 L 820 312 L 860 352"/>
+  </g>
+  <g fill="url(#gold)">
+    <path d="M 420 312 l 18 -18 l 18 18 z" opacity=".9"/>
+    <path d="M 500 306 l 18 -18 l 18 18 z" opacity=".8"/>
+    <path d="M 580 300 l 18 -18 l 18 18 z" opacity="1"/>
+    <path d="M 660 296 l 18 -18 l 18 18 z" opacity="1"/>
+    <path d="M 740 306 l 18 -18 l 18 18 z" opacity=".8"/>
+    <path d="M 380 352 l 18 -18 l 18 18 z" opacity=".7"/>
+    <path d="M 820 312 l 18 -18 l 18 18 z" opacity=".7"/>
+  </g>
+
+  <!-- the φ: golden ratio spiral at the crown's centre -->
+  <g transform="translate(600 208) scale(1.04)" fill="none" stroke="url(#gold)" stroke-width="4" stroke-linecap="round">
+    <path d="M 0 0 C 34 -6 62 16 58 50 C 54 86 22 110 -14 106 C -52 102 -80 74 -76 40 C -72 8 -40 -10 -8 2 C 16 11 30 34 27 55 C 24 76 8 88 -12 87"/>
+  </g>
+
+  <!-- wordmark -->
+  <text x="600" y="452" text-anchor="middle"
+        font-family="Helvetica Neue, Inter, system-ui, sans-serif"
+        font-size="118" font-weight="800" letter-spacing="10" fill="url(#word)">ALEXANDRA</text>
+
+  <text x="600" y="500" text-anchor="middle"
+        font-family="ui-monospace, SF Mono, Menlo, monospace"
+        font-size="30" letter-spacing="14" fill="#ff5c8a">DRA&lt;3 · OMNI EDITION</text>
+
+  <text x="600" y="548" text-anchor="middle"
+        font-family="ui-monospace, SF Mono, Menlo, monospace"
+        font-size="22" letter-spacing="6" fill="#7a8299">from .p — women · amazons · legends of LLL</text>
+
+  <text x="600" y="588" text-anchor="middle"
+        font-family="ui-monospace, SF Mono, Menlo, monospace"
+        font-size="17" letter-spacing="4" fill="#4c5570">life long learning · life itself · love, life, longevity of graphs · karma</text>
+
+  <!-- corner sigil -->
+  <g transform="translate(52 52)" fill="none" stroke="#3d4a75" stroke-width="2">
+    <path d="M 0 20 L 10 0 L 20 20 Z"/>
+    <path d="M 10 0 L 10 34"/>
+    <circle cx="10" cy="42" r="3" fill="#ff5c8a" stroke="none"/>
+  </g>
+</svg>

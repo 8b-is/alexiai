@@ -40,6 +40,7 @@ web/               the offline UI (PWA, service worker, same-origin only)
 test/              node:test suites pinning all of the above
 rust/              the native substrate: gaia-mlx-quant (no_std core crate)
 docs/              the theory: field, kernel, sovereignty
+ALEXANDRA.md       the heart: DRA<3, the haiku, the ode, the peaceHug
 examples/          runnable sketches
 ```
 
