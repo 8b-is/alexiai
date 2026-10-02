@@ -21,34 +21,52 @@
 ```bash
 git clone https://github.com/8b-is/alexiai.git && cd alexiai
 
-node src/cli.js serve        # the app → http://127.0.0.1:8787
-node src/cli.js doctor       # field readout + sovereignty check
-node src/cli.js bench        # ternary vs dense, measured honestly
-node --test test/*.test.js   # 61 JS assertions, all green
-cargo test --manifest-path rust/Cargo.toml  # + 31 Rust tests, all green
+cargo run --release -p alexiai -- serve    # the app → http://127.0.0.1:8787
+cargo run --release -p alexiai -- doctor   # field readout + sovereignty check
+cargo run --release -p alexiai -- bench    # ternary vs dense, measured honestly
+
+# or through the Go glue:
+go run ./golue run                          # build-if-needed + serve
+go run ./golue doctor
 ```
 
-That's the entire install. There is no `npm install`, no build step, no
-runtime dependency — the app **is** Node's standard library plus what ships in
-this tree. Point it at any Apple Silicon MLX server that speaks the
-OpenAI-compatible surface on loopback (`--endpoint http://127.0.0.1:1337`) and
-it is a complete, fully offline assistant.
+That is the entire install. The app is **one static Rust binary** (~540KB)
+with the whole UI embedded at compile time; there is no runtime dependency in
+any lane. Point it at any Apple Silicon MLX server that speaks the
+OpenAI-compatible surface on loopback (`--endpoint http://127.0.0.1:1337`)
+and it is a complete, fully offline assistant.
+
+### the lanes, all speaking one math
+
+```bash
+cargo test --manifest-path rust/Cargo.toml   # 45 Rust tests: core + the app
+go test ./...                                # the Go lane (go/)
+make -C c test                               # C99 + NEON/SSE4.1 asm (c/)
+swift test --package-path swift              # Swift kernel + CoreMIDI (swift/)
+```
+
+| lane | role | guarantees |
+|---|---|---|
+| `rust/` | the app + the core | `#![forbid(unsafe_code)]`, `no_std` core, zero-alloc proven by a counting allocator |
+| `go/` | the glue + a second opinion | stdlib-only supervisor, allocation-lean kernel |
+| `c/` | C99 + inline assembly | NEON (aarch64) and SSE4.1 (x86_64) paths, proven against the C reference |
+| `swift/` | OS-agnostic kernel + macOS CoreMIDI | pure-Swift core runs on Linux; the CoreMIDI lane ports the OpenXTalk-Apple-CoreMIDI surface |
+| `web/` | the offline UI | embedded in the binary; no CDN, no remote asset |
 
 ## 🔒 The Guarantee (enforced, not promised)
 
 > **Inference never leaves this machine.**
 
-This is not a policy note. `src/sovereign.js` is an execution point: it wraps
-`fetch` process-wide and rejects any request whose host is not loopback,
+This is not a policy note. `rust/alexiai/src/sovereign.rs` is an execution
+point: the transport validates the host against the loopback vocabulary
 *before a socket opens*. There is no vendor allowlist, no env-var escape
 hatch, no "but this one is fine". Loopback or nothing.
 
 ```bash
-$ node src/cli.js doctor
+$ cargo run --release -p alexiai -- doctor
   sovereignty
     policy     inference never leaves this machine
-    guard      installed            # while the app runs
-    loopback   127.0.0.1, ::1, localhost, ...
+    loopback   localhost, 127.0.0.1, ::1, ...
 
   local model
     endpoint   http://127.0.0.1:1337
@@ -88,7 +106,7 @@ with per-row absmean scales — the scheme real b1.58 models train into
 columns never drift; the packing round-trips exactly, pinned by tests.
 
 ```bash
-$ node src/cli.js bench --dim 256
+$ cargo run --release -p alexiai -- bench --dim 256
 bitsPerWeight   1.5850
 compression     20.18× vs float32
 relativeError   0.36   # honest number — random projections are the worst case
@@ -167,16 +185,14 @@ SSE stream ──▶ offline UI (PWA, service worker, no CDN)
 
 ```
 alexiai/
-├── src/gaia.js         the field: fold, layers, sampling
-├── src/mlx-quant.js    ternary packing + the kernel (portable reference)
-├── src/sovereign.js    the egress guard (the enforcement point)
-├── src/osarous.js      the local model adapter
-├── src/server.js       the offline HTTP server
-├── src/cli.js          serve · doctor · models · chat · gaia · bench
-├── rust/               the native lane: no_std, zero-unsafe, zero-alloc
-├── web/                the offline UI
-├── test/               node:test suites
-├── docs/               field · kernel · sovereignty theory
+├── rust/               the app (one static binary) + the no_std core
+│   ├── gaia-mlx-quant/   the substrate: ternary b1.58, zero-unsafe, zero-alloc
+│   └── alexiai/          serve · doctor · models · chat · gaia · bench, UI embedded
+├── go/                 the glue (golue supervisor) + the Go-native kernel
+├── c/                  C99 + NEON/SSE4.1 assembly, proven against the C reference
+├── swift/              OS-agnostic Swift kernel + the macOS CoreMIDI lane
+├── web/                the offline UI (embedded at compile time, no CDN)
+├── docs/               field · kernel · sovereignty · catalog alignment
 └── README.multiD.md    the dimensional walkthrough
 ```
 
@@ -203,7 +219,8 @@ second is the stairs.
 
 ```bash
 git clone https://github.com/8b-is/alexiai.git
-node --test test/*.test.js     # green before anything else
+cargo test --workspace           # green before anything else
+go test ./... && make -C c test && swift test --package-path swift
 ```
 
 Rules live in `AGENTS.md`. The one rule above all: **loopback or nothing.**

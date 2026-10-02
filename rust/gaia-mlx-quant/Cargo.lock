@@ -3,12 +3,5 @@
 version = 4
 
 [[package]]
-name = "alexiai"
-version = "0.1.0"
-dependencies = [
- "gaia-mlx-quant",
-]
-
-[[package]]
 name = "gaia-mlx-quant"
 version = "0.1.0"

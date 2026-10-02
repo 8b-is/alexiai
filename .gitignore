@@ -7,3 +7,6 @@ coverage/
 
 # rust
 target/
+c/test_kernel
+.swiftpm/
+swift/.build/

@@ -28,6 +28,11 @@
 
 use crate::pack::{POW3, T0, T1, T2, T3, T4, TRITS_PER_BYTE, digit_of};
 
+#[cfg(feature = "std")]
+use alloc::vec;
+#[cfg(feature = "std")]
+use alloc::vec::Vec;
+
 /// Fused multiply-add when std provides it; the portable fallback otherwise.
 /// On aarch64 and x86_64 std builds, `a.mul_add(b, c)` compiles to a single
 /// fused instruction; the `core`-only build keeps the portable two-op form.
@@ -341,6 +346,68 @@ pub fn ternary_matmul_planes_i(
             j += 1;
         }
         *slot = (acc0 + acc1 + acc2 + acc3) * gamma;
+    }
+}
+
+/// Absmean ternary quantization result.
+#[cfg(feature = "std")]
+#[derive(Debug, Clone)]
+pub struct Quantized {
+    pub trits: Vec<i8>,
+    pub scales: Option<Vec<f64>>,
+    pub gamma: f64,
+}
+
+/// Quantize a row-major weight matrix to `{-1, 0, +1}` trits with per-row
+/// absmean scales — the scheme real b1.58 models are trained into via the
+/// straight-through estimator. Without a shape, a single global scale is used.
+#[cfg(feature = "std")]
+pub fn quantize_ternary(weights: &[f64], rows: Option<usize>, cols: Option<usize>) -> Quantized {
+    let n = weights.len();
+    let mut trits = vec![0i8; n];
+
+    fn quantize(v: f64, scale: f64) -> i8 {
+        let q = (v / scale).round();
+        if q > 0.0 {
+            1
+        } else if q < 0.0 {
+            -1
+        } else {
+            0
+        }
+    }
+
+    if let (Some(rows), Some(cols)) = (rows, cols)
+        && rows * cols == n
+        && rows > 0
+        && cols > 0
+    {
+        let mut scales = vec![0f64; rows];
+        for r in 0..rows {
+            let row = &weights[r * cols..(r + 1) * cols];
+            let mean: f64 = row.iter().map(|v| v.abs()).sum::<f64>() / cols as f64;
+            let scale = if mean == 0.0 { 1.0 } else { mean };
+            scales[r] = scale;
+            for c in 0..cols {
+                trits[r * cols + c] = quantize(row[c], scale);
+            }
+        }
+        return Quantized {
+            trits,
+            scales: Some(scales),
+            gamma: 1.0,
+        };
+    }
+
+    let mean: f64 = weights.iter().map(|v| v.abs()).sum::<f64>() / n.max(1) as f64;
+    let scale = if mean == 0.0 { 1.0 } else { mean };
+    for (i, &v) in weights.iter().enumerate() {
+        trits[i] = quantize(v, scale);
+    }
+    Quantized {
+        trits,
+        scales: None,
+        gamma: 1.0,
     }
 }
 

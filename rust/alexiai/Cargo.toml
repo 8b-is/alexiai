@@ -1,0 +1,15 @@
+[package]
+name = "alexiai"
+version = "0.1.0"
+edition = "2024"
+description = "ALEXIAI <3 Omni edition — the fully offline sovereign app, one static Rust binary"
+license = "MIT"
+repository = "https://github.com/8b-is/alexiai"
+authors = ["Peter Lodri <peter@vaked.dev>", "the 8b-is constellation"]
+
+[[bin]]
+name = "alexiai"
+path = "src/main.rs"
+
+[dependencies]
+gaia-mlx-quant = { path = "../gaia-mlx-quant" }

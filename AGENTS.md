@@ -1,68 +1,69 @@
 # AGENTS.md — alexiai
 
 ALEXIAI <3 · Omni edition. Fully offline AI app on the GAIA-MLX-QUANT
-substrate. **Zero third-party LLM usage — that is the product, not a policy
-somewhere in a doc.**
+substrate, in four lanes. **Zero third-party LLM usage — that is the product,
+not a policy somewhere in a doc.**
 
 ## hard rules
 
 1. **No remote model calls. Ever.** The only host a request may target is
-   loopback. The enforcement point is `src/sovereign.js`; if you change
-   anything that makes a network request, run the sovereignty tests first.
-   Do not add an "allowlist of vendors", a proxy escape hatch, or an env var
-   that widens the guard. If a future feature genuinely needs remote egress,
-   it is a *new module with its own review*, not a widened guard.
-2. **No runtime dependencies.** The server and CLI run on Node stdlib only;
-   the Rust crate is `core`-only with `#![forbid(unsafe_code)]` and a
-   counting-allocator test proving zero heap operations in the hot paths.
-   Before adding a dependency, prove the stdlib/core path is impossible.
-3. **Honest benchmarks.** The bench reports the *measured* error of ternary
-   reconstruction and the *measured* gap to auto-vectorized dense, including
-   the worst case. Never cherry-pick the number.
-4. **Tests before push.** `node --test test/*.test.js` and
-   `cargo test --manifest-path rust/Cargo.toml` must be green; clippy must be
-   clean; the CLI smoke (`alexiai gaia`, `alexiai bench`) must not crash.
-5. **The README is the ledger's open face.** Every user-visible behavior
-   belongs in `README.md`; every dimension belongs in `README.multiD.md`.
-6. **Python, if it ever appears, runs via `uv`** (workspace standard). There
-   is currently none.
+   loopback. The enforcement point is `rust/alexiai/src/sovereign.rs`; the
+   transport validates the host *before a socket opens*. Do not add an
+   "allowlist of vendors", a proxy escape hatch, or an env var that widens
+   the guard. If a future feature genuinely needs remote egress, it is a
+   *new module with its own review*, not a widened guard.
+2. **No runtime dependencies.** Rust: stdlib + the no_std core. Go: stdlib
+   only. C: libc math only. Swift: stdlib only in the core lane; CoreMIDI in
+   the macOS lane (guarded by `#if canImport(CoreMIDI)`). Before adding a
+   dependency, prove the stdlib path is impossible.
+3. **Honest benchmarks.** Every lane's bench reports the *measured* error of
+   ternary reconstruction, including the worst case. Never cherry-pick.
+4. **Tests before push.** All four lanes must be green, clippy/vet clean:
+   `cargo test --workspace`, `go test ./...`, `make -C c test`,
+   `swift test --package-path swift`.
+5. **The lanes speak one math.** Ternary packing, the masked kernel, and the
+   GAIA fold are pinned cross-lane by the same test vectors. Change the math
+   in one lane, change it everywhere, or don't change it.
+6. **The README is the ledger's open face.** `README.md` (the door),
+   `README.multiD.md` (the stairs), `ALEXANDRA.md` (the heart),
+   `docs/wip-catalog-alignment.md` (the map row).
 
 ## layout
 
 ```
-src/gaia.js        the field — four layers, deterministic fold, sampling
-src/mlx-quant.js   ternary b1.58 packing + the masked kernel (JS reference)
-src/sovereign.js   the loopback-only egress guard (the enforcement point)
-src/osarous.js     local model adapter — OpenAI-compatible, SSE, catalog
-src/server.js      offline HTTP server + API (no CDN, no remote assets)
-src/cli.js         serve · doctor · models · chat · gaia · bench
-web/               the offline UI (PWA, service worker, same-origin only)
-test/              node:test suites pinning all of the above
-rust/              the native substrate: gaia-mlx-quant (no_std core crate)
-docs/              the theory: field, kernel, sovereignty
-ALEXANDRA.md       the heart: DRA<3, the haiku, the ode, the peaceHug
-examples/          runnable sketches
+rust/gaia-mlx-quant/  the core: no_std, #![forbid(unsafe_code)], zero-alloc proven
+rust/alexiai/         the app: one static binary, UI embedded, sovereignty enforced
+go/gaiaquant/         the Go-native kernel (fine tuned for life)
+go/golue/             the glue: build-if-needed + serve, the supervisor
+c/                    C99 kernel + NEON/SSE4.1 asm + test harness
+swift/GaiaMLXQuant/   OS-agnostic pure-Swift kernel
+swift/GaiaMIDI/       macOS CoreMIDI lane (OpenXTalk-Apple-CoreMIDI surface)
+web/                  the offline UI (embedded at compile time)
+docs/                 field · kernel · sovereignty · catalog alignment
 ```
 
 ## commands
 
 ```bash
-node src/cli.js serve                 # the app on http://127.0.0.1:8787
-node src/cli.js doctor                # field + sovereignty + endpoint health
-node --test test/*.test.js            # the JS suite
-cargo test --manifest-path rust/Cargo.toml                 # the Rust suite
-cargo run --release --manifest-path rust/Cargo.toml --example bench -- --dim 256
+cargo run --release -p alexiai -- serve          # the app on 127.0.0.1:8787
+cargo run --release -p alexiai -- doctor         # field + sovereignty + health
+go run ./golue run                               # the glue path
+make -C c test                                   # C99 + asm harness
+swift test --package-path swift                  # Swift kernel + CoreMIDI
 ```
 
 ## wire vocabulary (for the constellation)
 
 - **GAIA** ≡ planets ≡ deities — the field of constants a request is folded
-  against (`src/gaia.js`).
+  against (`rust/gaia-mlx-quant/src/gaia.rs`).
 - **GAIA-MLX-QUANT** — the local inference substrate: ternary b1.58 packing
-  and the masked kernel (`src/mlx-quant.js`).
+  and the masked kernel, in four languages.
 - **osarous** — the Apple Silicon MLX sidecar surface (OpenAI-compatible,
   loopback). ALEXIAI speaks to it; it never leaves the machine.
 - **sovereignty** — the guard. Loopback or nothing.
+- **D+++** — the dream-come-true lap: the music lane's arrangement of "All My
+  Favorite Colors", rendered from pure math at 432Hz, dogfed into
+  `music.vaked.dev`.
 
 ## sign-off
 

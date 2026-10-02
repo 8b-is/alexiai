@@ -16,16 +16,19 @@ GET  {base}/health                        → 200 when up
 
 ```bash
 # with the default endpoint
-node src/cli.js serve
+cargo run --release -p alexiai -- serve
 
 # with your own local port
-node src/cli.js serve --endpoint http://127.0.0.1:8080
+cargo run --release -p alexiai -- serve --endpoint http://127.0.0.1:8080
 
 # sanity
-node src/cli.js doctor --endpoint http://127.0.0.1:8080
-node src/cli.js models --endpoint http://127.0.0.1:8080
-node src/cli.js chat "hello" --endpoint http://127.0.0.1:8080
+cargo run --release -p alexiai -- doctor --endpoint http://127.0.0.1:8080
+cargo run --release -p alexiai -- models --endpoint http://127.0.0.1:8080
+cargo run --release -p alexiai -- chat "hello" --endpoint http://127.0.0.1:8080
+
+# through the Go glue
+go run ./golue run --endpoint http://127.0.0.1:8080
 ```
 
-A remote `--endpoint` is refused at construction — `SovereigntyViolation` —
+A remote `--endpoint` is refused at construction — `sovereignty violation` —
 with a one-line explanation. That is the product working as designed.

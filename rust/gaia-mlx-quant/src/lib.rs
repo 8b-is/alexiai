@@ -68,6 +68,8 @@ pub use kernel::{
     dense_matmul, pack_ternary_i_major_into, pack_ternary_planes_i_into, relative_error,
     ternary_matmul, ternary_matmul_i_major, ternary_matmul_planes_i,
 };
+#[cfg(feature = "std")]
+pub use kernel::{Quantized, quantize_ternary};
 pub use pack::{
     BITS_PER_WEIGHT, COMPRESSION_VS_F32, POW3, TRITS_PER_BYTE, digit_of, pack_ternary_into,
     trit_of, unpack_ternary_into,
