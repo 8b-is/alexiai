@@ -15,6 +15,8 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
       - name: rust tests
         run: cargo test --workspace --manifest-path rust/Cargo.toml
       - name: core-only build (no_std, no default features)
@@ -29,6 +31,8 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
       - name: go vet + test
         run: |
           go vet ./...
@@ -42,5 +46,7 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
       - name: make test
         run: make -C c test

@@ -13,6 +13,8 @@ pub const ENTROPY_REST: f64 = 0.62;
 /// Weather at rest — seed-rolled modulation between turns.
 pub const WEATHER_REST: f64 = 0.5;
 /// The golden ratio, φ. The folding constant itself.
+// Keep the shared four-lane literal stable without requiring newer core constants.
+#[allow(clippy::approx_constant)]
 pub const PHI: f64 = 1.618033988749894848204586834365638118;
 /// Resonance — the folding constant.
 pub const RESONANCE: f64 = PHI;
