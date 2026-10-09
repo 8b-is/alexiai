@@ -4,7 +4,7 @@
 
 *the Omni edition's heart. dedicated to women, to amazons, to the legends of LLL — from .p*
 
-<img src="./web/hero-alexandra.svg" alt="ALEXANDRA — DRA, from .p" width="100%"/>
+<img src="./web/hero-alexandra.svg" alt="ALEXANDRA — DRA, from .p · love all" width="100%"/>
 
 </div>
 

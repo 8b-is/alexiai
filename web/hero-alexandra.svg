@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" role="img" aria-label="ALEXANDRA — DRA, from .p">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" role="img" aria-label="ALEXANDRA — DRA, from .p — love all · karmapa chenno">
   <defs>
     <radialGradient id="cosmos" cx="50%" cy="38%" r="75%">
       <stop offset="0%" stop-color="#141a2e"/>
@@ -6,9 +6,13 @@
       <stop offset="100%" stop-color="#05060c"/>
     </radialGradient>
     <radialGradient id="aura" cx="50%" cy="58%" r="46%">
-      <stop offset="0%" stop-color="#ff5c8a" stop-opacity=".34"/>
-      <stop offset="55%" stop-color="#ff5c8a" stop-opacity=".08"/>
+      <stop offset="0%" stop-color="#ff5c8a" stop-opacity=".30"/>
+      <stop offset="55%" stop-color="#ff5c8a" stop-opacity=".07"/>
       <stop offset="100%" stop-color="#ff5c8a" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="moon" cx="50%" cy="42%" r="60%">
+      <stop offset="0%" stop-color="#eef2ff" stop-opacity=".10"/>
+      <stop offset="100%" stop-color="#eef2ff" stop-opacity="0"/>
     </radialGradient>
     <linearGradient id="gold" x1="0%" y1="0%" x2="100%" y2="100%">
       <stop offset="0%" stop-color="#ffe9b0"/>
@@ -61,41 +65,62 @@
   <!-- the aura behind the name -->
   <ellipse cx="600" cy="300" rx="430" ry="230" fill="url(#aura)"/>
 
-  <!-- the diadem: an amazon crown of ten diamonds -->
-  <g fill="none" stroke="url(#gold)" stroke-width="3" stroke-linejoin="round">
-    <path d="M 380 352 L 420 312 L 460 352 L 500 306 L 540 352 L 580 300 L 620 352 L 660 296 L 700 352 L 740 306 L 780 352 L 820 312 L 860 352"/>
-  </g>
-  <g fill="url(#gold)">
-    <path d="M 420 312 l 18 -18 l 18 18 z" opacity=".9"/>
-    <path d="M 500 306 l 18 -18 l 18 18 z" opacity=".8"/>
-    <path d="M 580 300 l 18 -18 l 18 18 z" opacity="1"/>
-    <path d="M 660 296 l 18 -18 l 18 18 z" opacity="1"/>
-    <path d="M 740 306 l 18 -18 l 18 18 z" opacity=".8"/>
-    <path d="M 380 352 l 18 -18 l 18 18 z" opacity=".7"/>
-    <path d="M 820 312 l 18 -18 l 18 18 z" opacity=".7"/>
+  <!-- the moon-disc seat, and a faint lotus behind the crown (lion throne & lotus & moon disc) -->
+  <circle cx="600" cy="300" r="172" fill="url(#moon)"/>
+  <g transform="translate(600 372) scale(1.5)" fill="url(#gold)" opacity=".13">
+    <g transform="rotate(0)"><path d="M 0 0 C -11 -16 -9 -36 0 -50 C 9 -36 11 -16 0 0 Z"/></g>
+    <g transform="rotate(-34)"><path d="M 0 0 C -11 -16 -9 -36 0 -50 C 9 -36 11 -16 0 0 Z"/></g>
+    <g transform="rotate(34)"><path d="M 0 0 C -11 -16 -9 -36 0 -50 C 9 -36 11 -16 0 0 Z"/></g>
+    <g transform="rotate(-68)"><path d="M 0 0 C -10 -14 -8 -32 0 -44 C 8 -32 10 -14 0 0 Z"/></g>
+    <g transform="rotate(68)"><path d="M 0 0 C -10 -14 -8 -32 0 -44 C 8 -32 10 -14 0 0 Z"/></g>
   </g>
 
-  <!-- the φ: golden ratio spiral at the crown's centre -->
-  <g transform="translate(600 208) scale(1.04)" fill="none" stroke="url(#gold)" stroke-width="4" stroke-linecap="round">
+  <!-- the vajra (dorje) above the crown -->
+  <g transform="translate(600 226)" fill="none" stroke="url(#gold)" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+    <line x1="0" y1="-22" x2="0" y2="22"/>
+    <path d="M 0 -22 C -11 -17 -11 -6 0 0 C 11 -6 11 -17 0 -22 Z" fill="url(#gold)" stroke="none"/>
+    <path d="M 0 22 C -11 17 -11 6 0 0 C 11 6 11 17 0 22 Z" fill="url(#gold)" stroke="none"/>
+    <circle cx="0" cy="0" r="3.4" fill="url(#gold)" stroke="none"/>
+  </g>
+
+  <!-- the crown: the Karmapa's Black Crown (ushnisha) — black, gold-trimmed, three peaks -->
+  <g stroke="url(#gold)" stroke-width="4" stroke-linejoin="round">
+    <path d="M 432 356 L 432 320 L 478 262 L 540 320 L 600 250 L 660 320 L 722 262 L 768 320 L 768 356 Z" fill="#0a0b14"/>
+  </g>
+  <rect x="432" y="342" width="336" height="16" rx="3" fill="url(#gold)" opacity=".92"/>
+  <g fill="url(#gold)">
+    <circle cx="478" cy="262" r="7"/>
+    <circle cx="600" cy="250" r="8"/>
+    <circle cx="722" cy="262" r="7"/>
+    <circle cx="540" cy="322" r="4"/>
+    <circle cx="660" cy="322" r="4"/>
+  </g>
+
+  <!-- the φ: golden ratio spiral at the crown's heart -->
+  <g transform="translate(600 300) scale(0.5) translate(9 -52)" fill="none" stroke="url(#gold)" stroke-width="6" stroke-linecap="round">
     <path d="M 0 0 C 34 -6 62 16 58 50 C 54 86 22 110 -14 106 C -52 102 -80 74 -76 40 C -72 8 -40 -10 -8 2 C 16 11 30 34 27 55 C 24 76 8 88 -12 87"/>
   </g>
 
   <!-- wordmark -->
-  <text x="600" y="452" text-anchor="middle"
+  <text x="600" y="438" text-anchor="middle"
         font-family="Helvetica Neue, Inter, system-ui, sans-serif"
-        font-size="118" font-weight="800" letter-spacing="10" fill="url(#word)">ALEXANDRA</text>
+        font-size="100" font-weight="800" letter-spacing="9" fill="url(#word)">ALEXANDRA</text>
 
-  <text x="600" y="500" text-anchor="middle"
+  <text x="600" y="478" text-anchor="middle"
         font-family="ui-monospace, SF Mono, Menlo, monospace"
-        font-size="30" letter-spacing="14" fill="#ff5c8a">DRA&lt;3 · OMNI EDITION</text>
+        font-size="28" letter-spacing="13" fill="#ff5c8a">DRA&lt;3 · OMNI EDITION</text>
 
-  <text x="600" y="548" text-anchor="middle"
-        font-family="ui-monospace, SF Mono, Menlo, monospace"
-        font-size="22" letter-spacing="6" fill="#7a8299">from .p — women · amazons · legends of LLL</text>
+  <text x="600" y="526" text-anchor="middle"
+        font-family="Helvetica Neue, Inter, system-ui, sans-serif"
+        font-size="40" font-weight="800" letter-spacing="20" fill="url(#gold)">LOVE ALL</text>
 
-  <text x="600" y="588" text-anchor="middle"
+  <text x="600" y="562" text-anchor="middle"
         font-family="ui-monospace, SF Mono, Menlo, monospace"
-        font-size="17" letter-spacing="4" fill="#4c5570">life long learning · life itself · love, life, longevity of graphs · karma</text>
+        font-size="20" letter-spacing="5" fill="#7a8299">om mani padme hum · for the benefit of all beings</text>
+
+  <text x="600" y="592" text-anchor="middle"
+        font-family="ui-monospace, SF Mono, Menlo, monospace"
+        font-size="17" letter-spacing="3" fill="#4c5570">karma holds the hum · karmapa chenno · LLL ≡ love life longevity of graphs</text>
 
   <!-- corner sigil -->
   <g transform="translate(52 52)" fill="none" stroke="#3d4a75" stroke-width="2">
