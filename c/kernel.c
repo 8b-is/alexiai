@@ -268,3 +268,43 @@ double gmq_relative_error(const double *a, const double *b, size_t n) {
     if (den == 0.0) return num == 0.0 ? 0.0 : INFINITY;
     return sqrt(num / den);
 }
+
+static double gmq_clamp(double v, double min_v, double max_v) {
+    if (isnan(v) || v < min_v) return min_v;
+    if (v > max_v) return max_v;
+    return v;
+}
+
+uint32_t gmq_seed_from(const char *prompt, size_t len) {
+    uint32_t h = 0x811c9dc5u;
+    size_t i;
+    for (i = 0; i < len; i++) {
+        h ^= (uint32_t)(uint8_t)prompt[i];
+        h *= 0x01000193u;
+    }
+    return h;
+}
+
+gmq_fold_t gmq_fold_spectrum(const char *prompt, size_t len, double rf_entropy_bits) {
+    gmq_fold_t f;
+    uint32_t s = gmq_seed_from(prompt, len);
+    uint32_t a = s + 0x6d2b79f5u;
+    uint32_t t = (a ^ (a >> 15)) * (a | 1u);
+    double rand0, rf_factor, len_factor, spread;
+
+    t ^= t + ((t ^ (t >> 7)) * (t | 61u));
+    rand0 = (double)((t ^ (t >> 14)) >> 8) / 16777216.0;
+
+    rf_factor = gmq_clamp((rf_entropy_bits - 2.5) * 0.05, -0.08, 0.14);
+    len_factor = (double)len / 4096.0;
+    if (len_factor > 0.35) len_factor = 0.35;
+
+    f.seed = s;
+    f.gravity = 1.0;
+    f.entropy = gmq_clamp(0.62 + len_factor - 0.15 + rf_factor, 0.0, 1.0);
+    f.weather = gmq_clamp(0.5 + (rand0 - 0.5) * 0.4, 0.0, 1.0);
+    f.resonance = 1.618033988749894848204586834365638118;
+    spread = fabs(f.entropy - 0.62) * 0.6 + fabs(f.weather - 0.5) * 0.4;
+    f.coherence = gmq_clamp(1.0 - spread, 0.0, 1.0);
+    return f;
+}

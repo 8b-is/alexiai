@@ -42,9 +42,19 @@ impl Osarous {
     }
 
     pub fn health(&self) -> (bool, String) {
+        let (up, detail, _) = self.health_with_latency();
+        (up, detail)
+    }
+
+    pub fn health_with_latency(&self) -> (bool, String, u64) {
+        let t0 = std::time::Instant::now();
         match transport::request(&format!("{}/health", self.base_url), "GET", None) {
-            Ok(resp) => (resp.status == 200, format!("HTTP {}", resp.status)),
-            Err(e) => (false, e),
+            Ok(resp) => (
+                resp.status == 200,
+                format!("HTTP {}", resp.status),
+                t0.elapsed().as_millis() as u64,
+            ),
+            Err(e) => (false, e, t0.elapsed().as_millis() as u64),
         }
     }
 

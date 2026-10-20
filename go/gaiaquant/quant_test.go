@@ -158,3 +158,22 @@ func TestQuantizationProducesLegalTrits(t *testing.T) {
 		t.Fatalf("scales len %d, want %d", len(scales), rows)
 	}
 }
+
+func TestFoldSpectrumModulatesEntropy(t *testing.T) {
+	prompt := "Analyze Shinjuku 2.4GHz Ch 6 saturation, BLE proximity & AirPlay RAOP surface"
+	low := FoldSpectrum(prompt, 0.5, nil)
+	high := FoldSpectrum(prompt, 4.8, nil)
+	if low.Seed != high.Seed {
+		t.Fatalf("seed mismatch: %d vs %d", low.Seed, high.Seed)
+	}
+	if low.Weather != high.Weather {
+		t.Fatalf("weather mismatch: %v vs %v", low.Weather, high.Weather)
+	}
+	if !(high.Entropy > low.Entropy) {
+		t.Fatalf("expected high.Entropy (%v) > low.Entropy (%v)", high.Entropy, low.Entropy)
+	}
+	s := DeriveSampling(high)
+	if s.Temperature < 0.05 || s.Temperature > 1.2 || s.TopK < 20 || s.TopK > 80 {
+		t.Fatalf("sampling out of bounds: %+v", s)
+	}
+}

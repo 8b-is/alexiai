@@ -40,7 +40,9 @@ static ALLOCATOR: Counting = Counting;
 
 #[test]
 fn hot_paths_perform_zero_allocations() {
-    use gaia_mlx_quant::{pack_ternary_into, ternary_matmul, unpack_ternary_into};
+    use gaia_mlx_quant::{
+        fold, fold_spectrum, pack_ternary_into, sampling, ternary_matmul, unpack_ternary_into,
+    };
 
     const ROWS: usize = 64;
     const COLS: usize = 64;
@@ -60,6 +62,8 @@ fn hot_paths_perform_zero_allocations() {
     pack_ternary_into(&trits, &mut packed);
     ternary_matmul(&packed, ROWS, COLS, &x, Some(&scales), 1.0, &mut out);
     unpack_ternary_into(&packed, ROWS * COLS, &mut unpacked);
+    let _ = sampling(&fold("warmup", None));
+    let _ = sampling(&fold_spectrum("warmup", 2.418, None));
 
     // The proof itself. `packed` is zeroed between iterations per the packing
     // contract (the accumulate is `+=`); zeroing is a memset, not an
@@ -70,6 +74,9 @@ fn hot_paths_perform_zero_allocations() {
         pack_ternary_into(&trits, &mut packed);
         ternary_matmul(&packed, ROWS, COLS, &x, Some(&scales), 1.0, &mut out);
         unpack_ternary_into(&packed, ROWS * COLS, &mut unpacked);
+        let f1 = fold("Analyze Shinjuku 2.4GHz Ch 6 saturation", None);
+        let f2 = fold_spectrum("Analyze Shinjuku 2.4GHz Ch 6 saturation", 2.418, None);
+        std::hint::black_box((sampling(&f1), sampling(&f2)));
     }
     let after = ALLOCS.load(Ordering::Relaxed);
 

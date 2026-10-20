@@ -135,6 +135,17 @@ static void test_relative_error(void) {
     CHECK(gmq_relative_error(a, a, 3) == 0.0, "identical vectors must have zero error");
 }
 
+static void test_fold_spectrum(void) {
+    const char *prompt = "Analyze Shinjuku 2.4GHz Ch 6 saturation, BLE proximity & AirPlay RAOP surface";
+    size_t len = strlen(prompt);
+    gmq_fold_t low = gmq_fold_spectrum(prompt, len, 0.5);
+    gmq_fold_t high = gmq_fold_spectrum(prompt, len, 4.8);
+    CHECK(low.seed == high.seed, "fold_spectrum seed must be deterministic");
+    CHECK(low.weather == high.weather, "fold_spectrum weather must be deterministic");
+    CHECK(high.entropy > low.entropy, "fold_spectrum high RF entropy must lift Chaos entropy");
+    CHECK(high.coherence >= 0.0 && high.coherence <= 1.0, "fold_spectrum coherence in [0, 1]");
+}
+
 int main(void) {
     printf("gmq C99 test harness — asm path: %s\n", gmq_uses_asm() ? "compiled in" : "not compiled");
     test_round_trip();
@@ -143,6 +154,7 @@ int main(void) {
     test_kernel_matches_dense();
     test_non_aligned_rows();
     test_relative_error();
+    test_fold_spectrum();
     if (failures) {
         fprintf(stderr, "%d failure(s)\n", failures);
         return 1;

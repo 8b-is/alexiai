@@ -116,6 +116,18 @@ final class KernelTests: XCTestCase {
         // The honest bound: random projections are the worst case.
         XCTAssertLessThan(GaiaMLXQuant.relativeError(ternary, dense), 0.6)
     }
+
+    func testFoldSpectrumModulatesEntropy() {
+        let prompt = "Analyze Shinjuku 2.4GHz Ch 6 saturation, BLE proximity & AirPlay RAOP surface"
+        let low = GaiaMLXQuant.foldSpectrum(prompt, rfEntropyBits: 0.5)
+        let high = GaiaMLXQuant.foldSpectrum(prompt, rfEntropyBits: 4.8)
+        XCTAssertEqual(low.seed, high.seed)
+        XCTAssertEqual(low.weather, high.weather)
+        XCTAssertGreaterThan(high.entropy, low.entropy)
+        let s = GaiaMLXQuant.sampling(high)
+        XCTAssertTrue((0.05...1.2).contains(s.temperature))
+        XCTAssertTrue((20...80).contains(s.topK))
+    }
 }
 #elseif canImport(Testing)
 import Testing
@@ -233,6 +245,18 @@ struct KernelTests {
         var dense = [Double](repeating: 0, count: cols)
         GaiaMLXQuant.denseMatMul(w, rows: rows, cols: cols, x: x, into: &dense)
         #expect(GaiaMLXQuant.relativeError(ternary, dense) < 0.6)
+    }
+
+    @Test func foldSpectrumModulatesEntropy() {
+        let prompt = "Analyze Shinjuku 2.4GHz Ch 6 saturation, BLE proximity & AirPlay RAOP surface"
+        let low = GaiaMLXQuant.foldSpectrum(prompt, rfEntropyBits: 0.5)
+        let high = GaiaMLXQuant.foldSpectrum(prompt, rfEntropyBits: 4.8)
+        #expect(low.seed == high.seed)
+        #expect(low.weather == high.weather)
+        #expect(high.entropy > low.entropy)
+        let s = GaiaMLXQuant.sampling(high)
+        #expect((0.05...1.2).contains(s.temperature))
+        #expect((20...80).contains(s.topK))
     }
 }
 #endif

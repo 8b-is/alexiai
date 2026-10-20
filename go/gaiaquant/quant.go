@@ -187,3 +187,106 @@ const BitsPerWeight = 1.584962500721156
 
 // CompressionVsF64 is the density win over float64.
 const CompressionVsF64 = 64.0 / BitsPerWeight
+
+// GAIA field rest constants.
+const (
+	GravityRest = 1.0
+	EntropyRest = 0.62
+	WeatherRest = 0.5
+	Phi         = 1.618033988749894848204586834365638118
+)
+
+// Fold holds the 4-layer GAIA fold result.
+type Fold struct {
+	Seed      uint32
+	Gravity   float64
+	Entropy   float64
+	Weather   float64
+	Resonance float64
+	Dominant  string
+	Coherence float64
+}
+
+// Sampling holds deterministic sampling parameters derived from a Fold.
+type Sampling struct {
+	Temperature float64
+	TopP        float64
+	TopK        uint32
+	Seed        uint32
+}
+
+// SeedFrom computes 32-bit FNV-1a over UTF-8 prompt bytes.
+func SeedFrom(prompt string) uint32 {
+	var h uint32 = 0x811c9dc5
+	for i := 0; i < len(prompt); i++ {
+		h ^= uint32(prompt[i])
+		h *= 0x01000193
+	}
+	return h
+}
+
+func clamp64(v, minV, maxV float64) float64 {
+	if math.IsNaN(v) || v < minV {
+		return minV
+	}
+	if v > maxV {
+		return maxV
+	}
+	return v
+}
+
+// FoldSpectrum folds a prompt with passive RF Shannon entropy (in bits),
+// matching gaia_mlx_quant::fold_spectrum across the Rust, Swift, C99, and JS lanes.
+func FoldSpectrum(prompt string, rfEntropyBits float64, explicitSeed *uint32) Fold {
+	s := SeedFrom(prompt)
+	if explicitSeed != nil {
+		s = *explicitSeed
+	}
+	a := s + 0x6d2b79f5
+	t := (a ^ (a >> 15)) * (a | 1)
+	t ^= t + ((t ^ (t >> 7)) * (t | 61))
+	rand0 := float64((t^(t>>14))>>8) / 16777216.0
+
+	rfFactor := clamp64((rfEntropyBits-2.5)*0.05, -0.08, 0.14)
+	lenFactor := math.Min(float64(len(prompt))/4096.0, 0.35)
+	entropy := clamp64(EntropyRest+lenFactor-0.15+rfFactor, 0.0, 1.0)
+	weather := clamp64(WeatherRest+(rand0-0.5)*0.4, 0.0, 1.0)
+	gravity := GravityRest
+	resonance := Phi
+
+	dominant := "gravity"
+	best := math.Inf(-1)
+	names := [4]string{"gravity", "entropy", "weather", "resonance"}
+	vals := [4]float64{gravity, entropy, weather, resonance}
+	rests := [4]float64{GravityRest, EntropyRest, WeatherRest, Phi}
+	for i := 0; i < 4; i++ {
+		d := math.Abs(vals[i] - rests[i])
+		if d > best {
+			best = d
+			dominant = names[i]
+		}
+	}
+
+	spread := math.Abs(entropy-EntropyRest)*0.6 + math.Abs(weather-WeatherRest)*0.4
+	coherence := clamp64(1.0-spread, 0.0, 1.0)
+
+	return Fold{
+		Seed:      s,
+		Gravity:   gravity,
+		Entropy:   entropy,
+		Weather:   weather,
+		Resonance: resonance,
+		Dominant:  dominant,
+		Coherence: coherence,
+	}
+}
+
+// DeriveSampling derives sampling parameters from a Fold.
+func DeriveSampling(f Fold) Sampling {
+	return Sampling{
+		Temperature: clamp64(0.15+f.Entropy*1.1, 0.05, 1.2),
+		TopP:        clamp64(0.5+f.Coherence*0.48, 0.5, 0.98),
+		TopK:        uint32(clamp64(20.0+(1.0-f.Coherence)*60.0, 20.0, 80.0) + 0.5),
+		Seed:        f.Seed,
+	}
+}

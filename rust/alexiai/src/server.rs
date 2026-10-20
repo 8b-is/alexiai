@@ -160,13 +160,14 @@ fn handle_connection(mut stream: std::net::TcpStream, adapter: &Osarous) -> Resu
             write_response(&mut stream, 200, "application/json", json.as_bytes())
         }
         ("GET", "/api/health") => {
-            let (up, detail) = adapter.health();
+            let (up, detail, latency_ms) = adapter.health_with_latency();
             let a = attestation();
             let json = format!(
-                r#"{{"ok":{},"endpoint":"{}","detail":"{}","sovereignty":{{"policy":"{}","loopbackHosts":[{}]}}}}"#,
+                r#"{{"ok":{},"endpoint":"{}","detail":"{}","latencyMs":{},"sovereignty":{{"policy":"{}","installed":true,"loopbackHosts":[{}]}}}}"#,
                 up,
                 adapter.base_url,
                 json_escape(detail.as_str()),
+                latency_ms,
                 a.policy,
                 a.loopback_hosts
                     .iter()
@@ -211,15 +212,23 @@ fn handle_connection(mut stream: std::net::TcpStream, adapter: &Osarous) -> Resu
 }
 
 fn handle_chat(stream: &mut std::net::TcpStream, adapter: &Osarous, body: &str) -> Result<(), String> {
-    use crate::osarous::serde_json_lite::parse_json;
+    use crate::osarous::serde_json_lite::{Value, parse_json};
     use crate::osarous::Message;
 
-    let prompt = parse_json(body)
-        .ok()
+    let parsed_body = parse_json(body).ok();
+    let prompt = parsed_body
+        .as_ref()
         .and_then(|v| v.get("prompt").and_then(|p| p.as_str().map(String::from)))
         .unwrap_or_default();
-    let history: Vec<Message> = parse_json(body)
-        .ok()
+    let rf_entropy = parsed_body
+        .as_ref()
+        .and_then(|v| match v.get("rf_entropy") {
+            Some(Value::Num(n)) => Some(*n),
+            Some(Value::Str(s)) => s.parse().ok(),
+            _ => None,
+        });
+    let history: Vec<Message> = parsed_body
+        .as_ref()
         .and_then(|v| v.get("history").and_then(|h| h.as_array()).cloned())
         .map(|rows| {
             rows.iter()
@@ -233,7 +242,10 @@ fn handle_chat(stream: &mut std::net::TcpStream, adapter: &Osarous, body: &str) 
         })
         .unwrap_or_default();
 
-    let f = fold(&prompt, None);
+    let f = match rf_entropy {
+        Some(rf) => gaia_mlx_quant::fold_spectrum(&prompt, rf, None),
+        None => fold(&prompt, None),
+    };
     let s = sampling(&f);
 
     stream
@@ -243,8 +255,12 @@ fn handle_chat(stream: &mut std::net::TcpStream, adapter: &Osarous, body: &str) 
         .map_err(|e| e.to_string())?;
 
     let gaia_frame = format!(
-        "event: gaia\ndata: {{\"field\":{{\"seed\":{},\"dominant\":\"{}\",\"coherence\":{}}},\"sampling\":{{\"temperature\":{},\"top_p\":{},\"top_k\":{},\"seed\":{}}}}}\n\n",
+        "event: gaia\ndata: {{\"field\":{{\"seed\":{},\"layers\":{{\"gravity\":{},\"entropy\":{},\"weather\":{},\"resonance\":{}}},\"dominant\":\"{}\",\"coherence\":{}}},\"sampling\":{{\"temperature\":{},\"top_p\":{},\"top_k\":{},\"seed\":{}}}}}\n\n",
         f.seed,
+        f.gravity,
+        f.entropy,
+        f.weather,
+        f.resonance,
         f.dominant.name(),
         f.coherence,
         s.temperature,
@@ -277,13 +293,13 @@ fn handle_chat(stream: &mut std::net::TcpStream, adapter: &Osarous, body: &str) 
                 match frame {
                     Ok((kind, text)) if kind == "delta" => {
                         let _ = stream.write_all(
-                            format!("event: delta\ndata: {}\n\n", json_escape_text(&text)).as_bytes(),
+                            format!("event: delta\ndata: {{\"text\":{}}}\n\n", json_escape_text(&text)).as_bytes(),
                         );
                     }
                     Ok(_) => {}
                     Err(e) => {
                         let _ = stream.write_all(
-                            format!("event: error\ndata: {}\n\n", json_escape_text(&e)).as_bytes(),
+                            format!("event: error\ndata: {{\"message\":{}}}\n\n", json_escape_text(&e)).as_bytes(),
                         );
                     }
                 }
@@ -291,7 +307,7 @@ fn handle_chat(stream: &mut std::net::TcpStream, adapter: &Osarous, body: &str) 
         }
         Err(e) => {
             let _ = stream.write_all(
-                format!("event: error\ndata: {}\n\n", json_escape_text(&e)).as_bytes(),
+                format!("event: error\ndata: {{\"message\":{}}}\n\n", json_escape_text(&e)).as_bytes(),
             );
         }
     }
@@ -415,16 +431,26 @@ mod tests {
         assert_eq!(rf_resp.status, 200);
         assert!(rf_resp.body_utf8().contains("\"coherence\""));
 
+        let health = crate::transport::request("http://127.0.0.1:18080/api/health", "GET", None).unwrap();
+        assert_eq!(health.status, 200);
+        let health_json = health.body_utf8();
+        assert!(health_json.contains("\"installed\":true"));
+        assert!(health_json.contains("\"latencyMs\":"));
+
         let page = crate::transport::request("http://127.0.0.1:18080/", "GET", None).unwrap();
         assert_eq!(page.status, 200);
         assert!(page.body_utf8().contains("ALEXIAI"));
 
-        let chat = crate::transport::request(
+        let frames: Vec<_> = crate::transport::sse(
             "http://127.0.0.1:18080/api/chat",
             "POST",
-            Some(r#"{"prompt":"hi"}"#),
-        );
-        // The model is down; the chat stream must still answer 200 with a GAIA frame.
-        assert!(chat.is_ok());
+            Some(r#"{"prompt":"hi","rf_entropy":2.418}"#),
+        )
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+        // The model is down; the chat stream must still answer 200 with a GAIA frame (including layers) and structured error JSON.
+        assert!(frames.iter().any(|f| f.event == "gaia" && f.data.contains("\"layers\":{\"gravity\":1")));
+        assert!(frames.iter().any(|f| f.event == "error" && f.data.contains("{\"message\":")));
     }
 }

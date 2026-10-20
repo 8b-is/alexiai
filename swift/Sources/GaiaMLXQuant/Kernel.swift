@@ -173,4 +173,101 @@ public enum GaiaMLXQuant {
         }
         return (num / den).squareRoot()
     }
+
+    // MARK: GAIA fold_spectrum
+
+    public static let gravityRest = 1.0
+    public static let entropyRest = 0.62
+    public static let weatherRest = 0.5
+    public static let phi = 1.618033988749894848204586834365638118
+
+    public struct Fold: Equatable, Sendable {
+        public let seed: UInt32
+        public let gravity: Double
+        public let entropy: Double
+        public let weather: Double
+        public let resonance: Double
+        public let dominant: String
+        public let coherence: Double
+    }
+
+    public struct Sampling: Equatable, Sendable {
+        public let temperature: Double
+        public let topP: Double
+        public let topK: UInt32
+        public let seed: UInt32
+    }
+
+    /// 32-bit FNV-1a over UTF-8 prompt bytes.
+    public static func seedFrom(_ prompt: String) -> UInt32 {
+        var h: UInt32 = 0x811c9dc5
+        for b in prompt.utf8 {
+            h ^= UInt32(b)
+            h = h &* 0x01000193
+        }
+        return h
+    }
+
+    @inline(__always)
+    private static func clamp(_ v: Double, _ minV: Double, _ maxV: Double) -> Double {
+        if v.isNaN || v < minV { return minV }
+        if v > maxV { return maxV }
+        return v
+    }
+
+    /// Fold a prompt together with passive RF spectral entropy (in bits).
+    public static func foldSpectrum(
+        _ prompt: String,
+        rfEntropyBits: Double,
+        seed: UInt32? = nil
+    ) -> Fold {
+        let s = seed ?? seedFrom(prompt)
+        let a = s &+ 0x6d2b79f5
+        var t = (a ^ (a >> 15)) &* (a | 1)
+        t ^= t &+ ((t ^ (t >> 7)) &* (t | 61))
+        let rand0 = Double((t ^ (t >> 14)) >> 8) / 16_777_216.0
+
+        let rfFactor = clamp((rfEntropyBits - 2.5) * 0.05, -0.08, 0.14)
+        let lenFactor = min(Double(prompt.utf8.count) / 4096.0, 0.35)
+        let entropy = clamp(entropyRest + lenFactor - 0.15 + rfFactor, 0.0, 1.0)
+        let weather = clamp(weatherRest + (rand0 - 0.5) * 0.4, 0.0, 1.0)
+        let gravity = gravityRest
+        let resonance = phi
+
+        let names = ["gravity", "entropy", "weather", "resonance"]
+        let vals = [gravity, entropy, weather, resonance]
+        let rests = [gravityRest, entropyRest, weatherRest, phi]
+        var dominant = "gravity"
+        var best = -Double.infinity
+        for i in 0..<4 {
+            let d = abs(vals[i] - rests[i])
+            if d > best {
+                best = d
+                dominant = names[i]
+            }
+        }
+
+        let spread = abs(entropy - entropyRest) * 0.6 + abs(weather - weatherRest) * 0.4
+        let coherence = clamp(1.0 - spread, 0.0, 1.0)
+
+        return Fold(
+            seed: s,
+            gravity: gravity,
+            entropy: entropy,
+            weather: weather,
+            resonance: resonance,
+            dominant: dominant,
+            coherence: coherence
+        )
+    }
+
+    /// Derive sampling parameters from a Fold.
+    public static func sampling(_ f: Fold) -> Sampling {
+        Sampling(
+            temperature: clamp(0.15 + f.entropy * 1.1, 0.05, 1.2),
+            topP: clamp(0.5 + f.coherence * 0.48, 0.5, 0.98),
+            topK: UInt32(clamp(20.0 + (1.0 - f.coherence) * 60.0, 20.0, 80.0) + 0.5),
+            seed: f.seed
+        )
+    }
 }

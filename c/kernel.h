@@ -39,4 +39,20 @@ double gmq_relative_error(const double *a, const double *b, size_t n);
 /* 1 when the platform assembly path is compiled in, 0 otherwise. */
 int gmq_uses_asm(void);
 
+/* 4-layer GAIA fold result for C99 cross-lane parity. */
+typedef struct {
+    uint32_t seed;
+    double gravity;
+    double entropy;
+    double weather;
+    double resonance;
+    double coherence;
+} gmq_fold_t;
+
+/* 32-bit FNV-1a over prompt bytes. */
+uint32_t gmq_seed_from(const char *prompt, size_t len);
+
+/* Fold a prompt together with passive RF Shannon entropy (in bits). */
+gmq_fold_t gmq_fold_spectrum(const char *prompt, size_t len, double rf_entropy_bits);
+
 #endif /* GMQ_KERNEL_H */
