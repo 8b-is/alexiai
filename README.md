@@ -215,6 +215,13 @@ second is the stairs.
   `https://api.openai.com` cannot appear in a request from this app. Not
   configurable. Not today, not after an update.
 
+## 🌐 Constellation Integrations (`wigle-triad` × `esp32.vaked.dev`)
+
+`GAIA-MLX-QUANT` (`b1.58` ternary packing, `fold_spectrum`, and **D+++ 432Hz** harmonic synthesis) is embedded across the offline-first MEDUSA triad fleet:
+
+- **[`8b-is/wigle-triad` (`v2.0.0`)](https://github.com/8b-is/wigle-triad)** — macOS (`WigleMac.app`), Android (`WigleTriad-v2.0.0-android-universal.apk`), iPadOS/iOS, and local Python bridge (`host/wiglewww.py` `/api/alexai`) fold passive 2.4/5 GHz Wi-Fi, BLE/BT, and AirPlay Shannon entropy $H(X)$ into the 4-layer GAIA field (`Ananke`, `Chaos`, `Zephyrus`, `Aphrodite`) and pack endpoint RSSI trits (`{-1, 0, +1}`) at 5 trits/byte (`1.585 bits/weight`).
+- **[`esp32.vaked.dev`](https://esp32.vaked.dev/)** ([`/api/alexai`](https://esp32.vaked.dev/api/alexai) · Tab 6 `🧠 AlexAI × Kompress-Ultra`) — Live offline-first PWA & WebSerial workstation pairing `AlexAIEngine` (`GAIA-MLX-QUANT b1.58`) with [`kompress-ultra` (`v16.2.0`)](https://github.com/peterlodri-sec/kompress-ultra).
+
 ## 🤝 Contribute
 
 ```bash

@@ -137,7 +137,11 @@ fn handle_connection(mut stream: std::net::TcpStream, adapter: &Osarous) -> Resu
         ("GET", "/api/gaia") => {
             let prompt = query_param(&query, "prompt").unwrap_or_default();
             let seed = query_param(&query, "seed").and_then(|s| s.parse().ok());
-            let f = fold(&prompt, seed);
+            let rf_entropy: Option<f64> = query_param(&query, "rf_entropy").and_then(|r| r.parse().ok());
+            let f = match rf_entropy {
+                Some(rf) => gaia_mlx_quant::fold_spectrum(&prompt, rf, seed),
+                None => fold(&prompt, seed),
+            };
             let s = sampling(&f);
             let json = format!(
                 r#"{{"seed":{},"layers":{{"gravity":{},"entropy":{},"weather":{},"resonance":{}}},"dominant":"{}","coherence":{},"sampling":{{"temperature":{},"top_p":{},"top_k":{},"seed":{}}}}}"#,
@@ -406,6 +410,10 @@ mod tests {
         assert_eq!(resp.status, 200);
         let json = resp.body_utf8();
         assert!(json.contains("\"dominant\""));
+
+        let rf_resp = crate::transport::request("http://127.0.0.1:18080/api/gaia?prompt=shinjuku&rf_entropy=3.4", "GET", None).unwrap();
+        assert_eq!(rf_resp.status, 200);
+        assert!(rf_resp.body_utf8().contains("\"coherence\""));
 
         let page = crate::transport::request("http://127.0.0.1:18080/", "GET", None).unwrap();
         assert_eq!(page.status, 200);

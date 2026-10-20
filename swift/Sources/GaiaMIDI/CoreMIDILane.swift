@@ -128,7 +128,7 @@ public final class GaiaVirtualSource {
 
     init(client: MIDIClientRef, name: String) throws {
         self.name = name
-        var status = MIDISourceCreate(client, name as CFString, &endpointRef)
+        let status = MIDISourceCreate(client, name as CFString, &endpointRef)
         guard status == noErr else {
             throw GaiaMIDIError.sourceCreateFailed(status)
         }

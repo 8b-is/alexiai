@@ -1,4 +1,5 @@
 #if canImport(CoreMIDI)
+#if canImport(XCTest)
 import XCTest
 @testable import GaiaMIDI
 
@@ -42,4 +43,45 @@ final class GaiaMIDITests: XCTestCase {
         _ = client.listDestinations()
     }
 }
+#elseif canImport(Testing)
+import Darwin
+import Testing
+@testable import GaiaMIDI
+
+struct GaiaMIDITests {
+
+    @Test func noteMessages() {
+        #expect(GaiaMIDIMessage.noteOn(60) == [0x90, 60, 100])
+        #expect(GaiaMIDIMessage.noteOn(60, channel: 3, velocity: 7) == [0x93, 60, 7])
+        #expect(GaiaMIDIMessage.noteOff(60) == [0x80, 60, 64])
+        #expect(GaiaMIDIMessage.controlChange(1, value: 2) == [0xB0, 1, 2])
+    }
+
+    @Test func vlqRoundTrip() {
+        for value: UInt32 in [0, 0x40, 0x7F, 0x80, 0x2000, 0x3FFF, 0x4000, 0x0FFFFFFF] {
+            let encoded = GaiaMIDIMessage.vlqEncode(value)
+            #expect(GaiaMIDIMessage.vlqDecode(encoded) == value)
+        }
+        #expect(GaiaMIDIMessage.vlqDecode([0x80, 0x00]) == 0)
+    }
+
+    @Test func hostTimeIsMonotonicMilliseconds() {
+        let t0 = GaiaMIDIMessage.hostTimeToMilliseconds(mach_absolute_time())
+        usleep(50_000)
+        let t1 = GaiaMIDIMessage.hostTimeToMilliseconds(mach_absolute_time())
+        let delta = t1 - t0
+        #expect(delta > 30)
+        #expect(delta < 90)
+    }
+
+    @Test func clientAndVirtualSourceCreateAndSend() throws {
+        let client = try GaiaMIDIClient(name: "alexiai-test")
+        let source = try client.makeVirtualSource("alexiai-test-source")
+        try source.send(GaiaMIDIMessage.noteOn(64))
+        try source.send(GaiaMIDIMessage.noteOff(64))
+        _ = client.listSources()
+        _ = client.listDestinations()
+    }
+}
+#endif
 #endif

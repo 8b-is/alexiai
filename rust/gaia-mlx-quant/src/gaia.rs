@@ -181,6 +181,51 @@ pub fn fold(prompt: &str, seed: Option<u32>) -> Fold {
     }
 }
 
+/// Fold a prompt together with passive RF spectral entropy (in bits, e.g. from
+/// `8b-is/wigle-triad` / `esp32.vaked.dev` 2.4GHz + 5GHz + BLE + AirPlay scans).
+///
+/// Pure, `no_std`, and zero-allocation: modulates the `Chaos` entropy budget by
+/// `clamp((rf_entropy_bits - 2.5) * 0.05, -0.08, 0.14)`.
+pub fn fold_spectrum(prompt: &str, rf_entropy_bits: f64, seed: Option<u32>) -> Fold {
+    let s = seed.unwrap_or_else(|| seed_from(prompt));
+    let mut next = mulberry32(s);
+
+    let rf_factor = clamp((rf_entropy_bits - 2.5) * 0.05, -0.08, 0.14);
+    let entropy = clamp(
+        ENTROPY_REST + (prompt.len() as f64 / 4096.0).min(0.35) - 0.15 + rf_factor,
+        0.0,
+        1.0,
+    );
+    let weather = clamp(WEATHER_REST + (next() - 0.5) * 0.4, 0.0, 1.0);
+    let gravity = GRAVITY;
+    let resonance = RESONANCE;
+
+    let mut dominant = Layer::Gravity;
+    let mut best = f64::NEG_INFINITY;
+    let layers = [gravity, entropy, weather, resonance];
+    for (i, &v) in layers.iter().enumerate() {
+        let rest = Layer::ALL[i].rest();
+        let distance = (v - rest).abs();
+        if distance > best {
+            best = distance;
+            dominant = Layer::ALL[i];
+        }
+    }
+
+    let spread = (entropy - ENTROPY_REST).abs() * 0.6 + (weather - WEATHER_REST).abs() * 0.4;
+    let coherence = clamp(1.0 - spread, 0.0, 1.0);
+
+    Fold {
+        seed: s,
+        gravity,
+        entropy,
+        weather,
+        resonance,
+        dominant,
+        coherence,
+    }
+}
+
 /// The sampling parameters the field derives from a fold.
 ///
 /// Higher entropy ⇒ hotter temperature. Higher coherence ⇒ tighter `top_p`.

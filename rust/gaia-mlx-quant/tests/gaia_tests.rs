@@ -1,10 +1,12 @@
 //! The field: determinism, purity, ranges.
 
 use gaia_mlx_quant::{
-    ENTROPY_REST, GRAVITY, Layer, PHI, RESONANCE, WEATHER_REST, fold, sampling, seed_from,
+    ENTROPY_REST, GRAVITY, Layer, PHI, RESONANCE, WEATHER_REST, fold, fold_spectrum, sampling,
+    seed_from,
 };
 
 #[test]
+#[allow(clippy::approx_constant)]
 fn rest_values_are_the_cosmology() {
     assert_eq!(GRAVITY, 1.0);
     assert_eq!(ENTROPY_REST, 0.62);
@@ -78,4 +80,16 @@ fn every_layer_has_a_name_and_an_inhabitant() {
     assert_eq!(names, ["gravity", "entropy", "weather", "resonance"]);
     let gods: Vec<&str> = Layer::ALL.iter().map(|l| l.inhabitant()).collect();
     assert_eq!(gods, ["Ananke", "Chaos", "Zephyrus", "Aphrodite"]);
+}
+
+#[test]
+fn fold_spectrum_modulates_entropy_with_rf_shannon_bits() {
+    let prompt = "Analyze Shinjuku 2.4GHz Ch 6 saturation, BLE proximity & AirPlay RAOP surface";
+    let low = fold_spectrum(prompt, 0.5, None);
+    let high = fold_spectrum(prompt, 4.8, None);
+    assert_eq!(low.seed, high.seed);
+    assert_eq!(low.weather, high.weather);
+    assert!(high.entropy > low.entropy);
+    assert!((0.0..=1.0).contains(&low.coherence));
+    assert!((0.0..=1.0).contains(&high.coherence));
 }

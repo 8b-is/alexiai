@@ -61,8 +61,8 @@ pub mod kernel;
 pub mod pack;
 
 pub use gaia::{
-    ENTROPY_REST, GRAVITY, Layer, PHI, RESONANCE, WEATHER_REST, Fold, Sampling, fold, sampling,
-    seed_from,
+    ENTROPY_REST, GRAVITY, Layer, PHI, RESONANCE, WEATHER_REST, Fold, Sampling, fold,
+    fold_spectrum, sampling, seed_from,
 };
 pub use kernel::{
     dense_matmul, pack_ternary_i_major_into, pack_ternary_planes_i_into, relative_error,
