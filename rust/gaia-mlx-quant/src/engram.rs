@@ -39,6 +39,9 @@ pub const ENGRAM_HEAD_DIM: usize = 64;
 /// Default hyper-connection multiplicity (`hc_mult = 4`).
 pub const ENGRAM_DEFAULT_HC_MULT: usize = 4;
 
+/// Fixed-point `Q16` scale (`q = 2^16 = 65,536`) for the zero-float `p/q` Engram pipeline.
+pub const ENGRAM_PQ_Q16: i64 = 1 << 16;
+
 /// Precomputed Lemire `p/q` (`q = 2^64`) reciprocal for fast prime-bucket modulo.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PrimeBucketMod {
@@ -499,6 +502,269 @@ pub fn engram_bfp64_int_aligned_matmul_into(
             row_i64 += (block_sum as i64) * (ps_row[g] as i64) * head_mult[g];
         }
         out[j] = (row_i64 as f64) * boundary_scale;
+    }
+}
+
+/// **Pure-Integer `Q16` Deferred-Scale `BFP-64` Engram Projection (`engram_bfp64_int_q16_matmul_into`)**:
+///
+/// Accumulates all `num_groups` 64-dim heads in `i16 -> i64` and shifts directly into
+/// `Q16` (`2^16`) fixed-point integers (`out_q16: &mut [i32]`) with **zero floating-point ops**.
+pub fn engram_bfp64_int_q16_matmul_into(
+    m_x: &[i8],
+    exp_x: &[i8],
+    w_signs: &[i8],
+    group_scales_pq: &[i32], // [out_features * num_groups] scaled by q_s = 2^20
+    in_features: usize,
+    out_features: usize,
+    out_q16: &mut [i32],
+) {
+    let num_groups = in_features / MLX_GROUP_SIZE;
+    let mut min_exp = i8::MAX;
+    for &e in &exp_x[..num_groups] {
+        if e < min_exp {
+            min_exp = e;
+        }
+    }
+    let mut head_mult = [1i64; 64];
+    for g in 0..num_groups.min(64) {
+        let diff = ((exp_x[g] as i32) - (min_exp as i32)).clamp(0, 20) as u32;
+        head_mult[g] = 1i64 << diff;
+    }
+    let shift_to_q16 = (min_exp as i32) - 4;
+
+    for j in 0..out_features {
+        let w_row = &w_signs[j * in_features..(j + 1) * in_features];
+        let ps_row = &group_scales_pq[j * num_groups..(j + 1) * num_groups];
+        let mut row_i64: i64 = 0;
+
+        for g in 0..num_groups {
+            let base = g * MLX_GROUP_SIZE;
+            let mx_blk = &m_x[base..base + MLX_GROUP_SIZE];
+            let mw_blk = &w_row[base..base + MLX_GROUP_SIZE];
+
+            let block_sum: i16 = mw_blk
+                .iter()
+                .zip(mx_blk.iter())
+                .map(|(&w, &m)| (w as i16).wrapping_mul(m as i16))
+                .fold(0i16, i16::wrapping_add);
+
+            row_i64 += (block_sum as i64) * (ps_row[g] as i64) * head_mult[g];
+        }
+
+        let val_q16 = if shift_to_q16 >= 0 {
+            row_i64 << (shift_to_q16.min(30) as u32)
+        } else {
+            let rshift = (-shift_to_q16).min(60) as u32;
+            let half = 1i64 << (rshift.saturating_sub(1));
+            if row_i64 >= 0 {
+                (row_i64 + half) >> rshift
+            } else {
+                -(((-row_i64) + half) >> rshift)
+            }
+        };
+        out_q16[j] = val_q16.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+    }
+}
+
+/// **Fused Single-Pass Bilinear RMSNorm Gate (`engram_fused_rmsnorm_gate`)**:
+///
+/// Computes `g = <RMSNorm(k), RMSNorm(q)> / sqrt(D)` in a **single fused pass** over `k` and `q`
+/// without allocating or writing intermediate normalized `scratch_k` / `scratch_q` vectors!
+#[inline]
+pub fn engram_fused_rmsnorm_gate(
+    key: &[f64],
+    query: &[f64],
+    norm_k_weight: &[f64],
+    norm_q_weight: &[f64],
+    eps: f64,
+) -> f64 {
+    let d = key.len();
+    assert_eq!(query.len(), d);
+    let mut sum_k2 = 0.0f64;
+    let mut sum_q2 = 0.0f64;
+    let mut weighted_dot = 0.0f64;
+
+    for i in 0..d {
+        let ki = key[i];
+        let qi = query[i];
+        sum_k2 += ki * ki;
+        sum_q2 += qi * qi;
+        weighted_dot += (norm_k_weight[i] * norm_q_weight[i]) * (ki * qi);
+    }
+
+    let d_f64 = d as f64;
+    let rms_k = libm_sqrt(sum_k2 / d_f64 + eps);
+    let rms_q = libm_sqrt(sum_q2 / d_f64 + eps);
+    let g = weighted_dot / (libm_sqrt(d_f64) * rms_k * rms_q);
+    let abs_g = if g.abs() < 1e-6 { 1e-6 } else { g.abs() };
+    let signed_sqrt = if g >= 0.0 {
+        libm_sqrt(abs_g)
+    } else {
+        -libm_sqrt(abs_g)
+    };
+    1.0 / (1.0 + libm_exp(-signed_sqrt))
+}
+
+/// Pure-Integer `Q16` Fused Bilinear RMSNorm Gate (`engram_fused_rmsnorm_gate_q16`):
+///
+/// Computes the hyper-connection gate in `Q16` (`[0, 65536]`) using exact integer
+/// Newton-Raphson `isqrt_u128` and rational Padé `[2/2]` sigmoid with **zero floats**.
+#[inline]
+pub fn engram_fused_rmsnorm_gate_q16(
+    key_q16: &[i32],
+    query_q16: &[i32],
+    norm_k_w_q16: &[i32],
+    norm_q_w_q16: &[i32],
+) -> i32 {
+    let d = key_q16.len();
+    let mut sum_k2: u128 = 0;
+    let mut sum_q2: u128 = 0;
+    let mut weighted_dot_q32: i128 = 0;
+
+    for i in 0..d {
+        let k = key_q16[i] as i64;
+        let q = query_q16[i] as i64;
+        sum_k2 += (k * k) as u128;
+        sum_q2 += (q * q) as u128;
+        let w_prod_q16 = ((norm_k_w_q16[i] as i64) * (norm_q_w_q16[i] as i64)) >> 16;
+        let kq_q16 = (k * q) >> 16;
+        weighted_dot_q32 += (w_prod_q16 as i128) * (kq_q16 as i128);
+    }
+
+    let eps_term = (d as u128) * 42_950;
+    let norm_k_q16 = engram_isqrt_u128(sum_k2 + eps_term).max(1) as i128;
+    let norm_q_q16 = engram_isqrt_u128(sum_q2 + eps_term).max(1) as i128;
+    let sqrt_d_q16 = engram_isqrt_u128((d as u128) << 32).max(1) as i128;
+
+    let denom_q32 = (norm_k_q16 * norm_q_q16).max(1);
+    let g_q16 = ((weighted_dot_q32 * sqrt_d_q16) / denom_q32) as i64;
+
+    let abs_g_q16 = g_q16.unsigned_abs().max(1);
+    let sqrt_abs_q16 = engram_isqrt_u128((abs_g_q16 as u128) << 16) as i64;
+    let signed_sqrt_q16 = if g_q16 >= 0 {
+        sqrt_abs_q16
+    } else {
+        -sqrt_abs_q16
+    };
+
+    engram_sigmoid_pade_q16(signed_sqrt_q16)
+}
+
+/// Rational Padé `[2/2]` Sigmoid in `Q16` (`1 / (1 + exp(-x))`), zero floats!
+#[inline]
+pub const fn engram_sigmoid_pade_q16(x_q16: i64) -> i32 {
+    let x = if x_q16 < -(6 * ENGRAM_PQ_Q16) {
+        -(6 * ENGRAM_PQ_Q16)
+    } else if x_q16 > (6 * ENGRAM_PQ_Q16) {
+        6 * ENGRAM_PQ_Q16
+    } else {
+        x_q16
+    };
+    let x2_q16 = (x * x) >> 16;
+    let num = 12 * ENGRAM_PQ_Q16 + 6 * x + x2_q16;
+    let raw_den = 24 * ENGRAM_PQ_Q16 + 2 * x2_q16;
+    let den = if raw_den < 1 { 1 } else { raw_den };
+    let sig_q16 = ((num << 16) + (den >> 1)) / den;
+    if sig_q16 < 0 {
+        0
+    } else if sig_q16 > ENGRAM_PQ_Q16 {
+        ENGRAM_PQ_Q16 as i32
+    } else {
+        sig_q16 as i32
+    }
+}
+
+/// **100% Zero-Float Pure-Integer `p/q` ("Counting Divided") Engram Layer Step (`engram_step_pq_no_floats_into`)**:
+///
+/// Executes the entire DeepSeek Engram layer step (`MultiHeadEmbedding` gather, `value_proj`,
+/// `key_projs[0..hc_mult]`, Fused Bilinear `RMSNorm` gate via `isqrt_u128`, signed-sqrt,
+/// rational Padé `[2/2]` sigmoid, ShortConv SiLU, and residual) in pure integer arithmetic
+/// with **zero IEEE-754 floating-point instructions**!
+#[allow(clippy::too_many_arguments)]
+pub fn engram_step_pq_no_floats_into(
+    table: &[Bfp64HeadRow],
+    head_indices: &[usize],
+    hidden_states_q16: &[i32],    // [hc_mult * hidden_size] in Q16
+    key_projs_signs: &[i8],       // [hc_mult * hidden_size * engram_dim]
+    key_projs_scales_pq: &[i32],  // [hc_mult * hidden_size * num_groups] in Q20
+    val_proj_signs: &[i8],        // [hidden_size * engram_dim]
+    val_proj_scales_pq: &[i32],   // [hidden_size * num_groups] in Q20
+    norm_w_q16: &[i32],           // [hidden_size] in Q16
+    short_conv_w_q16: &[i32],     // [hc_mult * hidden_size] in Q16
+    hc_mult: usize,
+    engram_dim: usize,
+    hidden_size: usize,
+    m_x_scratch: &mut [i8],       // [engram_dim]
+    exp_x_scratch: &mut [i8],     // [engram_dim / 64]
+    val_q16_scratch: &mut [i32],  // [hidden_size]
+    key_q16_scratch: &mut [i32],  // [hidden_size]
+    out_hc_q16: &mut [i32],       // [hc_mult * hidden_size] in Q16
+) {
+    let num_groups = engram_dim / MLX_GROUP_SIZE;
+
+    engram_gather_bfp64_heads_into(table, head_indices, m_x_scratch, exp_x_scratch);
+
+    engram_bfp64_int_q16_matmul_into(
+        m_x_scratch,
+        exp_x_scratch,
+        val_proj_signs,
+        val_proj_scales_pq,
+        engram_dim,
+        hidden_size,
+        val_q16_scratch,
+    );
+
+    let kp_mat_stride = hidden_size * engram_dim;
+    let kp_scale_stride = hidden_size * num_groups;
+
+    for hc in 0..hc_mult {
+        let k_signs = &key_projs_signs[hc * kp_mat_stride..(hc + 1) * kp_mat_stride];
+        let k_scales_pq = &key_projs_scales_pq[hc * kp_scale_stride..(hc + 1) * kp_scale_stride];
+        let query_q16 = &hidden_states_q16[hc * hidden_size..(hc + 1) * hidden_size];
+
+        engram_bfp64_int_q16_matmul_into(
+            m_x_scratch,
+            exp_x_scratch,
+            k_signs,
+            k_scales_pq,
+            engram_dim,
+            hidden_size,
+            key_q16_scratch,
+        );
+
+        let gate_q16 = engram_fused_rmsnorm_gate_q16(
+            key_q16_scratch,
+            query_q16,
+            norm_w_q16,
+            norm_w_q16,
+        ) as i64;
+
+        let conv_hc_q16 = &short_conv_w_q16[hc * hidden_size..(hc + 1) * hidden_size];
+        let out_slice = &mut out_hc_q16[hc * hidden_size..(hc + 1) * hidden_size];
+
+        for d in 0..hidden_size {
+            let v_gated_q16 = (gate_q16 * (val_q16_scratch[d] as i64)) >> 16;
+            let conv_val_q16 = (v_gated_q16 * (conv_hc_q16[d] as i64)) >> 16;
+            let sig_conv_q16 = engram_sigmoid_pade_q16(conv_val_q16) as i64;
+            let silu_q16 = (conv_val_q16 * sig_conv_q16) >> 16;
+            out_slice[d] = (query_q16[d] as i64 + v_gated_q16 + silu_q16) as i32;
+        }
+    }
+}
+
+#[inline]
+const fn engram_isqrt_u128(n: u128) -> u128 {
+    if n < 2 {
+        return n;
+    }
+    let shift = (128 - n.leading_zeros()).div_ceil(2);
+    let mut x = 1u128 << shift;
+    loop {
+        let y = (x + n / x) >> 1;
+        if y >= x {
+            return x;
+        }
+        x = y;
     }
 }
 

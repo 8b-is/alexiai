@@ -45,7 +45,8 @@ fn hot_paths_perform_zero_allocations() {
         WUPZ_DEFAULT_WINDOW_SIZE, WupzBlockDesc, WupzSectionDesc, b158_matmul_pq_i_major_into,
         engram_bfp64_int_aligned_matmul_into, engram_bfp64_prequant_matmul_into,
         engram_gather_bfp64_heads_into, engram_hash_ngram_pq_into,
-        engram_mem8_adaptive_matmul_into, engram_step_bfp64_into, fold, fold_pq, fold_spectrum,
+        engram_mem8_adaptive_matmul_into, engram_step_bfp64_into, engram_step_pq_no_floats_into,
+        fold, fold_pq, fold_spectrum,
         fold_spectrum_pq, fold_to_quant_tern_pq, gather_qmm_into, gather_qmm_pq_i64_into,
         maybe_matmul_into, maybe_matmul_pq_into, mergeq_matmul_into, mergeq_matmul_pq_into,
         mlx_dequantize_group64_into, mlx_dequantize_group64_pq_into,
@@ -303,6 +304,25 @@ fn hot_paths_perform_zero_allocations() {
             &mut s_norm,
             &mut s_q,
             &mut engram_out_hc,
+        );
+        engram_step_pq_no_floats_into(
+            &bfp_head_table,
+            &engram_indices[..1],
+            &p_x,
+            &trits,
+            &p_scales,
+            &trits,
+            &p_scales,
+            &p_row_scales,
+            &p_row_scales,
+            1,
+            ROWS,
+            COLS,
+            &mut m_x_i8,
+            &mut exp_x,
+            &mut ps_v,
+            &mut ps_k,
+            &mut p_tf_out,
         );
         let mut wupz_plan_buf = [0u8; 128];
         let wupz_secs = [WupzSectionDesc {

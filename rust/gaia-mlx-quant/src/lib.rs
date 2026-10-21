@@ -64,11 +64,12 @@ pub mod pack;
 pub mod wupz;
 
 pub use engram::{
-    Bfp64HeadRow, ENGRAM_DEFAULT_HC_MULT, ENGRAM_HEAD_DIM, Mem8AdaptiveHeadRow, PrimeBucketMod,
-    engram_bfp64_int_aligned_matmul_into, engram_bfp64_prequant_matmul_into,
+    Bfp64HeadRow, ENGRAM_DEFAULT_HC_MULT, ENGRAM_HEAD_DIM, ENGRAM_PQ_Q16, Mem8AdaptiveHeadRow,
+    PrimeBucketMod, engram_bfp64_int_aligned_matmul_into, engram_bfp64_int_q16_matmul_into,
+    engram_bfp64_prequant_matmul_into, engram_fused_rmsnorm_gate, engram_fused_rmsnorm_gate_q16,
     engram_gather_bfp64_heads_into, engram_hash_ngram_mod_into, engram_hash_ngram_pq_into,
-    engram_hc_gate, engram_mem8_adaptive_matmul_into, engram_step_bfp64_into,
-    engram_step_dense_fp64_into,
+    engram_hc_gate, engram_mem8_adaptive_matmul_into, engram_sigmoid_pade_q16,
+    engram_step_bfp64_into, engram_step_dense_fp64_into, engram_step_pq_no_floats_into,
 };
 
 pub use gaia::{
