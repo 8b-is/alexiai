@@ -1,8 +1,9 @@
 //! The field: determinism, purity, ranges.
 
 use gaia_mlx_quant::{
-    ENTROPY_REST, GRAVITY, Layer, PHI, RESONANCE, WEATHER_REST, fold, fold_spectrum, sampling,
-    seed_from,
+    ENTROPY_REST, ENTROPY_REST_PQ, GAIA_PQ_Q, GRAVITY, GRAVITY_REST_PQ, Layer, PHI, PHI_PQ,
+    RESONANCE, RESONANCE_REST_PQ, WEATHER_REST, WEATHER_REST_PQ, fold, fold_pq, fold_spectrum,
+    fold_spectrum_pq, sampling, sampling_pq, seed_from,
 };
 
 #[test]
@@ -92,4 +93,37 @@ fn fold_spectrum_modulates_entropy_with_rf_shannon_bits() {
     assert!(high.entropy > low.entropy);
     assert!((0.0..=1.0).contains(&low.coherence));
     assert!((0.0..=1.0).contains(&high.coherence));
+}
+
+#[test]
+fn fold_pq_and_sampling_pq_operate_in_pure_integer_space() {
+    assert_eq!(GAIA_PQ_Q, 1_048_576);
+    assert_eq!(GRAVITY_REST_PQ, 1_048_576);
+    assert_eq!(ENTROPY_REST_PQ, 650_117);
+    assert_eq!(WEATHER_REST_PQ, 524_288);
+    assert_eq!(RESONANCE_REST_PQ, PHI_PQ);
+    assert_eq!(Layer::Gravity.rest_pq(), GRAVITY_REST_PQ);
+    assert_eq!(Layer::Entropy.rest_pq(), ENTROPY_REST_PQ);
+    assert_eq!(Layer::Weather.rest_pq(), WEATHER_REST_PQ);
+    assert_eq!(Layer::Resonance.rest_pq(), RESONANCE_REST_PQ);
+
+    let prompt = "Analyze Shinjuku 2.4GHz Ch 6 saturation, BLE proximity & AirPlay RAOP surface";
+    let f_base = fold_pq(prompt, Some(42));
+    assert_eq!(f_base, fold_pq(prompt, Some(42)));
+    assert_eq!(f_base.get_p(Layer::Gravity), GRAVITY_REST_PQ);
+    assert!((0..=GAIA_PQ_Q).contains(&f_base.entropy_p));
+    assert!((0..=GAIA_PQ_Q).contains(&f_base.weather_p));
+    assert!((0..=GAIA_PQ_Q).contains(&f_base.coherence_p));
+
+    let low = fold_spectrum_pq(prompt, GAIA_PQ_Q / 2, Some(42));
+    let high = fold_spectrum_pq(prompt, GAIA_PQ_Q * 4, Some(42));
+    assert_eq!(low.seed, high.seed);
+    assert_eq!(low.weather_p, high.weather_p);
+    assert!(high.entropy_p > low.entropy_p);
+
+    let s_pq = sampling_pq(&high);
+    assert!((52_429..=1_258_291).contains(&s_pq.temperature_p));
+    assert!((524_288..=1_027_604).contains(&s_pq.top_p_p));
+    assert!((20..=80).contains(&s_pq.top_k));
+    assert_eq!(s_pq.seed, 42);
 }

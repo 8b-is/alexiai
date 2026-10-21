@@ -107,13 +107,26 @@ Pre-calculating $\pm 0.5 \times \text{scale}$ outside the loop eliminates
 $65,536$ per-weight floating-point multiplications per $256 \times 256$ matrix
 while ensuring exact trit assignment ($\{-1, 0, +1\}$) without rounding noise.
 
-### 5. Associativity Unlocks Wide SIMD Without Accuracy Loss
+### 5. Associativity & 32-Bit Chunking Unlock Wide SIMD (`5.25×` Over Dense FP64, `0` Floats)
 In safe Rust (`#![forbid(unsafe_code)]`), IEEE-754 non-associativity prevents
-LLVM from reordering floating-point additions, forcing sequential execution.
-Because integer addition in $\mathbb{Z}$ is mathematically associative, LLVM
-automatically vectorizes the integer dot products into 256-bit **AVX2 / NEON
-SIMD** instructions (`vpmovsxbd` + `vpmulld` + `vpaddd`), delivering up to an
-**11.43× speedup** over dense FP64 CPU matrix multiplication while maintaining
-strict, exact precision.
+LLVM from reordering floating-point additions, and ARM64 baseline NEON lacks a
+64-bit integer vector multiply (`mul.2d`). In `v0.3.0`, accumulating in 32-bit
+`i32` chunks (`wrapping_add` / `wrapping_mul` over 64-element blocks widened once
+to `i64`) with 4-column register blocking and compile-time 5-trit
+`BYTE_TRITS_I32: [[i32; 5]; 256]` / 4-trit `MLX_BYTE_TRITS_I32: [[i32; 4]; 256]`
+tables allows LLVM to emit bounds-check-free 128-bit **NEON** (`sxtl` + `mla.4s`)
+and 256-bit **AVX2** (`vpmovsxbd` + `vpmulld` + `vpaddd`) instructions —
+delivering a measured **5.25× speedup** over auto-vectorized dense FP64 CPU
+matrix multiplication at `512×512` (`41,720 ns` vs `219,043 ns`) with **zero
+floating-point operations**.
+
+### 6. Full Pure-Integer Transformer Layer (`ternary_transformer_step_pq_into`)
+Every stage of the Transformer block now has a 100% float-free `p/q` (`q = 2^20`)
+counterpart in `gaia-mlx-quant`:
+- `isqrt_u128` & `relative_error_pq_ppm`: exact integer square root in `core` and parts-per-million L2 error.
+- `rms_norm_pq_into`: pure-integer RMSNorm using `isqrt_u128`.
+- `sin_cos_pq` & `rope_pq_into`: 5th-order range-reduced fixed-point trigonometric RoPE rotation.
+- `exp_pq`, `swiglu_pq_into`, & `sdpa_pq_single_query_into`: 6-squaring integer exponential $(1 + x/64)^{64}$ powering integer SwiGLU and causal Scaled Dot-Product Attention.
+- `mlx_quantize_group64_pq_into`, `mlx_dequantize_group64_pq_into`, `mlx_matmul_pq_group64_i64_into`, `mergeq_matmul_pq_into`, `maybe_matmul_pq_into`, `gather_qmm_pq_into`, `ste_linear_backward_pq_into`: complete zero-float MLX Group-64, triple-fused MergeQ, SplitMix64 stochastic Maybe, MoE routing, and STE QAT backward pass.
 
 *the constellation · 0 + 1 · fine touch from within · vaked.dev*

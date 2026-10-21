@@ -315,3 +315,161 @@ fn pq_rational_and_integer_numerator_kernels_match_float_to_1e6() {
     assert!(relative_error(&y_b158_pq, &y_b158_float) < 1e-6);
     assert!(relative_error(&y_simd_pq, &y_b158_float) < 1e-6);
 }
+
+#[test]
+fn pure_integer_pq_mlx_and_transformer_primitives_operate_with_zero_floats() {
+    use gaia_mlx_quant::{
+        exp_pq, gather_qmm_pq_into, maybe_matmul_pq_into, mergeq_matmul_pq_into,
+        mlx_dequantize_group64_pq_into, mlx_matmul_pq_group64_i64_into,
+        mlx_quantize_group64_pq_into, quantize_pq_adaptive_into, relative_error_pq_ppm,
+        rms_norm_pq_into, rope_pq_into, sdpa_pq_single_query_into, sin_cos_pq,
+        ste_linear_backward_pq_into, swiglu_pq_into, ternary_transformer_step_pq_into,
+    };
+
+    let rows = 16usize;
+    let cols = 64usize;
+    let q_i32 = PQ_DEFAULT_Q as i32;
+    let w_f64: Vec<f64> = (0..rows * cols)
+        .map(|i| ((i * 17 + 11) % 23) as f64 / 11.0 - 1.0)
+        .collect();
+    let x_f64: Vec<f64> = (0..cols).map(|k| ((k * 7 + 3) % 13) as f64 / 6.0 - 1.0).collect();
+
+    let mut p_w = vec![0i32; rows * cols];
+    let mut p_x = vec![0i32; cols];
+    let q_w = quantize_pq_adaptive_into(&w_f64, &mut p_w);
+    assert!(q_w >= PQ_DEFAULT_Q);
+    quantize_pq_into(&w_f64, PQ_DEFAULT_Q, &mut p_w);
+    quantize_pq_into(&x_f64, PQ_DEFAULT_Q, &mut p_x);
+
+    let mut codes = vec![0u32; rows * (cols / 16)];
+    let mut p_scales = vec![0i32; rows * (cols / 64)];
+    mlx_quantize_group64_pq_into(&p_w, rows, cols, q_i32, &mut codes, &mut p_scales);
+
+    let mut p_w_dequant = vec![0i32; rows * cols];
+    mlx_dequantize_group64_pq_into(&codes, &p_scales, rows, cols, &mut p_w_dequant);
+    assert!(p_w_dequant.iter().any(|&v| v != 0));
+
+    let mut p_y_g64 = vec![0i64; rows];
+    let mut p_y_mergeq = vec![0i64; rows];
+    mlx_matmul_pq_group64_i64_into(&p_x, &codes, &p_scales, rows, cols, &mut p_y_g64);
+    mergeq_matmul_pq_into(&p_x, &p_w, rows, cols, 64, &mut p_y_mergeq);
+    assert_eq!(p_y_g64, p_y_mergeq);
+    assert_eq!(relative_error_pq_ppm(&p_y_g64, &p_y_mergeq), 0);
+
+    let mut p_y_maybe = vec![0i64; rows];
+    maybe_matmul_pq_into(&p_x, &p_w, rows, cols, 64, 0x432_528, &mut p_y_maybe);
+    assert!(p_y_maybe.iter().any(|&v| v != 0));
+
+    let mut moe_scratch = vec![0i64; rows];
+    let mut p_y_moe = vec![0i64; rows];
+    gather_qmm_pq_into(
+        &p_x,
+        &codes,
+        &p_scales,
+        1,
+        rows,
+        cols,
+        &[0],
+        &[q_i32],
+        PQ_DEFAULT_Q,
+        &mut moe_scratch,
+        &mut p_y_moe,
+    );
+    assert_eq!(p_y_moe, p_y_g64);
+
+    // Pure-integer sin/cos, exp, RMSNorm, RoPE, SwiGLU, SDPA, STE backward, and Transformer step
+    let (s0, c0) = sin_cos_pq(0);
+    assert_eq!(s0, 0);
+    assert!((c0 - PQ_DEFAULT_Q).abs() <= 2);
+    assert_eq!(exp_pq(0), PQ_DEFAULT_Q);
+    assert!(exp_pq(-PQ_DEFAULT_Q) < PQ_DEFAULT_Q && exp_pq(-PQ_DEFAULT_Q) > 0);
+
+    let dim = 16usize;
+    let hidden_dim = 32usize;
+    let mut p_norm = vec![0i32; dim];
+    rms_norm_pq_into(&p_x[..dim], None, PQ_DEFAULT_Q, 10, &mut p_norm);
+    let mut p_rot = vec![0i32; dim];
+    rope_pq_into(&p_norm, 3, &mut p_rot);
+    let mut p_swi = vec![0i32; dim];
+    swiglu_pq_into(&p_norm, &p_rot, PQ_DEFAULT_Q, &mut p_swi);
+
+    let mut p_scores = vec![0i64; 2];
+    let mut p_attn = vec![0i32; dim];
+    sdpa_pq_single_query_into(
+        &p_rot,
+        &p_w[..2 * dim],
+        &p_w[2 * dim..4 * dim],
+        2,
+        dim,
+        PQ_DEFAULT_Q,
+        &mut p_scores,
+        &mut p_attn,
+    );
+    assert!(p_scores.iter().all(|&s| s > 0));
+
+    let mut p_grad_x = vec![0i64; cols];
+    let mut p_grad_w = vec![0i64; rows * cols];
+    ste_linear_backward_pq_into(
+        &p_x,
+        &p_w,
+        &p_x[..rows],
+        rows,
+        cols,
+        PQ_DEFAULT_Q,
+        &mut p_grad_x,
+        &mut p_grad_w,
+    );
+    assert!(p_grad_w.iter().any(|&v| v != 0));
+
+    let trits_dd: Vec<i8> = (0..dim * dim).map(|i| [-1, 0, 1][(i * 5 + 1) % 3]).collect();
+    let trits_dh: Vec<i8> = (0..dim * hidden_dim).map(|i| [-1, 0, 1][(i * 7 + 2) % 3]).collect();
+    let mut w_dd = vec![0u8; (dim * dim).div_ceil(5)];
+    let mut w_dh = vec![0u8; (dim * hidden_dim).div_ceil(5)];
+    let mut w_hd = vec![0u8; (hidden_dim * dim).div_ceil(5)];
+    pack_ternary_i_major_into(&trits_dd, dim, dim, &mut w_dd);
+    pack_ternary_i_major_into(&trits_dh, dim, hidden_dim, &mut w_dh);
+    pack_ternary_i_major_into(&trits_dh, hidden_dim, dim, &mut w_hd);
+
+    let p_ones = vec![q_i32; dim];
+    let mut p_k_cache = vec![0i32; 4 * dim];
+    let mut p_v_cache = vec![0i32; 4 * dim];
+    let mut ps_norm = vec![0i32; dim];
+    let mut ps_q = vec![0i32; dim];
+    let mut ps_k = vec![0i32; dim];
+    let mut ps_v = vec![0i32; dim];
+    let mut ps_attn = vec![0i32; dim];
+    let mut ps_scores = vec![0i64; 4];
+    let mut ps_gate = vec![0i32; hidden_dim];
+    let mut ps_up = vec![0i32; hidden_dim];
+    let mut ps_i64 = vec![0i64; hidden_dim];
+    let mut p_tf_out = vec![0i32; dim];
+
+    ternary_transformer_step_pq_into(
+        &p_x[..dim],
+        &p_ones,
+        &w_dd,
+        &w_dd,
+        &w_dd,
+        &w_dd,
+        &p_ones,
+        &w_dh,
+        &w_dh,
+        &w_hd,
+        dim,
+        hidden_dim,
+        0,
+        &mut p_k_cache,
+        &mut p_v_cache,
+        &mut ps_norm,
+        &mut ps_q,
+        &mut ps_k,
+        &mut ps_v,
+        &mut ps_attn,
+        &mut ps_scores,
+        &mut ps_gate,
+        &mut ps_up,
+        &mut ps_i64,
+        &mut p_tf_out,
+    );
+    assert!(p_tf_out.iter().any(|&v| v != 0));
+}

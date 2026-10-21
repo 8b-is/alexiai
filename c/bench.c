@@ -63,23 +63,38 @@ int main(int argc, char **argv) {
     double *w = (double *)calloc(rows * cols, sizeof(double));
     double *x = (double *)calloc(rows, sizeof(double));
     int8_t *trits = (int8_t *)calloc(rows * cols, sizeof(int8_t));
+    int8_t *trits_i = (int8_t *)calloc(rows * cols, sizeof(int8_t));
     double *scales = (double *)calloc(rows, sizeof(double));
+    int32_t *p_x_scaled = (int32_t *)calloc(rows, sizeof(int32_t));
     uint8_t *packed = (uint8_t *)calloc(packed_len, sizeof(uint8_t));
     double *dense_out = (double *)calloc(cols, sizeof(double));
     double *ternary_out = (double *)calloc(cols, sizeof(double));
+    int64_t *pq_packed_out = (int64_t *)calloc(cols, sizeof(int64_t));
+    int64_t *pq_simd_out = (int64_t *)calloc(cols, sizeof(int64_t));
 
     int iters = 200;
     int k;
-    uint64_t t0, dense_ns, ternary_ns;
+    size_t r, c;
+    uint64_t t0, dense_ns, ternary_ns, pq_packed_ns, pq_simd_ns;
 
     fill_weights(w, rows * cols, 0x5eedu);
     fill_weights(x, rows, 0xc0ffeeu);
     quantize_per_row(w, rows, cols, trits, scales);
     gmq_pack_ternary(trits, rows * cols, packed);
 
+    for (r = 0; r < rows; r++) {
+        double v = x[r] * scales[r] * (double)GMQ_PQ_DEFAULT_Q;
+        p_x_scaled[r] = (int32_t)(v >= 0.0 ? v + 0.5 : v - 0.5);
+        for (c = 0; c < cols; c++) {
+            trits_i[c * rows + r] = trits[r * cols + c];
+        }
+    }
+
     /* Warm-up */
     gmq_dense_matmul(w, rows, cols, x, dense_out);
     gmq_ternary_matmul(packed, rows, cols, x, scales, 1.0, ternary_out);
+    gmq_ternary_matmul_pq(packed, rows, cols, p_x_scaled, NULL, GMQ_PQ_DEFAULT_Q, pq_packed_out);
+    gmq_simd_matmul_pq(trits_i, rows, cols, p_x_scaled, pq_simd_out);
 
     t0 = now_ns();
     for (k = 0; k < iters; k++) {
@@ -89,18 +104,36 @@ int main(int argc, char **argv) {
 
     t0 = now_ns();
     for (k = 0; k < iters; k++) {
+        gmq_simd_matmul_pq(trits_i, rows, cols, p_x_scaled, pq_simd_out);
+    }
+    pq_simd_ns = (now_ns() - t0) / (uint64_t)iters;
+
+    t0 = now_ns();
+    for (k = 0; k < iters; k++) {
+        gmq_ternary_matmul_pq(packed, rows, cols, p_x_scaled, NULL, GMQ_PQ_DEFAULT_Q, pq_packed_out);
+    }
+    pq_packed_ns = (now_ns() - t0) / (uint64_t)iters;
+
+    t0 = now_ns();
+    for (k = 0; k < iters; k++) {
         gmq_ternary_matmul(packed, rows, cols, x, scales, 1.0, ternary_out);
     }
     ternary_ns = (now_ns() - t0) / (uint64_t)iters;
 
-    printf("GAIA-MLX-QUANT C99 bench — honest numbers\n");
+    printf("GAIA-MLX-QUANT C99 v0.3.0 bench — SOTA p/q pure-integer & ternary b1.58 numbers\n");
     printf("  asm        %s\n", gmq_uses_asm() ? "SSE4.1 / NEON compiled in" : "portable C99");
     printf("  shape      %zux%zu\n", rows, cols);
     printf("  packing    1.5850 bits/weight · %zu bytes vs %zu f64 (%.2fx)\n",
            packed_len, rows * cols * sizeof(double),
            (double)(rows * cols * sizeof(double)) / (double)packed_len);
-    printf("  cpu dense  %llu ns/iter\n", (unsigned long long)dense_ns);
-    printf("  cpu packed %llu ns/iter\n", (unsigned long long)ternary_ns);
+    printf("  cpu dense  %llu ns/iter  (f64 reference)\n", (unsigned long long)dense_ns);
+    printf("  cpu pq-simd %llu ns/iter (NEON/SSE4.1 i8×i32->i32, 0 floats, %.2fx vs dense)\n",
+           (unsigned long long)pq_simd_ns,
+           pq_simd_ns > 0 ? (double)dense_ns / (double)pq_simd_ns : 0.0);
+    printf("  cpu pq-b158 %llu ns/iter (5-trits/byte p/q integer, 0 floats)\n",
+           (unsigned long long)pq_packed_ns);
+    printf("  cpu packed %llu ns/iter  (f64 boundary, unguarded interior bytes)\n",
+           (unsigned long long)ternary_ns);
     printf("  error      %.4f relative L2 vs dense (random weights — the worst case)\n",
            gmq_relative_error(ternary_out, dense_out, cols));
 
@@ -129,9 +162,13 @@ int main(int argc, char **argv) {
     free(w);
     free(x);
     free(trits);
+    free(trits_i);
     free(scales);
+    free(p_x_scaled);
     free(packed);
     free(dense_out);
     free(ternary_out);
+    free(pq_packed_out);
+    free(pq_simd_out);
     return 0;
 }

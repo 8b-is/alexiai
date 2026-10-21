@@ -128,6 +128,38 @@ final class KernelTests: XCTestCase {
         XCTAssertTrue((0.05...1.2).contains(s.temperature))
         XCTAssertTrue((20...80).contains(s.topK))
     }
+
+    func testPureIntegerPqMatMulAndFold() {
+        let rows = 4, cols = 5
+        let q = GaiaMLXQuant.pqDefaultQ
+        let pW: [Int32] = (0..<rows * cols).map { i in
+            let v: Int64 = (i % 3 == 0) ? q : ((i % 3 == 1) ? -q : 0)
+            return Int32(v)
+        }
+        let (trits, pScales) = GaiaMLXQuant.quantizePerRowPq(pW, rows: rows, cols: cols)
+        var packed = [UInt8](repeating: 0, count: (rows * cols + 4) / 5)
+        GaiaMLXQuant.packTrits(trits, into: &packed)
+
+        let pX: [Int32] = [Int32(q), Int32(-q / 2), Int32(q / 4), Int32(q)]
+        var pOut = [Int64](repeating: 0, count: cols)
+        GaiaMLXQuant.ternaryMatMulPq(
+            packed: packed,
+            rows: rows,
+            cols: cols,
+            pX: pX,
+            pScales: pScales,
+            qX: q,
+            qScale: q,
+            into: &pOut
+        )
+        XCTAssertTrue(pOut.contains { $0 != 0 })
+
+        let prompt = "Analyze Shinjuku 2.4GHz Ch 6 saturation, BLE proximity & AirPlay RAOP surface"
+        let lowPq = GaiaMLXQuant.foldSpectrumPq(prompt, rfEntropyBitsPq: Int32(q / 2))
+        let highPq = GaiaMLXQuant.foldSpectrumPq(prompt, rfEntropyBitsPq: Int32(q * 4))
+        XCTAssertEqual(lowPq.seed, highPq.seed)
+        XCTAssertGreaterThan(highPq.entropyPq, lowPq.entropyPq)
+    }
 }
 #elseif canImport(Testing)
 import Testing
@@ -257,6 +289,38 @@ struct KernelTests {
         let s = GaiaMLXQuant.sampling(high)
         #expect((0.05...1.2).contains(s.temperature))
         #expect((20...80).contains(s.topK))
+    }
+
+    @Test func pureIntegerPqMatMulAndFold() {
+        let rows = 4, cols = 5
+        let q = GaiaMLXQuant.pqDefaultQ
+        let pW: [Int32] = (0..<rows * cols).map { i in
+            let v: Int64 = (i % 3 == 0) ? q : ((i % 3 == 1) ? -q : 0)
+            return Int32(v)
+        }
+        let (trits, pScales) = GaiaMLXQuant.quantizePerRowPq(pW, rows: rows, cols: cols)
+        var packed = [UInt8](repeating: 0, count: (rows * cols + 4) / 5)
+        GaiaMLXQuant.packTrits(trits, into: &packed)
+
+        let pX: [Int32] = [Int32(q), Int32(-q / 2), Int32(q / 4), Int32(q)]
+        var pOut = [Int64](repeating: 0, count: cols)
+        GaiaMLXQuant.ternaryMatMulPq(
+            packed: packed,
+            rows: rows,
+            cols: cols,
+            pX: pX,
+            pScales: pScales,
+            qX: q,
+            qScale: q,
+            into: &pOut
+        )
+        #expect(pOut.contains { $0 != 0 })
+
+        let prompt = "Analyze Shinjuku 2.4GHz Ch 6 saturation, BLE proximity & AirPlay RAOP surface"
+        let lowPq = GaiaMLXQuant.foldSpectrumPq(prompt, rfEntropyBitsPq: Int32(q / 2))
+        let highPq = GaiaMLXQuant.foldSpectrumPq(prompt, rfEntropyBitsPq: Int32(q * 4))
+        #expect(lowPq.seed == highPq.seed)
+        #expect(highPq.entropyPq > lowPq.entropyPq)
     }
 }
 #endif

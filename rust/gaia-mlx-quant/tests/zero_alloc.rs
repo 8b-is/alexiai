@@ -41,12 +41,19 @@ static ALLOCATOR: Counting = Counting;
 #[test]
 fn hot_paths_perform_zero_allocations() {
     use gaia_mlx_quant::{
-        PQ_DEFAULT_Q, b158_matmul_pq_i_major_into, fold, fold_spectrum, gather_qmm_into,
-        maybe_matmul_into, mergeq_matmul_into, mlx_dequantize_group64_into,
-        mlx_matmul_pq_group64_into, mlx_quantize_group64_into, mlx_quantized_matmul_into,
-        pack_ternary_i_major_into, pack_ternary_into, quantize_pq_into, rms_norm_into, rope_into,
-        sampling, sdpa_single_query_into, ste_linear_backward_into, swiglu_into, ternary_matmul,
-        ternary_simd_pq_matmul_into, ternary_transformer_step_into, unpack_ternary_into,
+        KERNEL_PQ_Q, PQ_DEFAULT_Q, b158_matmul_pq_i_major_into, fold, fold_pq, fold_spectrum,
+        fold_spectrum_pq, gather_qmm_into, gather_qmm_pq_into, maybe_matmul_into,
+        maybe_matmul_pq_into, mergeq_matmul_into, mergeq_matmul_pq_into,
+        mlx_dequantize_group64_into, mlx_dequantize_group64_pq_into,
+        mlx_matmul_pq_group64_i64_into, mlx_matmul_pq_group64_into, mlx_quantize_group64_into,
+        mlx_quantize_group64_pq_into, mlx_quantized_matmul_into, pack_ternary_i_major_into,
+        pack_ternary_into, pack_ternary_planes_i_into, quantize_pq_into, quantize_ternary_pq_into,
+        rms_norm_into, rms_norm_pq_into, rope_into, rope_pq_into, sampling, sampling_pq,
+        sdpa_pq_single_query_into, sdpa_single_query_into, ste_linear_backward_into,
+        ste_linear_backward_pq_into, swiglu_into, swiglu_pq_into, ternary_matmul,
+        ternary_matmul_pq_i_major_into, ternary_matmul_pq_j_major_into,
+        ternary_matmul_pq_planes_i_into, ternary_simd_i8_pq_into, ternary_simd_pq_matmul_into,
+        ternary_transformer_step_into, ternary_transformer_step_pq_into, unpack_ternary_into,
     };
 
     const ROWS: usize = 64;
@@ -83,10 +90,33 @@ fn hot_paths_perform_zero_allocations() {
     let mut s_scores = vec![0f64; 4];
     let mut s_gate = vec![0f64; COLS];
     let mut s_up = vec![0f64; COLS];
+    let mut pos_planes = vec![0i8; ROWS * COLS];
+    let mut neg_planes = vec![0i8; ROWS * COLS];
+    let mut p_w = vec![0i32; ROWS * COLS];
+    let mut p_row_scales = vec![0i32; ROWS];
+    let mut p_out_i64 = vec![0i64; COLS];
+    let mut p_dequant_w = vec![0i32; ROWS * COLS];
+    let mut p_grad_x = vec![0i64; COLS];
+    let mut p_grad_w = vec![0i64; ROWS * COLS];
+    let mut p_k_cache = vec![0i32; 4 * COLS];
+    let mut p_v_cache = vec![0i32; 4 * COLS];
+    let mut ps_norm = vec![0i32; COLS];
+    let mut ps_q = vec![0i32; COLS];
+    let mut ps_k = vec![0i32; COLS];
+    let mut ps_v = vec![0i32; COLS];
+    let mut ps_attn = vec![0i32; COLS];
+    let mut ps_scores = vec![0i64; 4];
+    let mut ps_gate = vec![0i32; COLS];
+    let mut ps_up = vec![0i32; COLS];
+    let mut ps_i64 = vec![0i64; COLS];
+    let mut p_tf_out = vec![0i32; COLS];
 
     // Warm the paths (first-call branches and tables are settled).
     pack_ternary_into(&trits, &mut packed);
     pack_ternary_i_major_into(&trits, ROWS, COLS, &mut packed_i);
+    pack_ternary_planes_i_into(&trits, ROWS, COLS, &mut pos_planes, &mut neg_planes);
+    quantize_pq_into(&weights, PQ_DEFAULT_Q, &mut p_w);
+    quantize_pq_into(&scales, PQ_DEFAULT_Q, &mut p_row_scales);
     ternary_matmul(&packed, ROWS, COLS, &x, Some(&scales), 1.0, &mut out);
     unpack_ternary_into(&packed, ROWS * COLS, &mut unpacked);
     mlx_quantize_group64_into(&weights, ROWS, COLS, &mut mlx_codes, &mut mlx_scales);
@@ -156,7 +186,52 @@ fn hot_paths_perform_zero_allocations() {
         );
         let f1 = fold("Analyze Shinjuku 2.4GHz Ch 6 saturation", None);
         let f2 = fold_spectrum("Analyze Shinjuku 2.4GHz Ch 6 saturation", 2.418, None);
-        std::hint::black_box((sampling(&f1), sampling(&f2)));
+        let fpq1 = fold_pq("Analyze Shinjuku 2.4GHz Ch 6 saturation", None);
+        let fpq2 = fold_spectrum_pq("Analyze Shinjuku 2.4GHz Ch 6 saturation", 2_535_457, None);
+        quantize_ternary_pq_into(&p_w, ROWS, COLS, KERNEL_PQ_Q, &mut unpacked, &mut p_row_scales);
+        ternary_matmul_pq_j_major_into(&packed, ROWS, COLS, &p_x, Some(&p_row_scales), KERNEL_PQ_Q, &mut p_out_i64);
+        ternary_matmul_pq_i_major_into(&packed_i, ROWS, COLS, &p_x, Some(&p_row_scales), KERNEL_PQ_Q, &mut p_out_i64);
+        ternary_matmul_pq_planes_i_into(&pos_planes, &neg_planes, ROWS, COLS, &p_x, Some(&p_row_scales), KERNEL_PQ_Q, &mut p_out_i64);
+        ternary_simd_i8_pq_into(&trits, ROWS, COLS, &p_x, Some(&p_row_scales), KERNEL_PQ_Q, &mut p_out_i64);
+        mlx_quantize_group64_pq_into(&p_w, ROWS, COLS, KERNEL_PQ_Q, &mut mlx_codes, &mut p_scales);
+        mlx_dequantize_group64_pq_into(&mlx_codes, &p_scales, ROWS, COLS, &mut p_dequant_w);
+        mlx_matmul_pq_group64_i64_into(&p_x, &mlx_codes, &p_scales, ROWS, COLS, &mut p_out_i64);
+        mergeq_matmul_pq_into(&p_x, &p_w, ROWS, COLS, 64, &mut p_out_i64);
+        maybe_matmul_pq_into(&p_x, &p_w, ROWS, COLS, 64, 42, &mut p_out_i64);
+        gather_qmm_pq_into(&p_x, &mlx_codes, &p_scales, 1, ROWS, COLS, &[0], &[1_048_576], PQ_DEFAULT_Q, &mut ps_i64, &mut p_out_i64);
+        rms_norm_pq_into(&p_x, Some(&p_row_scales), PQ_DEFAULT_Q, 10, &mut ps_norm);
+        rope_pq_into(&ps_norm, 1, &mut ps_q);
+        swiglu_pq_into(&ps_norm, &ps_q, PQ_DEFAULT_Q, &mut ps_gate);
+        sdpa_pq_single_query_into(&ps_q, &p_k_cache, &p_v_cache, 2, COLS, PQ_DEFAULT_Q, &mut ps_scores, &mut ps_attn);
+        ste_linear_backward_pq_into(&p_x, &p_w, &p_row_scales, ROWS, COLS, PQ_DEFAULT_Q, &mut p_grad_x, &mut p_grad_w);
+        ternary_transformer_step_pq_into(
+            &p_x,
+            &p_row_scales,
+            &packed_i,
+            &packed_i,
+            &packed_i,
+            &packed_i,
+            &p_row_scales,
+            &packed_i,
+            &packed_i,
+            &packed_i,
+            COLS,
+            COLS,
+            0,
+            &mut p_k_cache,
+            &mut p_v_cache,
+            &mut ps_norm,
+            &mut ps_q,
+            &mut ps_k,
+            &mut ps_v,
+            &mut ps_attn,
+            &mut ps_scores,
+            &mut ps_gate,
+            &mut ps_up,
+            &mut ps_i64,
+            &mut p_tf_out,
+        );
+        std::hint::black_box((sampling(&f1), sampling(&f2), sampling_pq(&fpq1), sampling_pq(&fpq2)));
     }
     let after = ALLOCS.load(Ordering::Relaxed);
 

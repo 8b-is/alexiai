@@ -197,3 +197,67 @@ fn plane_kernel_applies_gamma() {
     // col 0: 1*1 + 1*2 + (-1)*3 = 0; col 1: 1*1 + (-1)*2 + (-1)*3 = -4.
     assert_eq!(out, [0.0, -2.0]);
 }
+
+#[test]
+fn pure_integer_pq_kernels_match_dense_pq_and_zero_floats() {
+    use gaia_mlx_quant::{
+        KERNEL_PQ_Q, dense_matmul_pq_into, isqrt_u128, pack_ternary_planes_i_into,
+        quantize_ternary_pq_into, relative_error_pq_ppm, ternary_matmul_pq_i_major_into,
+        ternary_matmul_pq_j_major_into, ternary_matmul_pq_planes_i_into, ternary_simd_i8_pq_into,
+    };
+
+    assert_eq!(isqrt_u128(0), 0);
+    assert_eq!(isqrt_u128(1), 1);
+    assert_eq!(isqrt_u128(1_000_000_000_000), 1_000_000);
+
+    let rows = 8usize;
+    let cols = 10usize;
+    let q = KERNEL_PQ_Q;
+    let p_w: Vec<i32> = (0..rows * cols)
+        .map(|k| match (k * 5 + 1) % 3 {
+            0 => -q,
+            1 => 0,
+            _ => q,
+        })
+        .collect();
+    let mut trits = vec![0i8; rows * cols];
+    let mut p_scales = vec![0i32; rows];
+    quantize_ternary_pq_into(&p_w, rows, cols, KERNEL_PQ_Q, &mut trits, &mut p_scales);
+
+    let packed_j = pack_ternary(&trits);
+    let mut packed_i = vec![0u8; (rows * cols).div_ceil(5)];
+    pack_ternary_i_major_into(&trits, rows, cols, &mut packed_i);
+    let mut pos = vec![0i8; rows * cols];
+    let mut neg = vec![0i8; rows * cols];
+    pack_ternary_planes_i_into(&trits, rows, cols, &mut pos, &mut neg);
+    let mut trits_i = vec![0i8; rows * cols];
+    for j in 0..rows {
+        for i in 0..cols {
+            trits_i[i * rows + j] = trits[j * cols + i];
+        }
+    }
+
+    let p_x: Vec<i32> = (0..rows).map(|j| ((j as i32) - 3) * (q / 4)).collect();
+    let mut out_j = vec![0i64; cols];
+    let mut out_i = vec![0i64; cols];
+    let mut out_planes = vec![0i64; cols];
+    let mut out_simd = vec![0i64; cols];
+
+    ternary_matmul_pq_j_major_into(&packed_j, rows, cols, &p_x, Some(&p_scales), KERNEL_PQ_Q, &mut out_j);
+    ternary_matmul_pq_i_major_into(&packed_i, rows, cols, &p_x, Some(&p_scales), KERNEL_PQ_Q, &mut out_i);
+    ternary_matmul_pq_planes_i_into(&pos, &neg, rows, cols, &p_x, Some(&p_scales), KERNEL_PQ_Q, &mut out_planes);
+    ternary_simd_i8_pq_into(&trits_i, rows, cols, &p_x, Some(&p_scales), KERNEL_PQ_Q, &mut out_simd);
+
+    assert_eq!(out_j, out_i);
+    assert_eq!(out_i, out_planes);
+    assert_eq!(out_planes, out_simd);
+    assert_eq!(relative_error_pq_ppm(&out_simd, &out_j), 0);
+
+    // Unscaled integer equivalence against dense_matmul_pq_into on pure trit weights
+    let p_trit_w: Vec<i32> = trits.iter().map(|&t| t as i32).collect();
+    let mut out_dense = vec![0i64; cols];
+    let mut out_unscaled = vec![0i64; cols];
+    dense_matmul_pq_into(&p_trit_w, rows, cols, &p_x, &mut out_dense);
+    ternary_simd_i8_pq_into(&trits_i, rows, cols, &p_x, None, KERNEL_PQ_Q, &mut out_unscaled);
+    assert_eq!(out_unscaled, out_dense);
+}

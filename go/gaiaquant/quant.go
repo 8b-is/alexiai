@@ -290,3 +290,184 @@ func DeriveSampling(f Fold) Sampling {
 		Seed:        f.Seed,
 	}
 }
+
+// ── Pure-Integer p/q ("Counting Divided" · Zero Floating Point) Go Lane ────
+
+// PqDefaultQ is the canonical rational denominator q = 2^20 = 1,048,576.
+const PqDefaultQ int64 = 1048576
+
+// FoldPq holds the 4-layer GAIA fold result in pure integer p/q (q = 2^20), zero floats.
+type FoldPq struct {
+	Seed       uint32
+	Q          int64
+	GravityP   int64
+	EntropyP   int64
+	WeatherP   int64
+	ResonanceP int64
+	Dominant   string
+	CoherenceP int64
+}
+
+func clampI64(v, minV, maxV int64) int64 {
+	if v < minV {
+		return minV
+	}
+	if v > maxV {
+		return maxV
+	}
+	return v
+}
+
+func absI64(v int64) int64 {
+	if v < 0 {
+		return -v
+	}
+	return v
+}
+
+// FoldSpectrumPq folds a prompt with passive RF Shannon entropy numerator rfEntropyP
+// (in q = 2^20) using 100% integer arithmetic and zero floating-point operations.
+func FoldSpectrumPq(prompt string, rfEntropyP int64, explicitSeed *uint32) FoldPq {
+	s := SeedFrom(prompt)
+	if explicitSeed != nil {
+		s = *explicitSeed
+	}
+	a := s + 0x6d2b79f5
+	t := (a ^ (a >> 15)) * (a | 1)
+	t ^= t + ((t ^ (t >> 7)) * (t | 61))
+	randP := int64((t ^ (t >> 14)) >> 12)
+
+	rfFactorP := clampI64((rfEntropyP-2621440)/20, -83886, 146801)
+	lenP := int64(len(prompt)) << 8
+	if lenP > 367002 {
+		lenP = 367002
+	}
+	entropyP := clampI64(650117+lenP-157286+rfFactorP, 0, PqDefaultQ)
+	weatherP := clampI64(524288+((randP-524288)*2)/5, 0, PqDefaultQ)
+	gravityP := PqDefaultQ
+	resonanceP := int64(1696632)
+
+	names := [4]string{"gravity", "entropy", "weather", "resonance"}
+	vals := [4]int64{gravityP, entropyP, weatherP, resonanceP}
+	rests := [4]int64{1048576, 650117, 524288, 1696632}
+	dominant := "gravity"
+	var best int64 = -1
+	for i := 0; i < 4; i++ {
+		d := absI64(vals[i] - rests[i])
+		if d > best {
+			best = d
+			dominant = names[i]
+		}
+	}
+
+	spreadP := (absI64(entropyP-650117)*3 + absI64(weatherP-524288)*2) / 5
+	coherenceP := clampI64(PqDefaultQ-spreadP, 0, PqDefaultQ)
+
+	return FoldPq{
+		Seed:       s,
+		Q:          PqDefaultQ,
+		GravityP:   gravityP,
+		EntropyP:   entropyP,
+		WeatherP:   weatherP,
+		ResonanceP: resonanceP,
+		Dominant:   dominant,
+		CoherenceP: coherenceP,
+	}
+}
+
+// QuantizePerRowPq quantizes integer numerators wP ([rows, cols]) to trits {-1, 0, +1}
+// and per-row absmean scale numerators scalesP using exact integer inequality
+// |v| * 2 * cols >= sumAbs (zero floats, zero divisions per weight).
+func QuantizePerRowPq(wP []int32, rows, cols int, q int32) (trits []int8, scalesP []int32) {
+	trits = make([]int8, len(wP))
+	scalesP = make([]int32, rows)
+	cols64 := int64(cols)
+	twoCols := cols64 * 2
+	for r := 0; r < rows; r++ {
+		row := wP[r*cols : (r+1)*cols]
+		var sumAbs int64
+		for _, v := range row {
+			sumAbs += absI64(int64(v))
+		}
+		if sumAbs == 0 {
+			scalesP[r] = q
+			continue
+		}
+		scalesP[r] = int32((sumAbs + (cols64 >> 1)) / cols64)
+		for c, v := range row {
+			v64 := int64(v)
+			if absI64(v64)*twoCols >= sumAbs {
+				if v64 > 0 {
+					trits[r*cols+c] = 1
+				} else {
+					trits[r*cols+c] = -1
+				}
+			}
+		}
+	}
+	return trits, scalesP
+}
+
+// TernaryMatMulPq is the pure-integer j-major 5-trits/byte kernel in p/q (zero floats).
+func TernaryMatMulPq(packed []uint8, rows, cols int, pX, pScales []int32, qScale int32, pOut []int64) {
+	for i := range pOut[:cols] {
+		pOut[i] = 0
+	}
+	qS := int64(qScale)
+	if qS <= 0 {
+		qS = 1
+	}
+	halfQ := qS >> 1
+	for j := 0; j < rows; j++ {
+		xj := int64(pX[j])
+		if xj == 0 {
+			continue
+		}
+		if pScales != nil {
+			prod := xj * int64(pScales[j])
+			if prod >= 0 {
+				xj = (prod + halfQ) / qS
+			} else {
+				xj = (prod - halfQ) / qS
+			}
+			if xj == 0 {
+				continue
+			}
+		}
+		startT := j * cols
+		endT := startT + cols
+		startB := startT / TritPerByte
+		endB := (endT + TritPerByte - 1) / TritPerByte
+		for b := startB; b < endB; b++ {
+			byte_ := packed[b]
+			if byte_ == 0 {
+				continue
+			}
+			base := b * TritPerByte
+			if base >= startT && base+TritPerByte <= endT {
+				col := base - startT
+				pOut[col+0] += int64(T0[byte_]) * xj
+				pOut[col+1] += int64(T1[byte_]) * xj
+				pOut[col+2] += int64(T2[byte_]) * xj
+				pOut[col+3] += int64(T3[byte_]) * xj
+				pOut[col+4] += int64(T4[byte_]) * xj
+			} else {
+				if t := base; t >= startT && t < endT {
+					pOut[t-startT] += int64(T0[byte_]) * xj
+				}
+				if t := base + 1; t >= startT && t < endT {
+					pOut[t-startT] += int64(T1[byte_]) * xj
+				}
+				if t := base + 2; t >= startT && t < endT {
+					pOut[t-startT] += int64(T2[byte_]) * xj
+				}
+				if t := base + 3; t >= startT && t < endT {
+					pOut[t-startT] += int64(T3[byte_]) * xj
+				}
+				if t := base + 4; t >= startT && t < endT {
+					pOut[t-startT] += int64(T4[byte_]) * xj
+				}
+			}
+		}
+	}
+}

@@ -27,11 +27,14 @@ const HERO_SVG: &str = include_str!("../../../web/hero-alexandra.svg");
 pub fn run_bench(dim: usize) -> String {
     use std::time::Instant;
     use gaia_mlx_quant::{
-        MLX_GROUP64_COMPRESSION, MlxQuantizedMatrix, PQ_DEFAULT_Q, b158_matmul_pq_i_major_into,
-        dense_matmul, gather_qmm_into, maybe_matmul_into, mergeq_matmul_into,
-        mlx_matmul_pq_group64_into, pack_ternary, pack_ternary_i_major_into, quantize_pq_into,
-        quantize_ternary, relative_error, ternary_matmul, ternary_matmul_i_major,
-        ternary_simd_pq_matmul_into, ternary_transformer_step_into,
+        KERNEL_PQ_Q, MLX_GROUP64_COMPRESSION, MlxQuantizedMatrix, PQ_DEFAULT_Q,
+        b158_matmul_pq_i_major_into, dense_matmul, dense_matmul_pq_into, gather_qmm_into,
+        maybe_matmul_into, mergeq_matmul_into, mergeq_matmul_pq_into,
+        mlx_matmul_pq_group64_i64_into, mlx_matmul_pq_group64_into, pack_ternary,
+        pack_ternary_i_major_into, pack_ternary_planes_i_into, quantize_pq_into, quantize_ternary,
+        relative_error, relative_error_pq_ppm, ternary_matmul, ternary_matmul_i_major,
+        ternary_matmul_pq_planes_i_into, ternary_simd_i8_pq_into, ternary_simd_pq_matmul_into,
+        ternary_transformer_step_into, ternary_transformer_step_pq_into,
     };
 
     let aligned_dim = dim.max(64).div_ceil(64) * 64;
@@ -120,16 +123,31 @@ pub fn run_bench(dim: usize) -> String {
     pack_ternary_i_major_into(&trits_dh, aligned_dim, hidden_dim, &mut w_dh);
     pack_ternary_i_major_into(&trits_dh, hidden_dim, aligned_dim, &mut w_hd);
 
+    let mut pos_dd = vec![0i8; aligned_dim * aligned_dim];
+    let mut neg_dd = vec![0i8; aligned_dim * aligned_dim];
+    pack_ternary_planes_i_into(&trits_dd, aligned_dim, aligned_dim, &mut pos_dd, &mut neg_dd);
+    let mut trits_dd_i = vec![0i8; aligned_dim * aligned_dim];
+    for j in 0..aligned_dim {
+        for i in 0..aligned_dim {
+            trits_dd_i[i * aligned_dim + j] = trits_dd[j * aligned_dim + i];
+        }
+    }
+
     let mut y_imajor = vec![0.0f64; aligned_dim];
     let t_imaj = Instant::now();
     ternary_matmul_i_major(&w_dd, aligned_dim, aligned_dim, &x_al, None, 1.0, &mut y_imajor);
     let imajor_us = t_imaj.elapsed().as_nanos() as f64 / 1000.0;
 
-    // p / q ("Counting Divided" — Pure Integer-Numerator Kernels, zero inner-loop float conversions)
+    // p / q ("Counting Divided" — Pure Integer-Numerator Kernels, 0 floating-point operations)
+    let mut p_w_al = vec![0i32; aligned_dim * aligned_dim];
     let mut p_x = vec![0i32; aligned_dim];
     let mut p_scales = vec![0i32; mlx_q.scales.len()];
+    quantize_pq_into(&w_al, PQ_DEFAULT_Q, &mut p_w_al);
     quantize_pq_into(&x_al, PQ_DEFAULT_Q, &mut p_x);
     quantize_pq_into(&mlx_q.scales, PQ_DEFAULT_Q, &mut p_scales);
+
+    let mut p_y_dense = vec![0i64; aligned_dim];
+    dense_matmul_pq_into(&p_w_al, aligned_dim, aligned_dim, &p_x, &mut p_y_dense);
 
     let mut y_pq_g64 = vec![0.0f64; aligned_dim];
     let t_pqg64 = Instant::now();
@@ -145,6 +163,23 @@ pub fn run_bench(dim: usize) -> String {
     );
     let pq_g64_us = t_pqg64.elapsed().as_nanos() as f64 / 1000.0;
 
+    let mut p_y_g64_i64 = vec![0i64; aligned_dim];
+    let t_pqg64_i64 = Instant::now();
+    mlx_matmul_pq_group64_i64_into(
+        &p_x,
+        &mlx_q.codes,
+        &p_scales,
+        aligned_dim,
+        aligned_dim,
+        &mut p_y_g64_i64,
+    );
+    let pq_g64_i64_us = t_pqg64_i64.elapsed().as_nanos() as f64 / 1000.0;
+
+    let mut p_y_mergeq = vec![0i64; aligned_dim];
+    let t_pq_mq = Instant::now();
+    mergeq_matmul_pq_into(&p_x, &p_w_al, aligned_dim, aligned_dim, 64, &mut p_y_mergeq);
+    let pq_mergeq_us = t_pq_mq.elapsed().as_nanos() as f64 / 1000.0;
+
     let mut y_pq_b158 = vec![0.0f64; aligned_dim];
     let t_pqb158 = Instant::now();
     b158_matmul_pq_i_major_into(&w_dd, aligned_dim, aligned_dim, &p_x, PQ_DEFAULT_Q, 1.0, &mut y_pq_b158);
@@ -152,8 +187,36 @@ pub fn run_bench(dim: usize) -> String {
 
     let mut y_pq_simd = vec![0.0f64; aligned_dim];
     let t_pqsimd = Instant::now();
-    ternary_simd_pq_matmul_into(&trits_dd, aligned_dim, aligned_dim, &p_x, PQ_DEFAULT_Q, None, 1.0, &mut y_pq_simd);
+    ternary_simd_pq_matmul_into(&trits_dd_i, aligned_dim, aligned_dim, &p_x, PQ_DEFAULT_Q, None, 1.0, &mut y_pq_simd);
     let pq_simd_us = t_pqsimd.elapsed().as_nanos() as f64 / 1000.0;
+
+    let mut p_y_planes = vec![0i64; aligned_dim];
+    let t_pq_planes = Instant::now();
+    ternary_matmul_pq_planes_i_into(
+        &pos_dd,
+        &neg_dd,
+        aligned_dim,
+        aligned_dim,
+        &p_x,
+        None,
+        KERNEL_PQ_Q,
+        &mut p_y_planes,
+    );
+    let pq_planes_us = t_pq_planes.elapsed().as_nanos() as f64 / 1000.0;
+
+    let mut p_y_simd_i8 = vec![0i64; aligned_dim];
+    let t_pq_simd_i8 = Instant::now();
+    ternary_simd_i8_pq_into(
+        &trits_dd_i,
+        aligned_dim,
+        aligned_dim,
+        &p_x,
+        None,
+        KERNEL_PQ_Q,
+        &mut p_y_simd_i8,
+    );
+    let pq_simd_i8_us = t_pq_simd_i8.elapsed().as_nanos() as f64 / 1000.0;
+    let pq_err_ppm = relative_error_pq_ppm(&p_y_simd_i8, &p_y_planes);
 
     let ones_d = vec![1.0f64; aligned_dim];
     let mut k_cache = vec![0.0f64; 8 * aligned_dim];
@@ -198,27 +261,78 @@ pub fn run_bench(dim: usize) -> String {
     let tf_us = t_tf.elapsed().as_nanos() as f64 / 1000.0;
     let tok_per_sec_16_layers = if tf_us > 0.0 { 1_000_000.0 / (tf_us * 16.0) } else { 0.0 };
 
+    // Pure-Integer p/q Ternary Transformer Step (0 floats)
+    let p_ones_d = vec![PQ_DEFAULT_Q as i32; aligned_dim];
+    let mut p_k_cache = vec![0i32; 8 * aligned_dim];
+    let mut p_v_cache = vec![0i32; 8 * aligned_dim];
+    let mut ps_norm = vec![0i32; aligned_dim];
+    let mut ps_q = vec![0i32; aligned_dim];
+    let mut ps_k = vec![0i32; aligned_dim];
+    let mut ps_v = vec![0i32; aligned_dim];
+    let mut ps_attn = vec![0i32; aligned_dim];
+    let mut ps_scores = vec![0i64; 8];
+    let mut ps_gate = vec![0i32; hidden_dim];
+    let mut ps_up = vec![0i32; hidden_dim];
+    let mut ps_i64 = vec![0i64; hidden_dim];
+    let mut p_tf_out = vec![0i32; aligned_dim];
+
+    let t_tf_pq = Instant::now();
+    ternary_transformer_step_pq_into(
+        &p_x,
+        &p_ones_d,
+        &w_dd,
+        &w_dd,
+        &w_dd,
+        &w_dd,
+        &p_ones_d,
+        &w_dh,
+        &w_dh,
+        &w_hd,
+        aligned_dim,
+        hidden_dim,
+        0,
+        &mut p_k_cache,
+        &mut p_v_cache,
+        &mut ps_norm,
+        &mut ps_q,
+        &mut ps_k,
+        &mut ps_v,
+        &mut ps_attn,
+        &mut ps_scores,
+        &mut ps_gate,
+        &mut ps_up,
+        &mut ps_i64,
+        &mut p_tf_out,
+    );
+    let tf_pq_us = t_tf_pq.elapsed().as_nanos() as f64 / 1000.0;
+
     format!(
-        r#"{{"dim":{dim},"bitsPerWeight":1.585,"bytesPacked":{},"bytesFloat64":{},"compression":{:.2},"relativeError":{:.4},"mlxRust":{{"engine":"gaia-mlx-quant (100% safe no_std Rust · zero heap allocs · p/q integer numerator)","denseMicros":{:.2},"b158JMajorMicros":{:.2},"b158IMajorMicros":{:.2},"pqB158IMajorMicros":{:.2},"pqWideSimdMicros":{:.2},"group64":{{"compressionVsF32":{:.2},"packedBytes":{},"micros":{:.2},"pqMicros":{:.2},"relativeError":{:.4}}},"mergeQ":{{"intermediateBytes":0,"micros":{:.2},"relativeError":{:.4}}},"maybeStochastic":{{"micros":{:.2}}},"gatherQmmMoE":{{"experts":4,"topK":2,"micros":{:.2}}},"ternaryTransformerBlock":{{"dim":{aligned_dim},"hiddenDim":{hidden_dim},"layerMicros":{:.2},"estTokPerSec16Layer":{:.1}}}}}}}"#,
+        r#"{{"dim":{dim},"version":"0.3.0","bitsPerWeight":1.585,"bytesPacked":{},"bytesFloat64":{},"compression":{:.2},"relativeError":{:.4},"relativeErrorPpm":{},"mlxRust":{{"engine":"gaia-mlx-quant v0.3.0 (100% safe no_std Rust · zero heap allocs · pure-integer p/q zero-float substrate)","denseMicros":{:.2},"b158JMajorMicros":{:.2},"b158IMajorMicros":{:.2},"pqB158IMajorMicros":{:.2},"pqWideSimdMicros":{:.2},"pqPlanesI64Micros":{:.2},"pqSimdI8ZeroFloatMicros":{:.2},"group64":{{"compressionVsF32":{:.2},"packedBytes":{},"micros":{:.2},"pqMicros":{:.2},"pqI64ZeroFloatMicros":{:.2},"relativeError":{:.4}}},"mergeQ":{{"intermediateBytes":0,"micros":{:.2},"pqZeroFloatMicros":{:.2},"relativeError":{:.4}}},"maybeStochastic":{{"micros":{:.2}}},"gatherQmmMoE":{{"experts":4,"topK":2,"micros":{:.2}}},"ternaryTransformerBlock":{{"dim":{aligned_dim},"hiddenDim":{hidden_dim},"layerMicros":{:.2},"pqZeroFloatLayerMicros":{:.2},"estTokPerSec16Layer":{:.1}}}}}}}"#,
         packed.len(),
         w.len() * 8,
         compression,
         err,
+        pq_err_ppm,
         dense_us,
         b158_us,
         imajor_us,
         pq_b158_us,
         pq_simd_us,
+        pq_planes_us,
+        pq_simd_i8_us,
         MLX_GROUP64_COMPRESSION,
         mlx_q.packed_bytes(),
         g64_us,
         pq_g64_us,
+        pq_g64_i64_us,
         g64_err,
         mergeq_us,
+        pq_mergeq_us,
         mergeq_err,
         maybe_us,
         moe_us,
         tf_us,
+        tf_pq_us,
         tok_per_sec_16_layers
     )
 }

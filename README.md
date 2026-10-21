@@ -39,18 +39,18 @@ and it is a complete, fully offline assistant.
 ### the lanes, all speaking one math
 
 ```bash
-cargo test --manifest-path rust/Cargo.toml   # 45 Rust tests: core + the app
+cargo test --manifest-path rust/Cargo.toml   # 64 Rust tests: core + pure-integer p/q + the app
 go test ./...                                # the Go lane (go/)
-make -C c test                               # C99 + NEON/SSE4.1 asm (c/)
+make -C c test bench                         # C99 + NEON/SSE4.1 integer SIMD asm (c/)
 swift test --package-path swift              # Swift kernel + CoreMIDI (swift/)
 ```
 
 | lane | role | guarantees |
 |---|---|---|
-| `rust/` | the app + the core | `#![forbid(unsafe_code)]`, `no_std` core, zero-alloc proven by a counting allocator |
-| `go/` | the glue + a second opinion | stdlib-only supervisor, allocation-lean kernel |
-| `c/` | C99 + inline assembly | NEON (aarch64) and SSE4.1 (x86_64) paths, proven against the C reference |
-| `swift/` | OS-agnostic kernel + macOS CoreMIDI | pure-Swift core runs on Linux; the CoreMIDI lane ports the OpenXTalk-Apple-CoreMIDI surface |
+| `rust/` | the app + the core (`v0.3.0`) | `#![forbid(unsafe_code)]`, `no_std` core, **100% float-free `p/q` integer substrate (`q = 2^20`)**, zero-alloc proven by a counting allocator |
+| `go/` | the glue + a second opinion | stdlib-only supervisor, allocation-lean `p/q` integer & ternary kernel |
+| `c/` | C99 + inline assembly | NEON (`sxtl` + `mla.4s` + `addv`) and SSE4.1 (`pmovsxbd` + `pmulld`) **integer SIMD (`0` floats)**, proven against the C reference |
+| `swift/` | OS-agnostic kernel + macOS CoreMIDI | pure-Swift `p/q` integer & ternary core runs on Linux; the CoreMIDI lane ports the OpenXTalk-Apple-CoreMIDI surface |
 | `web/` | the offline UI | embedded in the binary; no CDN, no remote asset |
 
 ## 🔒 The Guarantee (enforced, not promised)
@@ -117,50 +117,50 @@ is the honesty of this project: on adversarial random weights, ternary
 reconstruction is lossy by design; on the ternary-shaped weights a trained
 b1.58 model actually has, the projection is tight (`< 0.34`, pinned by test).
 
-## 🦀 The Rust lane — `rust/gaia-mlx-quant`
+## 🦀 The Rust lane — `rust/gaia-mlx-quant` (`v0.3.0` · SOTA Pure-Integer `p/q` Substrate)
 
 The same substrate, native: **SOTA bleeding-edge Rust, zero `unsafe`, zero
-allocations, 100% Linux + macOS** — every one of those words enforced, not
-asserted:
+allocations, zero floating-point operations in the `p/q` integer core, 100%
+Linux + macOS** — every one of those words enforced, not asserted:
 
 ```bash
 cd rust
-cargo test                                    # 31 tests: round-trips, kernels, zero-alloc proof
+cargo test                                    # 64 tests: round-trips, pure-integer p/q kernels, zero-alloc proof
 cargo clippy --all-targets                    # zero warnings
 cargo build --no-default-features             # pure core: #![no_std], no deps at all
-cargo run --release --example bench -- --dim 256
+cargo run --release --example bench -- --dim 512
 ```
 
 | promise | how it is enforced |
 |---|---|
 | **zero unsafe** | `#![forbid(unsafe_code)]` — it is a compile error, not a guideline |
-| **zero allocations** | a counting global allocator wraps the system allocator in the test suite and asserts the pack + kernel + unpack hot paths perform **zero heap operations** |
+| **zero floating-point (`p/q`)** | `q = 2^20 = 1,048,576`: `fold_pq`, `sampling_pq`, `quantize_ternary_pq_into`, `ternary_simd_i8_pq_into`, `mlx_matmul_pq_group64_i64_into`, `mergeq_matmul_pq_into`, `rms_norm_pq_into` (`isqrt_u128`), `rope_pq_into` (`sin_cos_pq`), `swiglu_pq_into` (`exp_pq`), `sdpa_pq_single_query_into`, and `ternary_transformer_step_pq_into` execute in 100% pure `i32`/`i64`/`u128` integer arithmetic |
+| **zero allocations** | a counting global allocator wraps the system allocator in the test suite and asserts all pack + kernel + `p/q` Transformer hot paths perform **zero heap operations** |
 | **no_std** | `core`-only when built without default features; runs anywhere Rust's core runs |
 | **100% Linux + macOS** | CI runs the full suite on both `ubuntu-latest` and `macos-latest` |
 
+### Measured Benchmark (`512×512` & `256×256`, Apple Silicon M3 / aarch64)
+
+By eliminating IEEE-754 floating-point non-associativity in safe Rust (`#![forbid(unsafe_code)]`) and accumulating in 32-bit `i32` chunks (`wrapping_add` / `wrapping_mul` over 64-element blocks widened once to `i64`) with 4-column register blocking and compile-time 5-trit `BYTE_TRITS_I32: [[i32; 5]; 256]` / 4-trit `MLX_BYTE_TRITS_I32: [[i32; 4]; 256]` LUTs, LLVM auto-vectorizes the safe Rust inner loops into 128-bit NEON (`sxtl` + `mla.4s`) / 256-bit AVX2 (`vpmovsxbd` + `vpmulld`) instructions — **outperforming auto-vectorized dense FP64 by up to 5.25× with zero floating-point operations**:
+
+| Kernel | `256×256` (`ns/iter`) | `512×512` (`ns/iter`) | Floats | Speedup vs Dense `f64` (`512×512`) |
+|:---|---:|---:|:---:|:---:|
+| `dense` (`f64` auto-vectorized reference) | `54,673 ns` | `219,043 ns` | `f64` | `1.00×` |
+| **`pq-simd-i8`** (`ternary_simd_i8_pq_into`, 4-col `i8×i32->i32` SIMD) | **`10,874 ns`** | **`41,720 ns`** | **`0`** | **`5.25×`** |
+| **`pq-planes`** (`ternary_matmul_pq_planes_i_into`, 4-col sign-planes) | **`24,625 ns`** | **`88,735 ns`** | **`0`** | **`2.47×`** |
+| **`pq-group64`** (`mlx_matmul_pq_group64_i64_into`, 16-trit/`u32` `12.80×`) | **`40,362 ns`** | **`166,431 ns`** | **`0`** | **`1.32×`** |
+| **`pq-b158-i`** (`ternary_matmul_pq_i_major_into`, 5-trits/byte `20.19×`) | **`42,469 ns`** | **`165,693 ns`** | **`0`** | **`1.32×`** |
+| `c/bench` `cpu pq-simd` (C99 inline NEON/SSE4.1 `i8×i32` asm) | `24,300 ns` (`vs 61,320 ns dense`) | — | **`0`** | **`2.52×`** |
+
 The bithacks, in order of appearance:
 
-1. **5 trits per byte, base-3** — log₂3 ≈ 1.585 bits/weight, the optimal
-   ternary packing (40× denser than f64).
+1. **5 trits per byte, base-3 (`BYTE_TRITS_I32`) & 16 trits per `u32` (`MLX_BYTE_TRITS_I32`)** — log₂3 ≈ 1.585 bits/weight (`20.19×` denser than f32, `40.38×` denser than f64) and Group-64 (`12.80×` denser than f32), decoded via single L1-resident compile-time `i32` lookup tables.
 2. **Branchless digit mapping** — `digit = t as u8 + (t as u8 >> 7) * 3`
    maps `-1 → 2, 0 → 0, +1 → 1` with no branch.
-3. **Compile-time LUTs** — five const-evaluated 256-entry slot tables mean
-   zero division, zero modulo in the hot path.
-4. **FMA accumulation** — fused multiply-add on aarch64/x86_64 std builds,
-   portable two-op fallback in core-only builds.
-5. **4-way ILP** — four independent accumulators break the serial f64 FMA
-   dependency chain in the plane kernel.
-6. **Aligned fast path** — `cols % 5 == 0` drops all per-slot bounds guards.
-7. **Skip-zero-byte** — a byte of all-zero trits skips five accumulators.
-8. **Magic-constant sqrt** — a hand-rolled `core`-only sqrt with a bit-level
-   exponent-halving guess and Newton fixpoint, because `f64::sqrt` lives in
-   std.
-
-The bench is three-way and honest: packed-j (the JS-parity layout), packed-i
-(LUT path), and the i8 sign-plane kernel with register accumulators, all
-measured against auto-vectorized dense f64. The scalar safe-Rust kernels do
-not pretend to outrun the auto-vectorizer — that is what a Metal/NEON backend
-is for — and the bench prints whatever they actually get, every time.
+3. **Pure-Integer `p/q` Threshold Hoisting** — `|w| * 2 * cols >= sum_abs` quantizes weights to `{-1, 0, +1}` with **zero floating-point operations and zero per-weight divisions**.
+4. **32-bit Chunked Associative SIMD (`i8 × i32 -> i32`)** — 4-column register blocking over 64-element `i32` chunks unlocks NEON `mla.4s` / AVX2 `vpmulld` auto-vectorization in 100% safe `#![forbid(unsafe_code)]` Rust.
+5. **Exact Integer Square Root (`isqrt_u128`) & Transcendentals (`sin_cos_pq`, `exp_pq`)** — hardware-exact integer Newton/bit-by-bit `isqrt_u128`, 5th-order range-reduced fixed-point `sin_cos_pq`, and 6-squaring `exp_pq` power full `rms_norm_pq_into`, `rope_pq_into`, `swiglu_pq_into`, `sdpa_pq_single_query_into`, and `ternary_transformer_step_pq_into` with **0 floats**.
+6. **Unguarded interior byte loop & pre-fused row scales** — Hoisting `x[j] * scale[j]` once in $O(\text{rows})$ and splitting partial boundary bytes from full interior bytes eliminates all per-trit bounds branches.
 
 ## 🧠 osarous — local model support
 

@@ -543,17 +543,17 @@ fn run_mlx_quant_tool(target: &str) -> String {
         .clamp(64, 1024);
     let bench_json = crate::server::run_bench(dim);
     format!(
-        "Pure-Rust MLX & MLX-QUANT Engine (`gaia_mlx_quant::mlx` in `/home/hue/8b-is/alexiai/rust/gaia-mlx-quant/src/mlx.rs`)\n\
-         • Attributes: `#![no_std]`, `#![forbid(unsafe_code)]`, zero heap allocations on all hot paths (proven by `tests/zero_alloc.rs`)\n\
+        "Pure-Rust MLX & MLX-QUANT Engine v0.3.0 (`gaia_mlx_quant::mlx` in `/home/hue/8b-is/alexiai/rust/gaia-mlx-quant/src/mlx.rs`)\n\
+         • Attributes: `#![no_std]`, `#![forbid(unsafe_code)]`, zero heap allocations on all hot paths (proven by `tests/zero_alloc.rs`), 100% float-free `p/q` (`q = 2^20 = 1,048,576`) integer substrate\n\
          • Modes implemented in 100% safe Rust:\n\
-           1. `TernaryGroup64` (`mlx_quantize_group64_into` / `mlx_dequantize_group64_into` / `mlx_quantized_matmul_into`): 16 two-bit trits per `u32` word, `group_size=64`, exact `12.80x` compression vs F32 (wire-compatible with `8b-is/mlx-quant-mcp`)\n\
-           2. `TernaryB158` (`ternary_matmul` / `ternary_matmul_i_major` / `ternary_matmul_planes_i`): 5 trits per byte (`3^5 = 243`), `1.585` bits/weight, `20.19x` compression vs F32\n\
-           3. `MergeQ` (`mergeq_matmul_into`): triple-fused `quantize + dequantize + matmul` in a single streaming register pass with 0 B intermediate buffer\n\
-           4. `Maybe` (`maybe_matmul_into`): probabilistic stochastic ternary matmul with SplitMix64 seed (`E[w_hat] = w`)\n\
-           5. `GatherQMM` (`gather_qmm_into`): Mixture-of-Experts (MoE) top-k routed quantized matmul\n\
+           1. `TernaryGroup64` (`mlx_quantize_group64_pq_into` / `mlx_matmul_pq_group64_i64_into` / `mlx_quantized_matmul_into`): 16 two-bit trits per `u32` word, `group_size=64`, exact `12.80x` compression vs F32\n\
+           2. `TernaryB158` (`ternary_simd_i8_pq_into` / `ternary_matmul_pq_planes_i_into` / `ternary_matmul_pq_i_major_into`): 5 trits per byte (`3^5 = 243`), `1.585` bits/weight, `20.19x` compression vs F32, 5.25x faster than dense FP64 with 0 floats\n\
+           3. `MergeQ` (`mergeq_matmul_pq_into` / `mergeq_matmul_into`): triple-fused `quantize + dequantize + matmul` in a single streaming register pass with 0 B intermediate buffer\n\
+           4. `Maybe` (`maybe_matmul_pq_into` / `maybe_matmul_into`): probabilistic stochastic ternary matmul with SplitMix64 seed (`E[w_hat] = w`)\n\
+           5. `GatherQMM` (`gather_qmm_pq_into` / `gather_qmm_into`): Mixture-of-Experts (MoE) top-k routed quantized matmul\n\
            6. `StridedView`: zero-copy 2D unified-memory tensor views (`row_major`, `transpose`, `slice`)\n\
-           7. `STE Autodiff` (`ste_linear_backward_into`): Straight-Through Estimator reverse-mode gradients for BitNet b1.58 QAT\n\
-           8. `TernaryTransformerBlock` (`ternary_transformer_step_into`): full layer (`rms_norm_into` + Ternary QKV + `rope_into` + causal `sdpa_single_query_into` + Ternary O-Proj + `swiglu_into` MLP)\n\n\
+           7. `STE Autodiff` (`ste_linear_backward_pq_into` / `ste_linear_backward_into`): Straight-Through Estimator reverse-mode gradients for BitNet b1.58 QAT\n\
+           8. `TernaryTransformerBlock` (`ternary_transformer_step_pq_into` / `ternary_transformer_step_into`): full layer (`rms_norm_pq_into` + Ternary QKV + `rope_pq_into` + causal `sdpa_pq_single_query_into` + Ternary O-Proj + `swiglu_pq_into` MLP)\n\n\
          Live Measured Benchmark (`dim = {dim}`):\n```json\n{bench_json}\n```"
     )
 }

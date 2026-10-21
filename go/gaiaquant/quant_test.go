@@ -176,4 +176,33 @@ func TestFoldSpectrumModulatesEntropy(t *testing.T) {
 	if s.Temperature < 0.05 || s.Temperature > 1.2 || s.TopK < 20 || s.TopK > 80 {
 		t.Fatalf("sampling out of bounds: %+v", s)
 	}
+
+	lowPq := FoldSpectrumPq(prompt, 524288, nil)
+	highPq := FoldSpectrumPq(prompt, 5033165, nil)
+	if lowPq.Seed != low.Seed || !(highPq.EntropyP > lowPq.EntropyP) {
+		t.Fatalf("FoldSpectrumPq mismatch: low=%+v high=%+v", lowPq, highPq)
+	}
+}
+
+func TestTernaryMatMulPqMatchesExactInteger(t *testing.T) {
+	rows, cols := 4, 7
+	trits := make([]int8, rows*cols)
+	for i := range trits {
+		trits[i] = []int8{-1, 0, 1}[i%3]
+	}
+	pX := []int32{1048576, -524288, 2097152, 262144}
+	packed := make([]uint8, (rows*cols+TritPerByte-1)/TritPerByte)
+	PackTrits(trits, packed)
+	pOut := make([]int64, cols)
+	TernaryMatMulPq(packed, rows, cols, pX, nil, int32(PqDefaultQ), pOut)
+
+	for c := 0; c < cols; c++ {
+		var want int64
+		for r := 0; r < rows; r++ {
+			want += int64(trits[r*cols+c]) * int64(pX[r])
+		}
+		if pOut[c] != want {
+			t.Fatalf("col %d: got %d want %d", c, pOut[c], want)
+		}
+	}
 }

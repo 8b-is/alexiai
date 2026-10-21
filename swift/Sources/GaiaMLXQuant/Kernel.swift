@@ -270,4 +270,157 @@ public enum GaiaMLXQuant {
             seed: f.seed
         )
     }
+
+    // MARK: p / q ("Counting Divided" — Pure Integer Z/Q Substrate, 0 floats)
+
+    /// Canonical dyadic denominator q = 2^20 = 1,048,576.
+    public static let pqDefaultQ: Int64 = 1_048_576
+    public static let gravityRestPq: Int32 = 1_048_576
+    public static let entropyRestPq: Int32 = 650_117
+    public static let weatherRestPq: Int32 = 524_288
+    public static let phiPq: Int32 = 1_696_631
+
+    public struct FoldPq: Equatable, Sendable {
+        public let seed: UInt32
+        public let gravityPq: Int32
+        public let entropyPq: Int32
+        public let weatherPq: Int32
+        public let resonancePq: Int32
+        public let dominant: String
+        public let coherencePq: Int32
+    }
+
+    /// Pure-integer p/q per-row absmean ternary quantization (0 floats).
+    ///
+    /// Uses the exact algebraic identity `round(|w| / (sum_abs / cols)) >= 1 <=> |w| * 2 * cols >= sum_abs`.
+    public static func quantizePerRowPq(
+        _ pW: [Int32],
+        rows: Int,
+        cols: Int
+    ) -> (trits: [Int8], pScales: [Int32]) {
+        var trits = [Int8](repeating: 0, count: pW.count)
+        var pScales = [Int32](repeating: 0, count: rows)
+        if rows == 0 || cols == 0 { return (trits, pScales) }
+        let twoCols = Int64(cols) * 2
+        for r in 0..<rows {
+            var sumAbs: Int64 = 0
+            let rowBase = r * cols
+            for c in 0..<cols {
+                let v = Int64(pW[rowBase + c])
+                sumAbs += v < 0 ? -v : v
+            }
+            if sumAbs == 0 {
+                pScales[r] = Int32(pqDefaultQ)
+                continue
+            }
+            pScales[r] = Int32(clamping: (sumAbs + Int64(cols / 2)) / Int64(cols))
+            for c in 0..<cols {
+                let v = Int64(pW[rowBase + c])
+                let av = v < 0 ? -v : v
+                if av * twoCols >= sumAbs {
+                    trits[rowBase + c] = v >= 0 ? 1 : -1
+                } else {
+                    trits[rowBase + c] = 0
+                }
+            }
+        }
+        return (trits, pScales)
+    }
+
+    /// Pure-integer p/q j-major ternary matmul (0 floats).
+    public static func ternaryMatMulPq(
+        packed: [UInt8],
+        rows: Int,
+        cols: Int,
+        pX: [Int32],
+        pScales: [Int32]?,
+        qX: Int64 = pqDefaultQ,
+        qScale: Int64 = pqDefaultQ,
+        into pOut: inout [Int64]
+    ) {
+        for i in 0..<cols { pOut[i] = 0 }
+        let luts = slotLuts
+        let qS = qScale > 0 ? qScale : 1
+        for j in 0..<rows {
+            var xj = Int64(pX[j])
+            if xj == 0 { continue }
+            if let pScales {
+                xj = (xj * Int64(pScales[j])) / qS
+                if xj == 0 { continue }
+            }
+            let startT = j * cols
+            let endT = startT + cols
+            let startB = startT / tritsPerByte
+            let endB = (endT + tritsPerByte - 1) / tritsPerByte
+            for b in startB..<endB {
+                let byte = packed[b]
+                if byte == 0 { continue }
+                let base = b * tritsPerByte
+                let t0 = base
+                if t0 >= startT && t0 < endT {
+                    pOut[t0 - startT] += Int64(luts[0][Int(byte)]) * xj
+                }
+                let t1 = base + 1
+                if t1 >= startT && t1 < endT {
+                    pOut[t1 - startT] += Int64(luts[1][Int(byte)]) * xj
+                }
+                let t2 = base + 2
+                if t2 >= startT && t2 < endT {
+                    pOut[t2 - startT] += Int64(luts[2][Int(byte)]) * xj
+                }
+                let t3 = base + 3
+                if t3 >= startT && t3 < endT {
+                    pOut[t3 - startT] += Int64(luts[3][Int(byte)]) * xj
+                }
+                let t4 = base + 4
+                if t4 >= startT && t4 < endT {
+                    pOut[t4 - startT] += Int64(luts[4][Int(byte)]) * xj
+                }
+            }
+        }
+    }
+
+    @inline(__always)
+    private static func clampI32(_ v: Int32, _ minV: Int32, _ maxV: Int32) -> Int32 {
+        if v < minV { return minV }
+        if v > maxV { return maxV }
+        return v
+    }
+
+    /// Pure-integer p/q GAIA spectrum fold (0 floats).
+    public static func foldSpectrumPq(
+        _ prompt: String,
+        rfEntropyBitsPq: Int32,
+        seed: UInt32? = nil
+    ) -> FoldPq {
+        let s = seed ?? seedFrom(prompt)
+        let a = s &+ 0x6d2b79f5
+        var t = (a ^ (a >> 15)) &* (a | 1)
+        t ^= t &+ ((t ^ (t >> 7)) &* (t | 61))
+        let randPq = Int32(((t ^ (t >> 14)) >> 12) & 0xF_FFFF)
+
+        let rfDelta = Int64(rfEntropyBitsPq) - 2_621_440
+        let rfFactor = clampI32(Int32((rfDelta * 52_429) >> 20), -83_886, 146_801)
+        let rawLen = Int64(prompt.utf8.count) * 256
+        let lenFactor = Int32(min(rawLen, 367_002))
+        let entropyPq = clampI32(entropyRestPq + lenFactor - 157_286 + rfFactor, 0, Int32(pqDefaultQ))
+        let weatherDelta = ((Int64(randPq) - 524_288) * 419_430) >> 20
+        let weatherPq = clampI32(weatherRestPq + Int32(weatherDelta), 0, Int32(pqDefaultQ))
+
+        let de = abs(entropyPq - entropyRestPq)
+        let dw = abs(weatherPq - weatherRestPq)
+        let dominant = dw > de ? "weather" : (de > 0 ? "entropy" : "gravity")
+        let spreadPq = Int32((Int64(de) * 629_146 + Int64(dw) * 419_430) >> 20)
+        let coherencePq = clampI32(Int32(pqDefaultQ) - spreadPq, 0, Int32(pqDefaultQ))
+
+        return FoldPq(
+            seed: s,
+            gravityPq: gravityRestPq,
+            entropyPq: entropyPq,
+            weatherPq: weatherPq,
+            resonancePq: phiPq,
+            dominant: dominant,
+            coherencePq: coherencePq
+        )
+    }
 }

@@ -62,28 +62,37 @@ pub mod mlx;
 pub mod pack;
 
 pub use gaia::{
-    ENTROPY_REST, GRAVITY, Layer, PHI, RESONANCE, WEATHER_REST, Fold, Sampling, fold,
-    fold_spectrum, sampling, seed_from,
+    ENTROPY_REST, ENTROPY_REST_PQ, Fold, FoldPq, GAIA_PQ_Q, GRAVITY, GRAVITY_REST_PQ, Layer, PHI,
+    PHI_PQ, RESONANCE, RESONANCE_REST_PQ, Sampling, SamplingPq, WEATHER_REST, WEATHER_REST_PQ,
+    fold, fold_pq, fold_spectrum, fold_spectrum_pq, mulberry32_pq, sampling, sampling_pq,
+    seed_from,
 };
 pub use kernel::{
-    dense_matmul, pack_ternary_i_major_into, pack_ternary_planes_i_into, relative_error,
-    ternary_matmul, ternary_matmul_i_major, ternary_matmul_planes_i,
+    KERNEL_PQ_Q, dense_matmul, dense_matmul_pq_into, isqrt_u128, pack_ternary_i_major_into,
+    pack_ternary_planes_i_into, quantize_ternary_pq_into, relative_error, relative_error_pq_ppm,
+    ternary_matmul, ternary_matmul_i_major, ternary_matmul_planes_i, ternary_matmul_pq_i_major_into,
+    ternary_matmul_pq_j_major_into, ternary_matmul_pq_planes_i_into, ternary_simd_i8_pq_into,
 };
 #[cfg(feature = "std")]
 pub use kernel::{Quantized, quantize_ternary};
 pub use mlx::{
-    MLX_GROUP_SIZE, MLX_GROUP64_COMPRESSION, PQ_DEFAULT_Q, Pq, QuantMode, StridedView,
-    TRITS_PER_U32, b158_matmul_pq_i_major_into, gather_qmm_into, maybe_matmul_into,
-    mergeq_matmul_into, mlx_code_of, mlx_dequantize_group64_into, mlx_matmul_pq_group64_into,
-    mlx_quantize_group64_into, mlx_quantized_matmul_into, mlx_trit_of, quantize_pq_into,
-    rms_norm_into, rope_into, sdpa_single_query_into, ste_linear_backward_into, swiglu_into,
-    ternary_simd_pq_matmul_into, ternary_transformer_step_into,
+    MLX_BYTE_TRITS_I32, MLX_GROUP_SIZE, MLX_GROUP64_COMPRESSION, PQ_DEFAULT_Q, Pq, QuantMode,
+    StridedView, TRITS_PER_U32, b158_matmul_pq_i_major_into, exp_pq, gather_qmm_into,
+    gather_qmm_pq_into, maybe_matmul_into, maybe_matmul_pq_into, mergeq_matmul_into,
+    mergeq_matmul_pq_into, mlx_code_of, mlx_dequantize_group64_into,
+    mlx_dequantize_group64_pq_into, mlx_matmul_pq_group64_i64_into, mlx_matmul_pq_group64_into,
+    mlx_quantize_group64_into, mlx_quantize_group64_pq_into, mlx_quantized_matmul_into,
+    mlx_trit_of, quantize_pq_adaptive_into, quantize_pq_into, rms_norm_into, rms_norm_pq_into,
+    rope_into, rope_pq_into, sdpa_pq_single_query_into, sdpa_single_query_into, sin_cos_pq,
+    ste_linear_backward_into, ste_linear_backward_pq_into, swiglu_into, swiglu_pq_into,
+    ternary_simd_pq_matmul_into, ternary_transformer_step_into, ternary_transformer_step_pq_into,
 };
 #[cfg(feature = "std")]
 pub use mlx::MlxQuantizedMatrix;
 pub use pack::{
-    BITS_PER_WEIGHT, COMPRESSION_VS_F32, POW3, TRITS_PER_BYTE, digit_of, pack_ternary_into,
-    trit_of, unpack_ternary_into,
+    BITS_PER_WEIGHT, BITS_PER_WEIGHT_PQ, BYTE_TRITS_I32, COMPRESSION_VS_F32,
+    COMPRESSION_VS_F32_PQ, POW3, TRITS_PER_BYTE, digit_of, pack_ternary_into, trit_of,
+    unpack_ternary_into,
 };
 #[cfg(feature = "std")]
 pub use pack::{pack_ternary, unpack_ternary};

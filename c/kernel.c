@@ -145,6 +145,54 @@ double gmq_trit_dot(const int8_t *pos, const int8_t *neg, const double *x, size_
     }
     return acc;
 }
+
+/* NEON pure-integer p/q trit dot: 8 trits per iteration in 32-bit integer lanes (0 floats!). */
+int64_t gmq_trit_dot_pq(const int8_t *trits, const int32_t *p_x, size_t n) {
+    int64_t total = 0;
+    size_t offset = 0;
+    /* Process in chunks of up to 512 elements so 32-bit accumulators never overflow. */
+    while (offset < n) {
+        size_t rem = n - offset;
+        size_t chunk = rem > 512 ? 512 : rem;
+        size_t vec_len = chunk & ~(size_t)7;
+        const int8_t *tp = trits + offset;
+        const int32_t *xp = p_x + offset;
+        const int8_t *tp0 = tp;
+        const int32_t *xp0 = xp;
+        size_t k = vec_len;
+        int32_t chunk_sum = 0;
+        if (k > 0) {
+            __asm__ volatile(
+                "movi v0.4s, #0\n\t"
+                "movi v1.4s, #0\n\t"
+                "1:\n\t"
+                "ld1 {v2.8b}, [%x[t]], #8\n\t"
+                "sxtl v3.8h, v2.8b\n\t"
+                "sxtl v4.4s, v3.4h\n\t"
+                "sxtl2 v5.4s, v3.8h\n\t"
+                "ld1 {v6.4s, v7.4s}, [%x[x]], #32\n\t"
+                "mla v0.4s, v4.4s, v6.4s\n\t"
+                "mla v1.4s, v5.4s, v7.4s\n\t"
+                "subs %x[k], %x[k], #8\n\t"
+                "b.ne 1b\n\t"
+                "add v0.4s, v0.4s, v1.4s\n\t"
+                "addv s0, v0.4s\n\t"
+                "fmov %w[out], s0\n\t"
+                : [out] "=r"(chunk_sum), [t] "+r"(tp), [x] "+r"(xp), [k] "+r"(k)
+                :
+                : "cc", "memory", "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7");
+        }
+        total += (int64_t)chunk_sum;
+        {
+            size_t i;
+            for (i = vec_len; i < chunk; i++) {
+                total += (int64_t)tp0[i] * (int64_t)xp0[i];
+            }
+        }
+        offset += chunk;
+    }
+    return total;
+}
 int gmq_uses_asm(void) { return 1; }
 
 #elif defined(__x86_64__) && defined(__SSE4_1__)
@@ -195,6 +243,57 @@ double gmq_trit_dot(const int8_t *pos, const int8_t *neg, const double *x, size_
     }
     return acc;
 }
+
+/* SSE4.1 pure-integer p/q trit dot: 8 trits per iteration via pmovsxbd + pmulld + paddd (0 floats!). */
+int64_t gmq_trit_dot_pq(const int8_t *trits, const int32_t *p_x, size_t n) {
+    int64_t total = 0;
+    size_t offset = 0;
+    while (offset < n) {
+        size_t rem = n - offset;
+        size_t chunk = rem > 512 ? 512 : rem;
+        size_t vec_len = chunk & ~(size_t)7;
+        const int8_t *tp = trits + offset;
+        const int32_t *xp = p_x + offset;
+        const int8_t *tp0 = tp;
+        const int32_t *xp0 = xp;
+        size_t k = vec_len;
+        int32_t lanes[4] = {0, 0, 0, 0};
+        if (k > 0) {
+            __asm__ volatile(
+                "pxor %%xmm0, %%xmm0\n\t"
+                "pxor %%xmm1, %%xmm1\n\t"
+                "1:\n\t"
+                "movd (%[t]), %%xmm2\n\t"
+                "movd 4(%[t]), %%xmm3\n\t"
+                "pmovsxbd %%xmm2, %%xmm2\n\t"
+                "pmovsxbd %%xmm3, %%xmm3\n\t"
+                "movdqu (%[x]), %%xmm4\n\t"
+                "movdqu 16(%[x]), %%xmm5\n\t"
+                "pmulld %%xmm4, %%xmm2\n\t"
+                "pmulld %%xmm5, %%xmm3\n\t"
+                "paddd %%xmm2, %%xmm0\n\t"
+                "paddd %%xmm3, %%xmm1\n\t"
+                "add $8, %[t]\n\t"
+                "add $32, %[x]\n\t"
+                "sub $8, %[k]\n\t"
+                "jnz 1b\n\t"
+                "paddd %%xmm1, %%xmm0\n\t"
+                "movdqu %%xmm0, %[lanes]\n\t"
+                : [lanes] "=m"(lanes), [t] "+r"(tp), [x] "+r"(xp), [k] "+r"(k)
+                :
+                : "cc", "memory", "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5");
+            total += (int64_t)lanes[0] + (int64_t)lanes[1] + (int64_t)lanes[2] + (int64_t)lanes[3];
+        }
+        {
+            size_t i;
+            for (i = vec_len; i < chunk; i++) {
+                total += (int64_t)tp0[i] * (int64_t)xp0[i];
+            }
+        }
+        offset += chunk;
+    }
+    return total;
+}
 int gmq_uses_asm(void) { return 1; }
 
 #else
@@ -205,10 +304,104 @@ double gmq_trit_dot(const int8_t *pos, const int8_t *neg, const double *x, size_
     for (i = 0; i < n; i++) acc += (double)(pos[i] - neg[i]) * x[i];
     return acc;
 }
+int64_t gmq_trit_dot_pq(const int8_t *trits, const int32_t *p_x, size_t n) {
+    int64_t acc = 0;
+    size_t i;
+    for (i = 0; i < n; i++) acc += (int64_t)trits[i] * (int64_t)p_x[i];
+    return acc;
+}
 int gmq_uses_asm(void) { return 0; }
 #endif
 
 /* ── the kernels ─────────────────────────────────────────────────────────── */
+
+void gmq_quantize_per_row_pq(const int32_t *w_p, size_t rows, size_t cols,
+                             int32_t q, int8_t *trits_out, int32_t *scales_p_out) {
+    size_t r, c;
+    int64_t cols_i64 = (int64_t)cols;
+    int64_t two_cols = cols_i64 * 2;
+    for (r = 0; r < rows; r++) {
+        const int32_t *row = &w_p[r * cols];
+        int8_t *dst = &trits_out[r * cols];
+        int64_t sum_abs = 0;
+        for (c = 0; c < cols; c++) {
+            int64_t v = (int64_t)row[c];
+            sum_abs += v < 0 ? -v : v;
+        }
+        if (sum_abs == 0) {
+            scales_p_out[r] = q;
+            for (c = 0; c < cols; c++) dst[c] = 0;
+            continue;
+        }
+        scales_p_out[r] = (int32_t)((sum_abs + (cols_i64 >> 1)) / cols_i64);
+        for (c = 0; c < cols; c++) {
+            int64_t v = (int64_t)row[c];
+            int64_t av = v < 0 ? -v : v;
+            if (av * two_cols < sum_abs) {
+                dst[c] = 0;
+            } else {
+                dst[c] = v > 0 ? 1 : -1;
+            }
+        }
+    }
+}
+
+void gmq_ternary_matmul_pq(const uint8_t *packed, size_t rows, size_t cols,
+                           const int32_t *p_x, const int32_t *p_scales,
+                           int32_t q_scale, int64_t *p_out) {
+    size_t i, j;
+    int64_t q_s = q_scale > 0 ? (int64_t)q_scale : 1;
+    int64_t half_q = q_s >> 1;
+    gmq_build_luts();
+    for (i = 0; i < cols; i++) p_out[i] = 0;
+    for (j = 0; j < rows; j++) {
+        int64_t xj = (int64_t)p_x[j];
+        size_t start_t, end_t, start_b, end_b, b;
+        if (xj == 0) continue;
+        if (p_scales) {
+            int64_t prod = xj * (int64_t)p_scales[j];
+            xj = prod >= 0 ? (prod + half_q) / q_s : (prod - half_q) / q_s;
+            if (xj == 0) continue;
+        }
+        start_t = j * cols;
+        end_t = start_t + cols;
+        start_b = start_t / GMQ_TRITS_PER_BYTE;
+        end_b = (end_t + GMQ_TRITS_PER_BYTE - 1) / GMQ_TRITS_PER_BYTE;
+        for (b = start_b; b < end_b; b++) {
+            uint8_t byte = packed[b];
+            size_t base;
+            if (byte == 0) continue;
+            base = b * GMQ_TRITS_PER_BYTE;
+            if (base >= start_t && base + GMQ_TRITS_PER_BYTE <= end_t) {
+                size_t col = base - start_t;
+                p_out[col + 0] += (int64_t)gmq_t0[byte] * xj;
+                p_out[col + 1] += (int64_t)gmq_t1[byte] * xj;
+                p_out[col + 2] += (int64_t)gmq_t2[byte] * xj;
+                p_out[col + 3] += (int64_t)gmq_t3[byte] * xj;
+                p_out[col + 4] += (int64_t)gmq_t4[byte] * xj;
+            } else {
+                size_t t = base;
+                if (t >= start_t && t < end_t) p_out[t - start_t] += (int64_t)gmq_t0[byte] * xj;
+                t = base + 1;
+                if (t >= start_t && t < end_t) p_out[t - start_t] += (int64_t)gmq_t1[byte] * xj;
+                t = base + 2;
+                if (t >= start_t && t < end_t) p_out[t - start_t] += (int64_t)gmq_t2[byte] * xj;
+                t = base + 3;
+                if (t >= start_t && t < end_t) p_out[t - start_t] += (int64_t)gmq_t3[byte] * xj;
+                t = base + 4;
+                if (t >= start_t && t < end_t) p_out[t - start_t] += (int64_t)gmq_t4[byte] * xj;
+            }
+        }
+    }
+}
+
+void gmq_simd_matmul_pq(const int8_t *trits_i_major, size_t rows, size_t cols,
+                        const int32_t *p_x, int64_t *p_out) {
+    size_t i;
+    for (i = 0; i < cols; i++) {
+        p_out[i] = gmq_trit_dot_pq(&trits_i_major[i * rows], p_x, rows);
+    }
+}
 
 void gmq_ternary_matmul(const uint8_t *packed, size_t rows, size_t cols,
                         const double *x, const double *scales, double gamma,
@@ -229,19 +422,28 @@ void gmq_ternary_matmul(const uint8_t *packed, size_t rows, size_t cols,
         end_b = (end_t + GMQ_TRITS_PER_BYTE - 1) / GMQ_TRITS_PER_BYTE;
         for (b = start_b; b < end_b; b++) {
             uint8_t byte = packed[b];
-            size_t base, t;
+            size_t base;
             if (byte == 0) continue;
             base = b * GMQ_TRITS_PER_BYTE;
-            t = base;
-            if (t >= start_t && t < end_t) out[t - start_t] += (double)gmq_t0[byte] * xj;
-            t = base + 1;
-            if (t >= start_t && t < end_t) out[t - start_t] += (double)gmq_t1[byte] * xj;
-            t = base + 2;
-            if (t >= start_t && t < end_t) out[t - start_t] += (double)gmq_t2[byte] * xj;
-            t = base + 3;
-            if (t >= start_t && t < end_t) out[t - start_t] += (double)gmq_t3[byte] * xj;
-            t = base + 4;
-            if (t >= start_t && t < end_t) out[t - start_t] += (double)gmq_t4[byte] * xj;
+            if (base >= start_t && base + GMQ_TRITS_PER_BYTE <= end_t) {
+                size_t col = base - start_t;
+                out[col + 0] += (double)gmq_t0[byte] * xj;
+                out[col + 1] += (double)gmq_t1[byte] * xj;
+                out[col + 2] += (double)gmq_t2[byte] * xj;
+                out[col + 3] += (double)gmq_t3[byte] * xj;
+                out[col + 4] += (double)gmq_t4[byte] * xj;
+            } else {
+                size_t t = base;
+                if (t >= start_t && t < end_t) out[t - start_t] += (double)gmq_t0[byte] * xj;
+                t = base + 1;
+                if (t >= start_t && t < end_t) out[t - start_t] += (double)gmq_t1[byte] * xj;
+                t = base + 2;
+                if (t >= start_t && t < end_t) out[t - start_t] += (double)gmq_t2[byte] * xj;
+                t = base + 3;
+                if (t >= start_t && t < end_t) out[t - start_t] += (double)gmq_t3[byte] * xj;
+                t = base + 4;
+                if (t >= start_t && t < end_t) out[t - start_t] += (double)gmq_t4[byte] * xj;
+            }
         }
     }
 }
@@ -306,5 +508,40 @@ gmq_fold_t gmq_fold_spectrum(const char *prompt, size_t len, double rf_entropy_b
     f.resonance = 1.618033988749894848204586834365638118;
     spread = fabs(f.entropy - 0.62) * 0.6 + fabs(f.weather - 0.5) * 0.4;
     f.coherence = gmq_clamp(1.0 - spread, 0.0, 1.0);
+    return f;
+}
+
+static int64_t gmq_clamp_i64(int64_t v, int64_t min_v, int64_t max_v) {
+    if (v < min_v) return min_v;
+    if (v > max_v) return max_v;
+    return v;
+}
+
+static int64_t gmq_abs_i64(int64_t v) {
+    return v < 0 ? -v : v;
+}
+
+gmq_fold_pq_t gmq_fold_spectrum_pq(const char *prompt, size_t len, int64_t rf_entropy_p) {
+    gmq_fold_pq_t f;
+    uint32_t s = gmq_seed_from(prompt, len);
+    uint32_t a = s + 0x6d2b79f5u;
+    uint32_t t = (a ^ (a >> 15)) * (a | 1u);
+    int64_t rand_p, rf_factor_p, len_p, spread_p;
+
+    t ^= t + ((t ^ (t >> 7)) * (t | 61u));
+    rand_p = (int64_t)((t ^ (t >> 14)) >> 12); /* in [0, 2^20) */
+
+    rf_factor_p = gmq_clamp_i64((rf_entropy_p - 2621440) / 20, -83886, 146801);
+    len_p = ((int64_t)len) << 8;
+    if (len_p > 367002) len_p = 367002;
+
+    f.seed = s;
+    f.q = GMQ_PQ_DEFAULT_Q;
+    f.gravity_p = 1048576;
+    f.entropy_p = gmq_clamp_i64(650117 + len_p - 157286 + rf_factor_p, 0, GMQ_PQ_DEFAULT_Q);
+    f.weather_p = gmq_clamp_i64(524288 + ((rand_p - 524288) * 2) / 5, 0, GMQ_PQ_DEFAULT_Q);
+    f.resonance_p = 1696632;
+    spread_p = (gmq_abs_i64(f.entropy_p - 650117) * 3 + gmq_abs_i64(f.weather_p - 524288) * 2) / 5;
+    f.coherence_p = gmq_clamp_i64(GMQ_PQ_DEFAULT_Q - spread_p, 0, GMQ_PQ_DEFAULT_Q);
     return f;
 }

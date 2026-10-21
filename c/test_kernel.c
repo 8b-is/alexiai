@@ -143,10 +143,49 @@ static void test_fold_spectrum(void) {
     size_t len = strlen(prompt);
     gmq_fold_t low = gmq_fold_spectrum(prompt, len, 0.5);
     gmq_fold_t high = gmq_fold_spectrum(prompt, len, 4.8);
+    gmq_fold_pq_t low_pq = gmq_fold_spectrum_pq(prompt, len, 524288);
+    gmq_fold_pq_t high_pq = gmq_fold_spectrum_pq(prompt, len, 5033165);
     CHECK(low.seed == high.seed, "fold_spectrum seed must be deterministic");
     CHECK(low.weather == high.weather, "fold_spectrum weather must be deterministic");
     CHECK(high.entropy > low.entropy, "fold_spectrum high RF entropy must lift Chaos entropy");
     CHECK(high.coherence >= 0.0 && high.coherence <= 1.0, "fold_spectrum coherence in [0, 1]");
+    CHECK(low_pq.seed == low.seed, "fold_spectrum_pq seed matches float fold");
+    CHECK(high_pq.entropy_p > low_pq.entropy_p, "fold_spectrum_pq high RF entropy lifts entropy_p");
+    CHECK(high_pq.coherence_p >= 0 && high_pq.coherence_p <= GMQ_PQ_DEFAULT_Q, "fold_spectrum_pq coherence_p in [0, q]");
+}
+
+static void test_pq_integer_kernels(void) {
+    enum { ROWS = 4, COLS = 9 };
+    int8_t trits[ROWS * COLS];
+    int8_t trits_i[ROWS * COLS];
+    int32_t p_x[ROWS] = {1048576, -524288, 2097152, 262144};
+    uint8_t packed[(ROWS * COLS + 4) / 5];
+    int64_t out_packed[COLS], out_simd[COLS];
+    size_t r, c;
+
+    for (r = 0; r < ROWS; r++) {
+        for (c = 0; c < COLS; c++) {
+            int8_t t = (int8_t)(((r * COLS + c) % 3) - 1);
+            trits[r * COLS + c] = t;
+            trits_i[c * ROWS + r] = t;
+        }
+    }
+    memset(packed, 0, sizeof(packed));
+    gmq_pack_ternary(trits, ROWS * COLS, packed);
+    gmq_ternary_matmul_pq(packed, ROWS, COLS, p_x, NULL, GMQ_PQ_DEFAULT_Q, out_packed);
+    gmq_simd_matmul_pq(trits_i, ROWS, COLS, p_x, out_simd);
+
+    for (c = 0; c < COLS; c++) {
+        int64_t expected = 0;
+        for (r = 0; r < ROWS; r++) {
+            expected += (int64_t)trits[r * COLS + c] * (int64_t)p_x[r];
+        }
+        if (out_packed[c] != expected || out_simd[c] != expected) {
+            CHECK(0, "p/q integer kernels disagree with exact integer reference");
+            return;
+        }
+    }
+    CHECK(1, "p/q integer kernels match exact integer reference");
 }
 
 #ifdef GMQ_CUDA
@@ -210,6 +249,7 @@ int main(void) {
     test_non_aligned_rows();
     test_relative_error();
     test_fold_spectrum();
+    test_pq_integer_kernels();
 #ifdef GMQ_CUDA
     test_cuda_matches_cpu();
 #endif
