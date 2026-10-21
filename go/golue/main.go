@@ -75,18 +75,34 @@ func rustBinary(explicit string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	bin := filepath.Join(cwd, "..", "rust", "target", "release", "alexiai")
-	if _, err := os.Stat(bin); os.IsNotExist(err) {
-		fmt.Fprintln(os.Stderr, "  (rust binary missing — cargo build --release)")
-		cmd := exec.Command("cargo", "build", "--release", "-p", "alexiai")
-		cmd.Dir = filepath.Join(cwd, "..", "rust")
-		cmd.Stdout = os.Stderr
-		cmd.Stderr = os.Stderr
-		if err := cmd.Run(); err != nil {
-			return "", fmt.Errorf("cargo build: %w", err)
+	candidates := []string{
+		filepath.Join(cwd, "..", "rust", "target", "release", "alexiai"),
+	}
+	if td := os.Getenv("CARGO_TARGET_DIR"); td != "" {
+		candidates = append([]string{filepath.Join(td, "release", "alexiai")}, candidates...)
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		candidates = append(candidates, filepath.Join(home, ".cargo", "target", "release", "alexiai"))
+	}
+	for _, c := range candidates {
+		if _, err := os.Stat(c); err == nil {
+			return c, nil
 		}
 	}
-	return bin, nil
+	fmt.Fprintln(os.Stderr, "  (rust binary missing — cargo build --release)")
+	cmd := exec.Command("cargo", "build", "--release", "-p", "alexiai")
+	cmd.Dir = filepath.Join(cwd, "..", "rust")
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("cargo build: %w", err)
+	}
+	for _, c := range candidates {
+		if _, err := os.Stat(c); err == nil {
+			return c, nil
+		}
+	}
+	return candidates[len(candidates)-1], nil
 }
 
 func run(args []string) error {
