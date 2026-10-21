@@ -6,6 +6,9 @@
  */
 
 #include "kernel.h"
+#ifdef GMQ_CUDA
+#include "kernel_cuda.h"
+#endif
 
 #include <math.h>
 #include <stdio.h>
@@ -146,6 +149,58 @@ static void test_fold_spectrum(void) {
     CHECK(high.coherence >= 0.0 && high.coherence <= 1.0, "fold_spectrum coherence in [0, 1]");
 }
 
+#ifdef GMQ_CUDA
+static void test_cuda_matches_cpu(void) {
+    char gpu_name[128] = {0};
+    int sm_maj = 0, sm_min = 0;
+    enum { ROWS = 17, COLS = 23 };
+    int8_t trits[ROWS * COLS];
+    double x[ROWS], scales[ROWS], w[ROWS * COLS];
+    uint8_t packed[(ROWS * COLS + 4) / 5];
+    double cpu_ternary[COLS], gpu_ternary[COLS];
+    double cpu_dense[COLS], gpu_dense[COLS];
+    int i, r, c;
+
+    if (!gmq_cuda_device_info(gpu_name, sizeof(gpu_name), &sm_maj, &sm_min)) {
+        printf("  (no CUDA device visible — skipping GPU parity check)\n");
+        return;
+    }
+    printf("  cuda device: %s (sm_%d%d)\n", gpu_name, sm_maj, sm_min);
+
+    for (r = 0; r < ROWS; r++) {
+        x[r] = (double)(r - 8) * 0.375;
+        scales[r] = 0.25 + (double)(r % 5) * 0.15;
+        for (c = 0; c < COLS; c++) {
+            int idx = r * COLS + c;
+            trits[idx] = (int8_t)((idx % 3) - 1);
+            w[idx] = (double)trits[idx] * scales[r];
+        }
+    }
+    memset(packed, 0, sizeof(packed));
+    gmq_pack_ternary(trits, ROWS * COLS, packed);
+
+    gmq_ternary_matmul(packed, ROWS, COLS, x, scales, 1.618, cpu_ternary);
+    CHECK(gmq_cuda_ternary_matmul(packed, ROWS, COLS, x, scales, 1.618, gpu_ternary) == 0,
+          "gmq_cuda_ternary_matmul succeeded");
+
+    gmq_dense_matmul(w, ROWS, COLS, x, cpu_dense);
+    CHECK(gmq_cuda_dense_matmul(w, ROWS, COLS, x, gpu_dense) == 0,
+          "gmq_cuda_dense_matmul succeeded");
+
+    for (i = 0; i < COLS; i++) {
+        if (fabs(cpu_ternary[i] - gpu_ternary[i]) > 1e-12) {
+            CHECK(0, "CUDA ternary kernel disagrees with C99 reference");
+            return;
+        }
+        if (fabs(cpu_dense[i] - gpu_dense[i]) > 1e-12) {
+            CHECK(0, "CUDA dense kernel disagrees with C99 reference");
+            return;
+        }
+    }
+    CHECK(1, "CUDA GPU ternary & dense kernels match C99 reference");
+}
+#endif
+
 int main(void) {
     printf("gmq C99 test harness — asm path: %s\n", gmq_uses_asm() ? "compiled in" : "not compiled");
     test_round_trip();
@@ -155,6 +210,9 @@ int main(void) {
     test_non_aligned_rows();
     test_relative_error();
     test_fold_spectrum();
+#ifdef GMQ_CUDA
+    test_cuda_matches_cpu();
+#endif
     if (failures) {
         fprintf(stderr, "%d failure(s)\n", failures);
         return 1;

@@ -9,7 +9,7 @@
 //! check in [`crate::sovereign`], so a remote endpoint is unreachable by
 //! construction.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
@@ -30,10 +30,20 @@ impl Response {
 
 /// A full HTTP request with the response body buffered.
 pub fn request(url: &str, method: &str, body: Option<&str>) -> Result<Response, String> {
+    request_with_headers(url, method, &[], body)
+}
+
+/// A full HTTP request with custom headers and the response body buffered.
+pub fn request_with_headers(
+    url: &str,
+    method: &str,
+    extra_headers: &[(&str, &str)],
+    body: Option<&str>,
+) -> Result<Response, String> {
     let (host, port) = assert_loopback(url)?; // the guard: before any socket
     let path = path_of(url);
     let mut stream = connect_raw(&host, port)?;
-    write_head(&mut stream, method, &path, body)?;
+    write_head_with_headers(&mut stream, method, &path, extra_headers, body)?;
 
     // One reader for the whole exchange: a duplicated fd would lose bytes
     // buffered by a first reader.
@@ -60,9 +70,22 @@ fn path_of(url: &str) -> String {
 }
 
 fn write_head(stream: &mut TcpStream, method: &str, path: &str, body: Option<&str>) -> Result<(), String> {
+    write_head_with_headers(stream, method, path, &[], body)
+}
+
+fn write_head_with_headers(
+    stream: &mut TcpStream,
+    method: &str,
+    path: &str,
+    extra_headers: &[(&str, &str)],
+    body: Option<&str>,
+) -> Result<(), String> {
     let mut head = format!(
         "{method} {path} HTTP/1.1\r\nHost: localhost\r\nAccept: */*\r\nConnection: close\r\n"
     );
+    for (k, v) in extra_headers {
+        head.push_str(&format!("{k}: {v}\r\n"));
+    }
     if let Some(b) = body {
         head.push_str("Content-Type: application/json\r\n");
         head.push_str(&format!("Content-Length: {}\r\n", b.len()));
@@ -101,12 +124,15 @@ fn read_headers(reader: &mut impl BufRead) -> Result<Vec<(String, String)>, Stri
     Ok(headers)
 }
 
-fn read_body_from(reader: &mut impl BufRead, headers: &[(String, String)]) -> Result<Vec<u8>, String> {
-    let chunked = headers
+fn is_chunked(headers: &[(String, String)]) -> bool {
+    headers
         .iter()
         .find(|(k, _)| k == "transfer-encoding")
-        .is_some_and(|(_, v)| v.to_ascii_lowercase().contains("chunked"));
-    if chunked {
+        .is_some_and(|(_, v)| v.to_ascii_lowercase().contains("chunked"))
+}
+
+fn read_body_from(reader: &mut impl BufRead, headers: &[(String, String)]) -> Result<Vec<u8>, String> {
+    if is_chunked(headers) {
         return read_chunked(reader);
     }
     let len = headers
@@ -119,24 +145,68 @@ fn read_body_from(reader: &mut impl BufRead, headers: &[(String, String)]) -> Re
     Ok(buf)
 }
 
+struct ChunkedReader<R> {
+    inner: R,
+    remaining: usize,
+    eof: bool,
+}
+
+impl<R> ChunkedReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            remaining: 0,
+            eof: false,
+        }
+    }
+}
+
+impl<R: BufRead> Read for ChunkedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.eof || buf.is_empty() {
+            return Ok(0);
+        }
+        while self.remaining == 0 {
+            let mut size_line = String::new();
+            let n = self.inner.read_line(&mut size_line)?;
+            if n == 0 {
+                self.eof = true;
+                return Ok(0);
+            }
+            let trimmed = size_line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let hex = trimmed.split(';').next().unwrap_or("0");
+            let size = usize::from_str_radix(hex, 16)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            if size == 0 {
+                let mut trailer = String::new();
+                let _ = self.inner.read_line(&mut trailer);
+                self.eof = true;
+                return Ok(0);
+            }
+            self.remaining = size;
+        }
+        let max_read = buf.len().min(self.remaining);
+        let n = self.inner.read(&mut buf[..max_read])?;
+        if n == 0 {
+            self.eof = true;
+            return Ok(0);
+        }
+        self.remaining -= n;
+        if self.remaining == 0 {
+            let mut crlf = [0u8; 2];
+            let _ = self.inner.read_exact(&mut crlf);
+        }
+        Ok(n)
+    }
+}
+
 fn read_chunked(reader: &mut impl BufRead) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
-    loop {
-        let mut size_line = String::new();
-        reader.read_line(&mut size_line).map_err(|e| e.to_string())?;
-        let size = usize::from_str_radix(size_line.trim().split(';').next().unwrap_or("0"), 16)
-            .map_err(|e| e.to_string())?;
-        if size == 0 {
-            let mut trailer = String::new();
-            reader.read_line(&mut trailer).ok();
-            break;
-        }
-        let mut chunk = vec![0u8; size];
-        reader.read_exact(&mut chunk).map_err(|e| e.to_string())?;
-        out.extend_from_slice(&chunk);
-        let mut crlf = [0u8; 2];
-        reader.read_exact(&mut crlf).ok(); // the CRLF after each chunk
-    }
+    let mut chunked = ChunkedReader::new(reader);
+    chunked.read_to_end(&mut out).map_err(|e| e.to_string())?;
     Ok(out)
 }
 
@@ -157,13 +227,27 @@ pub fn sse(url: &str, method: &str, body: Option<&str>) -> Result<SseStream, Str
     // Same single-reader rule as `request`: parse the head from the same
     // reader that will stream the body.
     let mut reader = BufReader::new(stream);
-    let _status = read_status(&mut reader)?;
-    let _headers = read_headers(&mut reader)?;
+    let status = read_status(&mut reader)?;
+    let headers = read_headers(&mut reader)?;
+    if status != 200 {
+        let err_body = read_body_from(&mut reader, &headers).unwrap_or_default();
+        let detail = String::from_utf8_lossy(&err_body).trim().to_string();
+        return Err(if detail.is_empty() {
+            format!("HTTP {status}")
+        } else {
+            format!("HTTP {status}: {detail}")
+        });
+    }
+    let reader: Box<dyn BufRead + Send> = if is_chunked(&headers) {
+        Box::new(BufReader::new(ChunkedReader::new(reader)))
+    } else {
+        Box::new(reader)
+    };
     Ok(SseStream { reader })
 }
 
 pub struct SseStream {
-    reader: BufReader<TcpStream>,
+    reader: Box<dyn BufRead + Send>,
 }
 
 impl Iterator for SseStream {
@@ -233,5 +317,18 @@ mod tests {
     #[test]
     fn empty_chunked_body_parses() {
         assert!(chunked_parse(b"0\r\n\r\n").is_empty());
+    }
+
+    #[test]
+    fn chunked_sse_streams_events() {
+        let raw = b"1b\r\ndata: {\"delta\":\"hello\"}\n\n\r\n\r\n10\r\ndata: [DONE]\n\n\r\n\r\n0\r\n\r\n";
+        let reader: Box<dyn BufRead + Send> =
+            Box::new(BufReader::new(ChunkedReader::new(Cursor::new(raw.to_vec()))));
+        let mut stream = SseStream { reader };
+        let first = stream.next().unwrap().unwrap();
+        assert_eq!(first.data, "{\"delta\":\"hello\"}");
+        let second = stream.next().unwrap().unwrap();
+        assert_eq!(second.data, "[DONE]");
+        assert!(stream.next().is_none());
     }
 }

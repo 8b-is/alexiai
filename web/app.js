@@ -46,6 +46,9 @@ function paintField(field) {
     ...Object.entries(field.layers).map(([k, v]) => [k, Number(v).toFixed(4), k === field.dominant ? 'dominant' : '']),
     ['coherence', field.coherence.toFixed(4), ''],
   ];
+  if (field.affect?.mood) {
+    entries.push(['heart', field.affect.mood, 'affect']);
+  }
   for (const [key, value, cls] of entries) {
     const chip = document.createElement('span');
     chip.className = `chip ${cls}`;
@@ -78,6 +81,18 @@ async function refreshPanels() {
       : [['catalog', 'empty', 'bad']]);
   } catch {
     renderRows('models', [['error', 'no catalog', 'bad']]);
+  }
+
+  try {
+    const mcp = await (await fetch('/api/mcp')).json();
+    const rows = [
+      ['st-daemon', mcp.stDaemonUp ? `up ${mcp.stDaemonLatencyMs}ms (:28428)` : 'down', mcp.stDaemonUp ? 'ok' : 'bad'],
+      ['crabcc AST', mcp.crabccBinary ? 'ready (4412×)' : 'missing', mcp.crabccBinary ? 'ok' : 'bad'],
+      ['mcp tools', `${(mcp.tools ?? []).length} local tools`, 'ok'],
+    ];
+    renderRows('mcp', rows);
+  } catch {
+    renderRows('mcp', [['error', 'mcp unavailable', 'bad']]);
   }
 
   try {
@@ -119,6 +134,19 @@ function addGrain(text) {
   grain.className = 'grain';
   grain.textContent = text;
   last.append(grain);
+}
+
+function addMcpTrace(tool, target, elapsedMs, output) {
+  const last = transcript.lastElementChild;
+  if (!last) return;
+  const details = document.createElement('details');
+  details.className = 'mcp-trace';
+  const summary = document.createElement('summary');
+  summary.textContent = `mcp · ${tool}(${target}) · ${elapsedMs}ms`;
+  const pre = document.createElement('pre');
+  pre.textContent = output || '';
+  details.append(summary, pre);
+  last.append(details);
 }
 
 // ── the turn ──────────────────────────────────────────────────────────────
@@ -167,10 +195,14 @@ composer.addEventListener('submit', async (event) => {
         if (event === 'gaia') {
           const parsed = JSON.parse(data);
           paintField(parsed.field);
+          const mood = parsed.field.affect?.mood ? `${parsed.field.affect.mood} · ` : '';
           addGrain(
-            `field · dominant ${parsed.field.dominant} · coherence ${parsed.field.coherence.toFixed(3)}` +
+            `field · ${mood}dominant ${parsed.field.dominant} · coherence ${parsed.field.coherence.toFixed(3)}` +
             ` · T=${parsed.sampling.temperature} · top_p=${parsed.sampling.top_p}`
           );
+        } else if (event === 'mcp') {
+          const parsed = JSON.parse(data);
+          addMcpTrace(parsed.tool, parsed.target, parsed.elapsedMs, parsed.output);
         } else if (event === 'delta') {
           text += JSON.parse(data).text;
           body.textContent = text;

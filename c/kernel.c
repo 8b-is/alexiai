@@ -160,7 +160,7 @@ double gmq_trit_dot(const int8_t *pos, const int8_t *neg, const double *x, size_
         "xorpd %%xmm0, %%xmm0\n\t"
         "xorpd %%xmm1, %%xmm1\n\t"
         "1:\n\t"
-        "cmp %[k], 0\n\t"
+        "test %[k], %[k]\n\t"
         "je 2f\n\t"
         "movd (%[p]), %%xmm2\n\t"
         "movd (%[m]), %%xmm3\n\t"

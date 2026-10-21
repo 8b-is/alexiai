@@ -13,6 +13,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #define GMQ_TRITS_PER_BYTE 5
 
 /* Pack trits into a caller-owned, zero-initialized byte buffer. */
@@ -54,5 +58,9 @@ uint32_t gmq_seed_from(const char *prompt, size_t len);
 
 /* Fold a prompt together with passive RF Shannon entropy (in bits). */
 gmq_fold_t gmq_fold_spectrum(const char *prompt, size_t len, double rf_entropy_bits);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* GMQ_KERNEL_H */

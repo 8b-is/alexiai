@@ -86,6 +86,8 @@ body {
 
 .chip b { color: var(--ink); font-weight: 600; }
 .chip.dominant { border-color: var(--hot); color: var(--hot); }
+.chip.affect { border-color: var(--hot); color: var(--hot); background: rgba(255, 92, 138, 0.09); }
+.chip.affect b { color: var(--hot); }
 
 /* ── layout ───────────────────────────────────────────────────────────── */
 
@@ -118,8 +120,8 @@ main {
 .empty { color: var(--dim); font-family: var(--mono); font-size: .85rem; }
 
 .turn { border-left: 2px solid var(--line); padding-left: 1rem; }
-.turn.user { border-color: var(--cool); }
-.turn.assistant { border-color: var(--hot); }
+.turn.user, .turn.you { border-color: var(--cool); }
+.turn.assistant, .turn.alexiai { border-color: var(--hot); }
 
 .turn .who {
   font-family: var(--mono);
@@ -138,6 +140,30 @@ main {
   font-size: .68rem;
   color: var(--warm);
   margin-top: .5rem;
+}
+
+.turn .mcp-trace {
+  margin-top: .45rem;
+  font-family: var(--mono);
+  font-size: .68rem;
+  color: var(--cool);
+}
+
+.turn .mcp-trace summary {
+  cursor: pointer;
+  user-select: none;
+}
+
+.turn .mcp-trace pre {
+  margin: .4rem 0 0;
+  padding: .65rem .8rem;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: .5rem;
+  color: var(--ink);
+  overflow-x: auto;
+  max-height: 260px;
+  white-space: pre-wrap;
 }
 
 /* ── composer ─────────────────────────────────────────────────────────── */

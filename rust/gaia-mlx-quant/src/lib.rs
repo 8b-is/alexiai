@@ -58,6 +58,7 @@ extern crate alloc;
 
 pub mod gaia;
 pub mod kernel;
+pub mod mlx;
 pub mod pack;
 
 pub use gaia::{
@@ -70,6 +71,15 @@ pub use kernel::{
 };
 #[cfg(feature = "std")]
 pub use kernel::{Quantized, quantize_ternary};
+pub use mlx::{
+    MLX_GROUP_SIZE, MLX_GROUP64_COMPRESSION, QuantMode, StridedView, TRITS_PER_U32,
+    gather_qmm_into, maybe_matmul_into, mergeq_matmul_into, mlx_code_of,
+    mlx_dequantize_group64_into, mlx_quantize_group64_into, mlx_quantized_matmul_into,
+    mlx_trit_of, rms_norm_into, rope_into, sdpa_single_query_into, ste_linear_backward_into,
+    swiglu_into, ternary_transformer_step_into,
+};
+#[cfg(feature = "std")]
+pub use mlx::MlxQuantizedMatrix;
 pub use pack::{
     BITS_PER_WEIGHT, COMPRESSION_VS_F32, POW3, TRITS_PER_BYTE, digit_of, pack_ternary_into,
     trit_of, unpack_ternary_into,

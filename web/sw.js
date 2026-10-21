@@ -6,7 +6,7 @@
  * answer.
  */
 
-const CACHE = 'alexiai-v1';
+const CACHE = 'alexiai-v4';
 
 /** The entire app. Nothing else is needed to render. */
 const SHELL = [

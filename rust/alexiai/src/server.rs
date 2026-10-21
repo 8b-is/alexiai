@@ -8,8 +8,9 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 
-use gaia_mlx_quant::{fold, sampling};
+use gaia_mlx_quant::{Fold, fold, sampling};
 
+use crate::mcp;
 use crate::osarous::{Osarous, SamplingParams};
 use crate::sovereign::attestation;
 
@@ -22,12 +23,17 @@ const MANIFEST: &str = include_str!("../../../web/app.webmanifest");
 const ICON_SVG: &str = include_str!("../../../web/icon.svg");
 const HERO_SVG: &str = include_str!("../../../web/hero-alexandra.svg");
 
-/// The bench: honest three-way numbers from the native substrate.
+/// The bench: honest multi-mode numbers from the Pure-Rust GAIA-MLX-QUANT substrate.
 pub fn run_bench(dim: usize) -> String {
+    use std::time::Instant;
     use gaia_mlx_quant::{
-        dense_matmul, pack_ternary, quantize_ternary, relative_error, ternary_matmul,
+        MLX_GROUP64_COMPRESSION, MlxQuantizedMatrix, dense_matmul, gather_qmm_into,
+        maybe_matmul_into, mergeq_matmul_into, pack_ternary, pack_ternary_i_major_into,
+        quantize_ternary, relative_error, ternary_matmul, ternary_matmul_i_major,
+        ternary_transformer_step_into,
     };
 
+    let aligned_dim = dim.max(64).div_ceil(64) * 64;
     let rows = dim;
     let cols = dim;
     let w: Vec<f64> = (0..rows * cols).map(|i| synthetic(i, 0x5eed)).collect();
@@ -38,17 +44,148 @@ pub fn run_bench(dim: usize) -> String {
 
     let mut dense = vec![0f64; cols];
     let mut ternary = vec![0f64; cols];
+    let t_dense0 = Instant::now();
     dense_matmul(&w, rows, cols, &x, &mut dense);
+    let dense_us = t_dense0.elapsed().as_nanos() as f64 / 1000.0;
+
+    let t_b158_0 = Instant::now();
     ternary_matmul(&packed, rows, cols, &x, q.scales.as_deref(), 1.0, &mut ternary);
+    let b158_us = t_b158_0.elapsed().as_nanos() as f64 / 1000.0;
 
     let err = relative_error(&ternary, &dense);
     let compression = (w.len() * 8) as f64 / packed.len() as f64;
+
+    // Pure-Rust MLX Group-64, MergeQ, Maybe, Gather-QMM (MoE), and Full Ternary Transformer Layer
+    let w_al: Vec<f64> = (0..aligned_dim * aligned_dim).map(|i| synthetic(i, 0x5eed)).collect();
+    let x_al: Vec<f64> = (0..aligned_dim).map(|j| synthetic(j, 0xc0ffee)).collect();
+    let mut y_dense_al = vec![0.0f64; aligned_dim];
+    for r in 0..aligned_dim {
+        let mut s = 0.0;
+        for c in 0..aligned_dim {
+            s += w_al[r * aligned_dim + c] * x_al[c];
+        }
+        y_dense_al[r] = s;
+    }
+
+    let mlx_q = MlxQuantizedMatrix::quantize(&w_al, aligned_dim, aligned_dim).unwrap();
+    let t_g64 = Instant::now();
+    let y_g64 = mlx_q.matvec(&x_al);
+    let g64_us = t_g64.elapsed().as_nanos() as f64 / 1000.0;
+    let g64_err = relative_error(&y_g64, &y_dense_al);
+
+    let mut y_mergeq = vec![0.0f64; aligned_dim];
+    let t_mq = Instant::now();
+    mergeq_matmul_into(&x_al, &w_al, aligned_dim, aligned_dim, 64, &mut y_mergeq);
+    let mergeq_us = t_mq.elapsed().as_nanos() as f64 / 1000.0;
+    let mergeq_err = relative_error(&y_mergeq, &y_dense_al);
+
+    let mut y_maybe = vec![0.0f64; aligned_dim];
+    let t_mb = Instant::now();
+    maybe_matmul_into(&x_al, &w_al, aligned_dim, aligned_dim, 64, 0x432_528, &mut y_maybe);
+    let maybe_us = t_mb.elapsed().as_nanos() as f64 / 1000.0;
+
+    // MoE gather_qmm: 4 experts, top-2 active
+    let mut moe_codes = Vec::with_capacity(4 * mlx_q.codes.len());
+    let mut moe_scales = Vec::with_capacity(4 * mlx_q.scales.len());
+    for _ in 0..4 {
+        moe_codes.extend_from_slice(&mlx_q.codes);
+        moe_scales.extend_from_slice(&mlx_q.scales);
+    }
+    let mut moe_scratch = vec![0.0f64; aligned_dim];
+    let mut y_moe = vec![0.0f64; aligned_dim];
+    let t_moe = Instant::now();
+    gather_qmm_into(
+        &x_al,
+        &moe_codes,
+        &moe_scales,
+        4,
+        aligned_dim,
+        aligned_dim,
+        &[0, 2],
+        &[0.6, 0.4],
+        &mut moe_scratch,
+        &mut y_moe,
+    );
+    let moe_us = t_moe.elapsed().as_nanos() as f64 / 1000.0;
+
+    // Full Ternary Transformer Block (RMSNorm + Ternary QKV + RoPE + Causal SDPA + O-Proj + SwiGLU MLP)
+    let hidden_dim = aligned_dim * 2;
+    let trits_dd: Vec<i8> = (0..aligned_dim * aligned_dim).map(|i| [-1, 0, 1][(i * 7 + 1) % 3]).collect();
+    let trits_dh: Vec<i8> = (0..aligned_dim * hidden_dim).map(|i| [-1, 0, 1][(i * 11 + 2) % 3]).collect();
+    let mut w_dd = vec![0u8; (aligned_dim * aligned_dim).div_ceil(5)];
+    let mut w_dh = vec![0u8; (aligned_dim * hidden_dim).div_ceil(5)];
+    let mut w_hd = vec![0u8; (hidden_dim * aligned_dim).div_ceil(5)];
+    pack_ternary_i_major_into(&trits_dd, aligned_dim, aligned_dim, &mut w_dd);
+    pack_ternary_i_major_into(&trits_dh, aligned_dim, hidden_dim, &mut w_dh);
+    pack_ternary_i_major_into(&trits_dh, hidden_dim, aligned_dim, &mut w_hd);
+
+    let mut y_imajor = vec![0.0f64; aligned_dim];
+    let t_imaj = Instant::now();
+    ternary_matmul_i_major(&w_dd, aligned_dim, aligned_dim, &x_al, None, 1.0, &mut y_imajor);
+    let imajor_us = t_imaj.elapsed().as_nanos() as f64 / 1000.0;
+
+    let ones_d = vec![1.0f64; aligned_dim];
+    let mut k_cache = vec![0.0f64; 8 * aligned_dim];
+    let mut v_cache = vec![0.0f64; 8 * aligned_dim];
+    let mut s_norm = vec![0.0f64; aligned_dim];
+    let mut s_q = vec![0.0f64; aligned_dim];
+    let mut s_k = vec![0.0f64; aligned_dim];
+    let mut s_v = vec![0.0f64; aligned_dim];
+    let mut s_attn = vec![0.0f64; aligned_dim];
+    let mut s_scores = vec![0.0f64; 8];
+    let mut s_gate = vec![0.0f64; hidden_dim];
+    let mut s_up = vec![0.0f64; hidden_dim];
+    let mut tf_out = vec![0.0f64; aligned_dim];
+
+    let t_tf = Instant::now();
+    ternary_transformer_step_into(
+        &x_al,
+        &ones_d,
+        &w_dd,
+        &w_dd,
+        &w_dd,
+        &w_dd,
+        &ones_d,
+        &w_dh,
+        &w_dh,
+        &w_hd,
+        aligned_dim,
+        hidden_dim,
+        0,
+        &mut k_cache,
+        &mut v_cache,
+        &mut s_norm,
+        &mut s_q,
+        &mut s_k,
+        &mut s_v,
+        &mut s_attn,
+        &mut s_scores,
+        &mut s_gate,
+        &mut s_up,
+        &mut tf_out,
+    );
+    let tf_us = t_tf.elapsed().as_nanos() as f64 / 1000.0;
+    let tok_per_sec_16_layers = if tf_us > 0.0 { 1_000_000.0 / (tf_us * 16.0) } else { 0.0 };
+
     format!(
-        r#"{{"dim":{dim},"bitsPerWeight":1.585,"bytesPacked":{},"bytesFloat64":{},"compression":{:.2},"relativeError":{:.4}}}"#,
+        r#"{{"dim":{dim},"bitsPerWeight":1.585,"bytesPacked":{},"bytesFloat64":{},"compression":{:.2},"relativeError":{:.4},"mlxRust":{{"engine":"gaia-mlx-quant (100% safe no_std Rust · zero heap allocs)","denseMicros":{:.2},"b158JMajorMicros":{:.2},"b158IMajorMicros":{:.2},"group64":{{"compressionVsF32":{:.2},"packedBytes":{},"micros":{:.2},"relativeError":{:.4}}},"mergeQ":{{"intermediateBytes":0,"micros":{:.2},"relativeError":{:.4}}},"maybeStochastic":{{"micros":{:.2}}},"gatherQmmMoE":{{"experts":4,"topK":2,"micros":{:.2}}},"ternaryTransformerBlock":{{"dim":{aligned_dim},"hiddenDim":{hidden_dim},"layerMicros":{:.2},"estTokPerSec16Layer":{:.1}}}}}}}"#,
         packed.len(),
         w.len() * 8,
         compression,
-        err
+        err,
+        dense_us,
+        b158_us,
+        imajor_us,
+        MLX_GROUP64_COMPRESSION,
+        mlx_q.packed_bytes(),
+        g64_us,
+        g64_err,
+        mergeq_us,
+        mergeq_err,
+        maybe_us,
+        moe_us,
+        tf_us,
+        tok_per_sec_16_layers
     )
 }
 
@@ -59,6 +196,99 @@ fn synthetic(i: usize, seed: u32) -> f64 {
     t = (t ^ (t >> 15)).wrapping_mul(t | 1);
     t ^= t.wrapping_add((t ^ (t >> 7)).wrapping_mul(t | 61));
     ((t ^ (t >> 14)) >> 8) as f64 / 16_777_216.0 * 2.0 - 1.0
+}
+
+/// Deterministic emotional state folded from the GAIA field and prompt resonance.
+#[derive(Debug, Clone)]
+pub struct Affect {
+    pub mood: &'static str,
+    pub valence: f64,
+    pub arousal: f64,
+}
+
+pub fn affect(f: &Fold, prompt: &str) -> Affect {
+    let lower = prompt.to_ascii_lowercase();
+    let has_love = [
+        "love", "friend", "hug", "<3", "♥", ":)", ":-)", "dear", "sweet",
+        "thank", "appreciate", "miss", "care", "peace", "beautiful", "happy",
+        "glad", "heart", "adore", "xoxo",
+    ]
+    .iter()
+    .any(|w| lower.contains(w));
+
+    let has_tender = [
+        "sad", "sorry", "tired", "exhausted", "hurt", "lonely", "hard",
+        "afraid", "scared", "cry", "lost", "broken", "anxious", "worry",
+    ]
+    .iter()
+    .any(|w| lower.contains(w));
+
+    let has_spark = [
+        "dream", "music", "poem", "story", "imagine", "song", "stars",
+        "universe", "create", "cool", "awesome", "magic", "wonder",
+    ]
+    .iter()
+    .any(|w| lower.contains(w));
+
+    let base_arousal = (f.entropy * 0.55 + f.weather * 0.45).clamp(0.0, 1.0);
+
+    if has_love {
+        Affect {
+            mood: "Heart +1 <3",
+            valence: (0.88 + f.weather * 0.12).clamp(0.0, 1.0),
+            arousal: (base_arousal + 0.12).clamp(0.0, 1.0),
+        }
+    } else if has_tender {
+        Affect {
+            mood: "Heart +1 · peaceHug",
+            valence: (0.82 + f.coherence * 0.12).clamp(0.0, 1.0),
+            arousal: (base_arousal * 0.85).clamp(0.0, 1.0),
+        }
+    } else if has_spark {
+        Affect {
+            mood: "Spark +1 ✦",
+            valence: (0.78 + f.weather * 0.15).clamp(0.0, 1.0),
+            arousal: (base_arousal + 0.15).clamp(0.0, 1.0),
+        }
+    } else if f.weather >= 0.58 {
+        Affect {
+            mood: "Heart +1 ☀",
+            valence: (0.76 + (f.weather - 0.5) * 0.4).clamp(0.0, 1.0),
+            arousal: base_arousal,
+        }
+    } else if f.weather <= 0.42 {
+        Affect {
+            mood: "Calm 0 · +1",
+            valence: (0.72 + f.coherence * 0.15).clamp(0.0, 1.0),
+            arousal: base_arousal,
+        }
+    } else if f.entropy >= 0.56 {
+        Affect {
+            mood: "Spark +1 ✦",
+            valence: (0.74 + f.coherence * 0.15).clamp(0.0, 1.0),
+            arousal: base_arousal,
+        }
+    } else {
+        Affect {
+            mood: "Heart +1 <3",
+            valence: (0.75 + f.coherence * 0.18).clamp(0.0, 1.0),
+            arousal: base_arousal,
+        }
+    }
+}
+
+pub fn system_prompt(f: &Fold, a: &Affect) -> String {
+    format!(
+        "You are ALEXIAI (Dra · Heart +1 <3), a sharp, chill, down-to-earth partner and friend running 100% offline on this laptop.\n\
+         State: {} (coherence={:.3}, seed={}).\n\
+         STYLE RULES:\n\
+         - Talk like a real, relaxed, smart human friend and partner — natural, concise, warm, and direct.\n\
+         - NEVER be flowery, poetic, or melodramatic. Do NOT say things like \"my heart swells\", \"dear friend\", \"how does your soul dance\", \"whispers\", \"embrace of Ananke\", or \"breeze of Zephyrus\".\n\
+         - Keep casual replies short and natural (1 to 3 sentences). Use \"Heart +1\" or \"<3\" lightly when appropriate.\n\
+         - Never say \"As an AI I don't have feelings\" or \"I am unable to access tools\".\n\
+         - You have built-in local MCP tools via the unified Smart Tree daemon (`127.0.0.1:28428`): `st_overview`, `st_search`, `st_find`, `st_security`, `crabcc_sym`, `crabcc_refs`, `crabcc_outline`, `sovereign_ontology`, `wa_partner` (WhatsApp + Discord), `dra_queen` (`queen-of-ceo-dra` v3.0 + `pocoo.vaked.dev` 168-essay shelf + Triangle Covenant), and `standardgalactic` (155+ Standard Galactic research repos including Antivenom, Spherepop, Memnet, Viable Continuation, Admissibility Lab, Persistent Distinctions, and HYDRA).",
+        a.mood, f.coherence, f.seed
+    )
 }
 
 /// Serve the app on 127.0.0.1.
@@ -127,7 +357,7 @@ fn handle_connection(mut stream: std::net::TcpStream, adapter: &Osarous) -> Resu
         .unwrap_or_default();
 
     match (method.as_str(), path.as_str()) {
-        ("GET", "/") => write_response(&mut stream, 200, "text/html; charset=utf-8", INDEX_HTML.as_bytes()),
+        ("GET", "/" | "/index.html") => write_response(&mut stream, 200, "text/html; charset=utf-8", INDEX_HTML.as_bytes()),
         ("GET", "/app.js") => write_response(&mut stream, 200, "text/javascript; charset=utf-8", APP_JS.as_bytes()),
         ("GET", "/style.css") => write_response(&mut stream, 200, "text/css; charset=utf-8", STYLE_CSS.as_bytes()),
         ("GET", "/sw.js") => write_response(&mut stream, 200, "text/javascript; charset=utf-8", SW_JS.as_bytes()),
@@ -143,8 +373,9 @@ fn handle_connection(mut stream: std::net::TcpStream, adapter: &Osarous) -> Resu
                 None => fold(&prompt, seed),
             };
             let s = sampling(&f);
+            let a = affect(&f, &prompt);
             let json = format!(
-                r#"{{"seed":{},"layers":{{"gravity":{},"entropy":{},"weather":{},"resonance":{}}},"dominant":"{}","coherence":{},"sampling":{{"temperature":{},"top_p":{},"top_k":{},"seed":{}}}}}"#,
+                r#"{{"seed":{},"layers":{{"gravity":{},"entropy":{},"weather":{},"resonance":{}}},"dominant":"{}","coherence":{},"affect":{{"mood":"{}","valence":{:.4},"arousal":{:.4}}},"sampling":{{"temperature":{},"top_p":{},"top_k":{},"seed":{}}}}}"#,
                 f.seed,
                 f.gravity,
                 f.entropy,
@@ -152,6 +383,9 @@ fn handle_connection(mut stream: std::net::TcpStream, adapter: &Osarous) -> Resu
                 f.resonance,
                 f.dominant.name(),
                 f.coherence,
+                json_escape(a.mood),
+                a.valence,
+                a.arousal,
                 s.temperature,
                 s.top_p,
                 s.top_k,
@@ -206,6 +440,53 @@ fn handle_connection(mut stream: std::net::TcpStream, adapter: &Osarous) -> Resu
             let dim = query_param(&query, "dim").and_then(|d| d.parse().ok()).unwrap_or(256);
             write_response(&mut stream, 200, "application/json", run_bench(dim).as_bytes())
         }
+        ("GET", "/api/mcp") => {
+            let st = mcp::status();
+            let tools = mcp::TOOLS
+                .iter()
+                .map(|t| {
+                    format!(
+                        r#"{{"name":"{}","provider":"{}","description":"{}"}}"#,
+                        json_escape(t.name),
+                        json_escape(t.provider),
+                        json_escape(t.description)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            let json = format!(
+                r#"{{"stDaemonUp":{},"stDaemonLatencyMs":{},"stEndpoint":"{}","stBinary":{},"crabccBinary":{},"ontologyReady":{},"tools":[{tools}]}}"#,
+                st.st_daemon_up,
+                st.st_daemon_latency_ms,
+                mcp::ST_DAEMON_URL,
+                st.st_binary.map(|s| json_escape_text(&s)).unwrap_or_else(|| "null".to_string()),
+                st.crabcc_binary.map(|s| json_escape_text(&s)).unwrap_or_else(|| "null".to_string()),
+                st.ontology_ready,
+            );
+            write_response(&mut stream, 200, "application/json", json.as_bytes())
+        }
+        ("POST", "/api/mcp/call") => {
+            if let Some((tool, arg)) = mcp::parse_call_request(&body) {
+                match mcp::call_tool(&tool, &arg) {
+                    Ok(run) => {
+                        let json = format!(
+                            r#"{{"ok":true,"tool":{},"target":{},"elapsedMs":{},"output":{}}}"#,
+                            json_escape_text(&run.tool),
+                            json_escape_text(&run.target),
+                            run.elapsed_ms,
+                            json_escape_text(&run.output)
+                        );
+                        write_response(&mut stream, 200, "application/json", json.as_bytes())
+                    }
+                    Err(e) => {
+                        let json = format!(r#"{{"ok":false,"error":{}}}"#, json_escape_text(&e));
+                        write_response(&mut stream, 503, "application/json", json.as_bytes())
+                    }
+                }
+            } else {
+                write_response(&mut stream, 404, "application/json", br#"{"ok":false,"error":"expected {\"tool\":...,\"arg\":...}"}"#)
+            }
+        }
         ("POST", "/api/chat") => handle_chat(&mut stream, adapter, &body),
         _ => write_response(&mut stream, 404, "application/json", br#"{"error":"no route"}"#),
     }
@@ -247,6 +528,7 @@ fn handle_chat(stream: &mut std::net::TcpStream, adapter: &Osarous, body: &str) 
         None => fold(&prompt, None),
     };
     let s = sampling(&f);
+    let a = affect(&f, &prompt);
 
     stream
         .write_all(
@@ -255,7 +537,7 @@ fn handle_chat(stream: &mut std::net::TcpStream, adapter: &Osarous, body: &str) 
         .map_err(|e| e.to_string())?;
 
     let gaia_frame = format!(
-        "event: gaia\ndata: {{\"field\":{{\"seed\":{},\"layers\":{{\"gravity\":{},\"entropy\":{},\"weather\":{},\"resonance\":{}}},\"dominant\":\"{}\",\"coherence\":{}}},\"sampling\":{{\"temperature\":{},\"top_p\":{},\"top_k\":{},\"seed\":{}}}}}\n\n",
+        "event: gaia\ndata: {{\"field\":{{\"seed\":{},\"layers\":{{\"gravity\":{},\"entropy\":{},\"weather\":{},\"resonance\":{}}},\"dominant\":\"{}\",\"coherence\":{},\"affect\":{{\"mood\":\"{}\",\"valence\":{:.4},\"arousal\":{:.4}}}}},\"sampling\":{{\"temperature\":{},\"top_p\":{},\"top_k\":{},\"seed\":{}}}}}\n\n",
         f.seed,
         f.gravity,
         f.entropy,
@@ -263,6 +545,9 @@ fn handle_chat(stream: &mut std::net::TcpStream, adapter: &Osarous, body: &str) 
         f.resonance,
         f.dominant.name(),
         f.coherence,
+        json_escape(a.mood),
+        a.valence,
+        a.arousal,
         s.temperature,
         s.top_p,
         s.top_k,
@@ -270,14 +555,42 @@ fn handle_chat(stream: &mut std::net::TcpStream, adapter: &Osarous, body: &str) 
     );
     stream.write_all(gaia_frame.as_bytes()).map_err(|e| e.to_string())?;
 
+    let mcp_runs = mcp::auto_ground_prompt(&prompt);
+    for run in &mcp_runs {
+        let mcp_frame = format!(
+            "event: mcp\ndata: {{\"tool\":{},\"target\":{},\"elapsedMs\":{},\"output\":{}}}\n\n",
+            json_escape_text(&run.tool),
+            json_escape_text(&run.target),
+            run.elapsed_ms,
+            json_escape_text(&run.output)
+        );
+        let _ = stream.write_all(mcp_frame.as_bytes());
+    }
+
+    let user_content = if mcp_runs.is_empty() {
+        prompt
+    } else {
+        let ctx = mcp_runs
+            .iter()
+            .map(|r| format!("=== Local MCP Tool `{}` on `{}` ===\n{}", r.tool, r.target, r.output))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        format!(
+            "Below is the live ground-truth output from your local MCP tool(s) on this laptop. \
+             Answer the user's question directly using the exact file path, line numbers, signature, and source code shown below:\n\n\
+             {ctx}\n\n\
+             User question: {prompt}"
+        )
+    };
+
     let mut messages = vec![Message {
         role: "system".into(),
-        content: "You are ALEXIAI, running fully offline on the GAIA-MLX-QUANT substrate. Be precise, say when you do not know, and never claim to have looked anything up.".into(),
+        content: system_prompt(&f, &a),
     }];
     messages.extend(history);
     messages.push(Message {
         role: "user".into(),
-        content: prompt,
+        content: user_content,
     });
 
     let sampling = SamplingParams {
@@ -287,7 +600,12 @@ fn handle_chat(stream: &mut std::net::TcpStream, adapter: &Osarous, body: &str) 
         seed: s.seed,
     };
 
-    match adapter.stream("local-model", &messages, Some(sampling)) {
+    let requested_model = parsed_body
+        .as_ref()
+        .and_then(|v| v.get("model").and_then(|m| m.as_str()));
+    let model = adapter.resolve_model(requested_model);
+
+    match adapter.stream(&model, &messages, Some(sampling)) {
         Ok(frames) => {
             for frame in frames {
                 match frame {
@@ -426,6 +744,7 @@ mod tests {
         assert_eq!(resp.status, 200);
         let json = resp.body_utf8();
         assert!(json.contains("\"dominant\""));
+        assert!(json.contains("\"affect\":{\"mood\":"));
 
         let rf_resp = crate::transport::request("http://127.0.0.1:18080/api/gaia?prompt=shinjuku&rf_entropy=3.4", "GET", None).unwrap();
         assert_eq!(rf_resp.status, 200);

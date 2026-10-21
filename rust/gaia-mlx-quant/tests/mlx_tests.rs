@@ -1,0 +1,248 @@
+use gaia_mlx_quant::{
+    MLX_GROUP64_COMPRESSION, MlxQuantizedMatrix, StridedView, gather_qmm_into, maybe_matmul_into,
+    mergeq_matmul_into, mlx_code_of, mlx_quantized_matmul_into, mlx_trit_of,
+    pack_ternary_i_major_into, relative_error, rms_norm_into, rope_into, sdpa_single_query_into,
+    ste_linear_backward_into, swiglu_into, ternary_transformer_step_into,
+};
+
+#[test]
+fn mlx_group64_compression_is_12_80x() {
+    assert!((MLX_GROUP64_COMPRESSION - 12.80).abs() < 1e-12);
+    let w = vec![1.0f64; 64 * 64];
+    let q = MlxQuantizedMatrix::quantize(&w, 64, 64).unwrap();
+    assert!((q.compression_ratio() - 12.80).abs() < 1e-12);
+}
+
+#[test]
+fn mlx_code_and_trit_round_trip() {
+    assert_eq!(mlx_code_of(-1), 0);
+    assert_eq!(mlx_code_of(0), 1);
+    assert_eq!(mlx_code_of(1), 2);
+    assert_eq!(mlx_trit_of(0), -1);
+    assert_eq!(mlx_trit_of(1), 0);
+    assert_eq!(mlx_trit_of(2), 1);
+    assert_eq!(mlx_trit_of(3), 0);
+}
+
+#[test]
+fn group64_quantize_dequantize_and_mergeq_agree_exactly() {
+    let rows = 16;
+    let cols = 128;
+    let w: Vec<f64> = (0..rows * cols)
+        .map(|i| ((i * 17 + 11) % 23) as f64 / 11.0 - 1.0)
+        .collect();
+    let x: Vec<f64> = (0..cols).map(|k| ((k * 7 + 3) % 13) as f64 / 6.0 - 1.0).collect();
+
+    let q = MlxQuantizedMatrix::quantize(&w, rows, cols).unwrap();
+    let y_q = q.matvec(&x);
+
+    let mut y_mergeq = vec![0.0f64; rows];
+    mergeq_matmul_into(&x, &w, rows, cols, 64, &mut y_mergeq);
+
+    let err = relative_error(&y_q, &y_mergeq);
+    assert!(err < 1e-12, "group64 matvec vs mergeq relative error = {err}");
+
+    // Also verify dequantized dense matvec matches y_q
+    let w_hat = q.dequantize();
+    let mut y_dequant = vec![0.0f64; rows];
+    for r in 0..rows {
+        let mut s = 0.0;
+        for c in 0..cols {
+            s += w_hat[r * cols + c] * x[c];
+        }
+        y_dequant[r] = s;
+    }
+    assert!(relative_error(&y_q, &y_dequant) < 1e-12);
+}
+
+#[test]
+fn maybe_matmul_is_unbiased_estimator_of_dense_matmul() {
+    let rows = 8;
+    let cols = 64;
+    let w: Vec<f64> = (0..rows * cols)
+        .map(|i| (((i * 31 + 7) % 101) as f64 / 100.0 - 0.25) * 0.8)
+        .collect();
+    let x: Vec<f64> = (0..cols).map(|k| (k as f64 + 1.0) / cols as f64).collect();
+
+    let mut y_dense = vec![0.0f64; rows];
+    for r in 0..rows {
+        for c in 0..cols {
+            y_dense[r] += w[r * cols + c] * x[c];
+        }
+    }
+
+    let trials = 1024;
+    let mut y_avg = vec![0.0f64; rows];
+    let mut y_tmp = vec![0.0f64; rows];
+    for t in 0..trials {
+        maybe_matmul_into(&x, &w, rows, cols, 64, 1000 + (t as u64) * 7919, &mut y_tmp);
+        for r in 0..rows {
+            y_avg[r] += y_tmp[r] / (trials as f64);
+        }
+    }
+
+    let err = relative_error(&y_avg, &y_dense);
+    assert!(err < 0.03, "stochastic maybe_matmul mean error too large: {err}");
+}
+
+#[test]
+fn gather_qmm_routes_selected_experts_accurately() {
+    let num_experts = 4;
+    let n_out = 8;
+    let k_in = 64;
+    let mut all_codes = Vec::new();
+    let mut all_scales = Vec::new();
+    let mut experts = Vec::new();
+
+    for e in 0..num_experts {
+        let w: Vec<f64> = (0..n_out * k_in)
+            .map(|i| ((i * (e + 3) + 5) % 19) as f64 / 9.0 - 1.0)
+            .collect();
+        let q = MlxQuantizedMatrix::quantize(&w, n_out, k_in).unwrap();
+        all_codes.extend_from_slice(&q.codes);
+        all_scales.extend_from_slice(&q.scales);
+        experts.push(q);
+    }
+
+    let x: Vec<f64> = (0..k_in).map(|k| (k as f64) * 0.05 - 1.0).collect();
+    let active = [1usize, 3usize];
+    let gates = [0.65f64, 0.35f64];
+    let mut scratch = vec![0.0f64; n_out];
+    let mut y_moe = vec![0.0f64; n_out];
+
+    gather_qmm_into(
+        &x,
+        &all_codes,
+        &all_scales,
+        num_experts,
+        n_out,
+        k_in,
+        &active,
+        &gates,
+        &mut scratch,
+        &mut y_moe,
+    );
+
+    let y1 = experts[1].matvec(&x);
+    let y3 = experts[3].matvec(&x);
+    let y_ref: Vec<f64> = (0..n_out).map(|i| 0.65 * y1[i] + 0.35 * y3[i]).collect();
+
+    assert!(relative_error(&y_moe, &y_ref) < 1e-12);
+}
+
+#[test]
+fn strided_view_zero_copy_transpose_and_slice() {
+    let data = [1, 2, 3, 4, 5, 6];
+    let v = StridedView::row_major(&data, 2, 3);
+    assert_eq!(v.get(0, 2), 3);
+    assert_eq!(v.get(1, 0), 4);
+
+    let vt = v.transpose();
+    assert_eq!((vt.rows, vt.cols), (3, 2));
+    assert_eq!(vt.get(2, 0), 3);
+    assert_eq!(vt.get(0, 1), 4);
+
+    let sub = v.slice(0, 2, 1, 2);
+    assert_eq!(sub.get(0, 0), 2);
+    assert_eq!(sub.get(1, 1), 6);
+}
+
+#[test]
+fn rope_preserves_vector_norm_and_transformer_step_runs_cleanly() {
+    let dim = 16;
+    let hidden_dim = 32;
+    let x: Vec<f64> = (0..dim).map(|i| (i as f64 + 1.0) * 0.1).collect();
+    let mut x_rot = vec![0.0f64; dim];
+    rope_into(&x, 5, 10000.0, &mut x_rot);
+
+    let norm_before: f64 = x.iter().map(|v| v * v).sum();
+    let norm_after: f64 = x_rot.iter().map(|v| v * v).sum();
+    assert!(
+        (norm_before - norm_after).abs() / norm_before < 1e-3,
+        "RoPE should preserve Euclidean norm: {norm_before} vs {norm_after}"
+    );
+
+    // Test full Ternary Transformer step
+    let trits_dd: Vec<i8> = (0..dim * dim).map(|i| [-1, 0, 1][(i * 5 + 1) % 3]).collect();
+    let trits_dh: Vec<i8> = (0..dim * hidden_dim).map(|i| [-1, 0, 1][(i * 7 + 2) % 3]).collect();
+    let mut w_dd = vec![0u8; (dim * dim).div_ceil(5)];
+    let mut w_dh = vec![0u8; (dim * hidden_dim).div_ceil(5)];
+    let mut w_hd = vec![0u8; (hidden_dim * dim).div_ceil(5)];
+    pack_ternary_i_major_into(&trits_dd, dim, dim, &mut w_dd);
+    pack_ternary_i_major_into(&trits_dh, dim, hidden_dim, &mut w_dh);
+    pack_ternary_i_major_into(&trits_dh, hidden_dim, dim, &mut w_hd);
+
+    let ones_d = vec![1.0f64; dim];
+    let mut k_cache = vec![0.0f64; 4 * dim];
+    let mut v_cache = vec![0.0f64; 4 * dim];
+    let mut s_norm = vec![0.0f64; dim];
+    let mut s_q = vec![0.0f64; dim];
+    let mut s_k = vec![0.0f64; dim];
+    let mut s_v = vec![0.0f64; dim];
+    let mut s_attn = vec![0.0f64; dim];
+    let mut s_scores = vec![0.0f64; 4];
+    let mut s_gate = vec![0.0f64; hidden_dim];
+    let mut s_up = vec![0.0f64; hidden_dim];
+    let mut out = vec![0.0f64; dim];
+
+    ternary_transformer_step_into(
+        &x,
+        &ones_d,
+        &w_dd,
+        &w_dd,
+        &w_dd,
+        &w_dd,
+        &ones_d,
+        &w_dh,
+        &w_dh,
+        &w_hd,
+        dim,
+        hidden_dim,
+        0,
+        &mut k_cache,
+        &mut v_cache,
+        &mut s_norm,
+        &mut s_q,
+        &mut s_k,
+        &mut s_v,
+        &mut s_attn,
+        &mut s_scores,
+        &mut s_gate,
+        &mut s_up,
+        &mut out,
+    );
+    assert!(out.iter().all(|v| v.is_finite()));
+    assert!(out.iter().any(|&v| v != 0.0));
+}
+
+#[test]
+fn ste_linear_backward_produces_valid_gradients() {
+    let n_out = 4;
+    let k_in = 8;
+    let x = [0.5, -0.25, 1.0, 0.75, -0.5, 0.2, 0.9, -0.8];
+    let w: Vec<f64> = (0..n_out * k_in).map(|i| ((i as f64) - 15.0) * 0.05).collect();
+    let grad_y = [1.0, -0.5, 0.25, 0.75];
+    let mut grad_x = [0.0f64; 8];
+    let mut grad_w = [0.0f64; 32];
+
+    ste_linear_backward_into(&x, &w, &grad_y, n_out, k_in, &mut grad_x, &mut grad_w);
+    assert!(grad_x.iter().all(|v| v.is_finite()));
+    assert!(grad_w.iter().all(|v| v.is_finite()));
+    assert!(grad_w.iter().any(|&v| v != 0.0));
+
+    // Also exercise rms_norm, swiglu, sdpa, and mlx_quantized_matmul directly
+    let mut norm_out = [0.0f64; 8];
+    rms_norm_into(&x, None, 1e-5, &mut norm_out);
+    let mut swi_out = [0.0f64; 8];
+    swiglu_into(&x, &norm_out, &mut swi_out);
+    let mut scores = [0.0f64; 2];
+    let mut attn_out = [0.0f64; 4];
+    sdpa_single_query_into(&x[..4], &w[..8], &w[8..16], 2, 4, &mut scores, &mut attn_out);
+    let mut codes = [0x5555_5555u32; 4];
+    codes[0] = 0xaaaa_0000;
+    let scales = [1.0f64];
+    let x64 = [0.5f64; 64];
+    let mut y1 = [0.0f64; 1];
+    mlx_quantized_matmul_into(&x64, &codes, &scales, 1, 64, &mut y1);
+    assert!(y1[0].is_finite());
+}

@@ -12,8 +12,30 @@ use crate::transport::{self, SseEvent};
 
 /// Default sidecar endpoint. Loopback by construction.
 pub const DEFAULT_BASE_URL: &str = "http://127.0.0.1:1337";
+/// Default Ollama loopback endpoint (OpenAI-compatible `/v1/*`).
+pub const OLLAMA_BASE_URL: &str = "http://127.0.0.1:11434";
 /// Advertised context window when a model does not declare one.
 pub const DEFAULT_CONTEXT_WINDOW: u64 = 262144;
+
+/// Probe loopback endpoints (`127.0.0.1:1337` then `127.0.0.1:11434`) so both
+/// osarous/LM Studio and local GPU Ollama work out of the box.
+pub fn discover_endpoint() -> String {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
+    use std::time::Duration;
+
+    let timeout = Duration::from_millis(40);
+    let addr_1337 = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1337);
+    if TcpStream::connect_timeout(&addr_1337, timeout).is_ok() {
+        return DEFAULT_BASE_URL.to_string();
+    }
+    let addr_11434 = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 11434);
+    if TcpStream::connect_timeout(&addr_11434, timeout).is_ok()
+        || std::path::Path::new("/usr/bin/ollama").exists()
+    {
+        return OLLAMA_BASE_URL.to_string();
+    }
+    DEFAULT_BASE_URL.to_string()
+}
 
 #[derive(Debug, Clone)]
 pub struct CatalogModel {
@@ -49,13 +71,38 @@ impl Osarous {
     pub fn health_with_latency(&self) -> (bool, String, u64) {
         let t0 = std::time::Instant::now();
         match transport::request(&format!("{}/health", self.base_url), "GET", None) {
-            Ok(resp) => (
-                resp.status == 200,
+            Ok(resp) if resp.status == 200 => (
+                true,
                 format!("HTTP {}", resp.status),
                 t0.elapsed().as_millis() as u64,
             ),
+            Ok(resp) => match transport::request(&format!("{}/v1/models", self.base_url), "GET", None) {
+                Ok(mresp) if mresp.status == 200 => (
+                    true,
+                    format!("HTTP {}", mresp.status),
+                    t0.elapsed().as_millis() as u64,
+                ),
+                _ => (
+                    false,
+                    format!("HTTP {}", resp.status),
+                    t0.elapsed().as_millis() as u64,
+                ),
+            },
             Err(e) => (false, e, t0.elapsed().as_millis() as u64),
         }
+    }
+
+    pub fn resolve_model(&self, preferred: Option<&str>) -> String {
+        if let Some(m) = preferred
+            && !m.is_empty()
+            && m != "local-model"
+        {
+            return m.to_string();
+        }
+        self.models()
+            .ok()
+            .and_then(|models| models.into_iter().next().map(|m| m.id))
+            .unwrap_or_else(|| "local-model".to_string())
     }
 
     pub fn models(&self) -> Result<Vec<CatalogModel>, String> {

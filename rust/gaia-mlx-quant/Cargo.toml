@@ -1,6 +1,6 @@
 [package]
 name = "gaia-mlx-quant"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "GAIA-MLX-QUANT substrate — the zero-allocation, zero-unsafe ternary b1.58 kernel in pure core Rust"
 license = "MIT"

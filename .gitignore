@@ -8,5 +8,9 @@ coverage/
 # rust
 target/
 c/test_kernel
+c/bench
+c/test_kernel_cuda
+c/bench_cuda
+c/*.o
 .swiftpm/
 swift/.build/
