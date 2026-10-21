@@ -41,19 +41,31 @@ static ALLOCATOR: Counting = Counting;
 #[test]
 fn hot_paths_perform_zero_allocations() {
     use gaia_mlx_quant::{
-        Bfp64HeadRow, Mem8AdaptiveHeadRow, PQ_DEFAULT_Q, PrimeBucketMod, b158_matmul_pq_i_major_into,
+        Bfp64HeadRow, KERNEL_PQ_Q, Mem8AdaptiveHeadRow, PQ_DEFAULT_Q, PrimeBucketMod,
+        WUPZ_DEFAULT_WINDOW_SIZE, WupzBlockDesc, WupzSectionDesc, b158_matmul_pq_i_major_into,
         engram_bfp64_int_aligned_matmul_into, engram_bfp64_prequant_matmul_into,
         engram_gather_bfp64_heads_into, engram_hash_ngram_pq_into,
-        engram_mem8_adaptive_matmul_into, engram_step_bfp64_into, fold, fold_spectrum,
-        gather_qmm_into, gather_qmm_pq_into, maybe_matmul_into, mergeq_matmul_into,
-        mlx_dequantize_group64_into, mlx_matmul_pq_group64_into, mlx_quantize_group64_into,
-        mlx_quantized_matmul_into, pack_ternary_i_major_into, pack_ternary_into,
-        quantize_bfp_i8_group64_into, quantize_bfp_i16_group64_into, quantize_pq_adaptive_into,
-        quantize_pq_into, rms_norm_into, rope_into, sampling, sdpa_pq_single_query_into,
-        sdpa_single_query_into, ste_linear_backward_into, swiglu_into,
+        engram_mem8_adaptive_matmul_into, engram_step_bfp64_into, fold, fold_pq, fold_spectrum,
+        fold_spectrum_pq, fold_to_quant_tern_pq, gather_qmm_into, gather_qmm_pq_i64_into,
+        maybe_matmul_into, maybe_matmul_pq_into, mergeq_matmul_into, mergeq_matmul_pq_into,
+        mlx_dequantize_group64_into, mlx_dequantize_group64_pq_into,
+        mlx_matmul_pq_group64_i64_into, mlx_matmul_pq_group64_into, mlx_quantize_group64_into,
+        mlx_quantize_group64_pq_into, mlx_quantized_matmul_into, omni_bfp_i8_simd_pq_into,
+        pack_quantum_bitplanes_i_major_into, pack_ternary_i_major_into, pack_ternary_into,
+        pack_ternary_planes_i_into, quantize_bfp_i8_group64_into, quantize_bfp_i8_pq_group64_into,
+        quantize_bfp_i16_group64_into, quantize_pq_into, quantize_quantum_bitplane_i4_pq_into,
+        quantize_quantum_ternary_act_pq_into, quantize_ternary_pq_into,
+        quantum_bitplane_i4_matmul_pq_into, quantum_ternary_matmul_pq_into, rms_norm_into,
+        rms_norm_pq_into, rope_into, rope_pq_into, sampling, sampling_pq,
+        sdpa_pq_i32_single_query_into, sdpa_single_query_into, ste_linear_backward_into,
+        ste_linear_backward_pq_into, swiglu_into, swiglu_pq_into,
         ternary_bfp_adaptive_mem8_matmul_into, ternary_bfp_i8_matmul_into,
-        ternary_bfp_i16_matmul_into, ternary_matmul, ternary_simd_pq_matmul_into,
-        ternary_transformer_step_into, unpack_ternary_into,
+        ternary_bfp_i16_matmul_into, ternary_matmul, ternary_matmul_pq_i_major_into,
+        ternary_matmul_pq_j_major_into, ternary_matmul_pq_planes_i_into, ternary_simd_i8_pq_into,
+        ternary_simd_pq_matmul_into, ternary_transformer_step_into,
+        ternary_transformer_step_pq_into, unpack_ternary_into, wupz_bitplane_diff_u64,
+        wupz_bitplane_popcount_u64, wupz_byte_diff, wupz_pack_plan_into, wupz_plan_digest,
+        wupz_popcount, wupz_xor_fold, wupz_xor_fold_u64,
     };
 
     const ROWS: usize = 64;
@@ -90,11 +102,41 @@ fn hot_paths_perform_zero_allocations() {
     let mut s_scores = vec![0f64; 4];
     let mut s_gate = vec![0f64; COLS];
     let mut s_up = vec![0f64; COLS];
-    let mut m_i8 = vec![0i8; ROWS];
-    let mut m_i16 = vec![0i16; ROWS];
+    let mut pos_planes = vec![0i8; ROWS * COLS];
+    let mut neg_planes = vec![0i8; ROWS * COLS];
+    let mut p_w = vec![0i32; ROWS * COLS];
+    let mut p_row_scales = vec![0i32; ROWS];
+    let mut p_out_i64 = vec![0i64; COLS];
+    let mut p_dequant_w = vec![0i32; ROWS * COLS];
+    let mut p_grad_x = vec![0i64; COLS];
+    let mut p_grad_w = vec![0i64; ROWS * COLS];
+    let mut p_k_cache = vec![0i32; 4 * COLS];
+    let mut p_v_cache = vec![0i32; 4 * COLS];
+    let mut ps_norm = vec![0i32; COLS];
+    let mut ps_q = vec![0i32; COLS];
+    let mut ps_k = vec![0i32; COLS];
+    let mut ps_v = vec![0i32; COLS];
+    let mut ps_attn = vec![0i32; COLS];
+    let mut ps_scores = vec![0i64; 4];
+    let mut ps_gate = vec![0i32; COLS];
+    let mut ps_up = vec![0i32; COLS];
+    let mut ps_i64 = vec![0i64; COLS];
+    let mut p_tf_out = vec![0i32; COLS];
+    let mut w_pos_u64 = vec![0u64; COLS];
+    let mut w_neg_u64 = vec![0u64; COLS];
+    let mut x_pos_u64 = vec![0u64; 1];
+    let mut x_neg_u64 = vec![0u64; 1];
+    let mut x_sign_u64 = vec![0u64; 1];
+    let mut x_b0_u64 = vec![0u64; 1];
+    let mut x_b1_u64 = vec![0u64; 1];
+    let mut x_b2_u64 = vec![0u64; 1];
+    let mut q_scales_i4 = vec![0i32; 1];
+    let mut m_x_i8 = vec![0i8; ROWS];
+    let mut s_x_i8 = vec![0f64; 1];
+    let mut m_x_i16 = vec![0i16; ROWS];
+    let mut s_x_i16 = vec![0f64; 1];
+    let mut s_x_pq_i8 = vec![0i32; 1];
     let mut exp_x = vec![0i8; ROWS / 64];
-    let mut scale_x = vec![0f64; ROWS / 64];
-    let mut promoted_mask = vec![false; ROWS / 64];
 
     let engram_buckets = [PrimeBucketMod::new(17, 0)];
     let engram_tokens = [3u64, 7, 11, 13];
@@ -107,6 +149,9 @@ fn hot_paths_perform_zero_allocations() {
     // Warm the paths (first-call branches and tables are settled).
     pack_ternary_into(&trits, &mut packed);
     pack_ternary_i_major_into(&trits, ROWS, COLS, &mut packed_i);
+    pack_ternary_planes_i_into(&trits, ROWS, COLS, &mut pos_planes, &mut neg_planes);
+    quantize_pq_into(&weights, PQ_DEFAULT_Q, &mut p_w);
+    quantize_pq_into(&scales, PQ_DEFAULT_Q, &mut p_row_scales);
     ternary_matmul(&packed, ROWS, COLS, &x, Some(&scales), 1.0, &mut out);
     unpack_ternary_into(&packed, ROWS * COLS, &mut unpacked);
     mlx_quantize_group64_into(&weights, ROWS, COLS, &mut mlx_codes, &mut mlx_scales);
@@ -136,38 +181,17 @@ fn hot_paths_perform_zero_allocations() {
         mlx_dequantize_group64_into(&mlx_codes, &mlx_scales, ROWS, COLS, &mut dequant_w);
         mlx_quantized_matmul_into(&x, &mlx_codes, &mlx_scales, ROWS, COLS, &mut out);
         quantize_pq_into(&x, PQ_DEFAULT_Q, &mut p_x);
-        let q_adapt = quantize_pq_adaptive_into(&x, 22, &mut p_x);
         quantize_pq_into(&mlx_scales, PQ_DEFAULT_Q, &mut p_scales);
-        mlx_matmul_pq_group64_into(&p_x, q_adapt, &mlx_codes, &p_scales, PQ_DEFAULT_Q, ROWS, COLS, &mut out);
-        b158_matmul_pq_i_major_into(&packed_i, ROWS, COLS, &p_x, q_adapt, 1.0, &mut out);
-        ternary_simd_pq_matmul_into(&trits, ROWS, COLS, &p_x, q_adapt, None, 1.0, &mut out);
-        quantize_bfp_i8_group64_into(&x, &mut m_i8, &mut exp_x, &mut scale_x);
-        ternary_bfp_i8_matmul_into(&trits, ROWS, COLS, &m_i8, &scale_x, 1.0, &mut out);
-        quantize_bfp_i16_group64_into(&x, &mut m_i16, &mut exp_x, &mut scale_x);
-        ternary_bfp_i16_matmul_into(&trits, ROWS, COLS, &m_i16, &scale_x, 1.0, &mut out);
-        let _ = ternary_bfp_adaptive_mem8_matmul_into(
-            &trits,
-            ROWS,
-            COLS,
-            &x,
-            0.005,
-            1.0,
-            &mut m_i8,
-            &mut m_i16,
-            &mut exp_x,
-            &mut scale_x,
-            &mut promoted_mask,
-            &mut out,
-        );
+        mlx_matmul_pq_group64_into(&p_x, PQ_DEFAULT_Q, &mlx_codes, &p_scales, PQ_DEFAULT_Q, ROWS, COLS, &mut out);
+        b158_matmul_pq_i_major_into(&packed_i, ROWS, COLS, &p_x, PQ_DEFAULT_Q, 1.0, &mut out);
+        ternary_simd_pq_matmul_into(&trits, ROWS, COLS, &p_x, PQ_DEFAULT_Q, None, 1.0, &mut out);
         mergeq_matmul_into(&x, &weights, ROWS, COLS, 64, &mut out);
         maybe_matmul_into(&x, &weights, ROWS, COLS, 64, 42, &mut out);
         gather_qmm_into(&x, &mlx_codes, &mlx_scales, 1, ROWS, COLS, &[0], &[1.0], &mut s_norm, &mut out);
-        gather_qmm_pq_into(&p_x, q_adapt, &mlx_codes, &p_scales, PQ_DEFAULT_Q, 1, ROWS, COLS, &[0], &[1.0], &mut s_norm, &mut out);
         rms_norm_into(&x, Some(&scales), 1e-5, &mut out);
         rope_into(&x, 1, 10000.0, &mut out);
         swiglu_into(&x, &scales, &mut out);
         sdpa_single_query_into(&x, &k_cache, &v_cache, 2, COLS, &mut s_scores, &mut out);
-        sdpa_pq_single_query_into(&p_x, &p_x, &p_x, 1 << 14, 1, COLS, &mut s_scores, &mut out);
         ste_linear_backward_into(&x, &weights, &scales, ROWS, COLS, &mut grad_x, &mut grad_w);
         ternary_transformer_step_into(
             &x,
@@ -197,10 +221,67 @@ fn hot_paths_perform_zero_allocations() {
         );
         let f1 = fold("Analyze Shinjuku 2.4GHz Ch 6 saturation", None);
         let f2 = fold_spectrum("Analyze Shinjuku 2.4GHz Ch 6 saturation", 2.418, None);
+        let fpq1 = fold_pq("Analyze Shinjuku 2.4GHz Ch 6 saturation", None);
+        let fpq2 = fold_spectrum_pq("Analyze Shinjuku 2.4GHz Ch 6 saturation", 2_535_457, None);
+        quantize_ternary_pq_into(&p_w, ROWS, COLS, KERNEL_PQ_Q, &mut unpacked, &mut p_row_scales);
+        ternary_matmul_pq_j_major_into(&packed, ROWS, COLS, &p_x, Some(&p_row_scales), KERNEL_PQ_Q, &mut p_out_i64);
+        ternary_matmul_pq_i_major_into(&packed_i, ROWS, COLS, &p_x, Some(&p_row_scales), KERNEL_PQ_Q, &mut p_out_i64);
+        ternary_matmul_pq_planes_i_into(&pos_planes, &neg_planes, ROWS, COLS, &p_x, Some(&p_row_scales), KERNEL_PQ_Q, &mut p_out_i64);
+        ternary_simd_i8_pq_into(&trits, ROWS, COLS, &p_x, Some(&p_row_scales), KERNEL_PQ_Q, &mut p_out_i64);
+        mlx_quantize_group64_pq_into(&p_w, ROWS, COLS, KERNEL_PQ_Q, &mut mlx_codes, &mut p_scales);
+        mlx_dequantize_group64_pq_into(&mlx_codes, &p_scales, ROWS, COLS, &mut p_dequant_w);
+        mlx_matmul_pq_group64_i64_into(&p_x, &mlx_codes, &p_scales, ROWS, COLS, &mut p_out_i64);
+        mergeq_matmul_pq_into(&p_x, &p_w, ROWS, COLS, 64, &mut p_out_i64);
+        maybe_matmul_pq_into(&p_x, &p_w, ROWS, COLS, 64, 42, &mut p_out_i64);
+        gather_qmm_pq_i64_into(&p_x, &mlx_codes, &p_scales, 1, ROWS, COLS, &[0], &[1_048_576], PQ_DEFAULT_Q, &mut ps_i64, &mut p_out_i64);
+        rms_norm_pq_into(&p_x, Some(&p_row_scales), PQ_DEFAULT_Q, 10, &mut ps_norm);
+        rope_pq_into(&ps_norm, 1, &mut ps_q);
+        swiglu_pq_into(&ps_norm, &ps_q, PQ_DEFAULT_Q, &mut ps_gate);
+        sdpa_pq_i32_single_query_into(&ps_q, &p_k_cache, &p_v_cache, 2, COLS, PQ_DEFAULT_Q, &mut ps_scores, &mut ps_attn);
+        ste_linear_backward_pq_into(&p_x, &p_w, &p_row_scales, ROWS, COLS, PQ_DEFAULT_Q, &mut p_grad_x, &mut p_grad_w);
+        pack_quantum_bitplanes_i_major_into(&trits, ROWS, COLS, &mut w_pos_u64, &mut w_neg_u64);
+        let q_sx = quantize_quantum_ternary_act_pq_into(&p_x, &mut x_pos_u64, &mut x_neg_u64);
+        quantum_ternary_matmul_pq_into(&w_pos_u64, &w_neg_u64, ROWS, COLS, &x_pos_u64, &x_neg_u64, q_sx, None, KERNEL_PQ_Q, &mut p_out_i64);
+        quantize_quantum_bitplane_i4_pq_into(&p_x, &mut x_sign_u64, &mut x_b0_u64, &mut x_b1_u64, &mut x_b2_u64, &mut q_scales_i4);
+        quantum_bitplane_i4_matmul_pq_into(&w_pos_u64, &w_neg_u64, ROWS, COLS, &x_sign_u64, &x_b0_u64, &x_b1_u64, &x_b2_u64, &q_scales_i4, &mut p_out_i64);
+        quantize_bfp_i8_pq_group64_into(&p_x, &mut m_x_i8, &mut s_x_pq_i8);
+        omni_bfp_i8_simd_pq_into(&trits, ROWS, COLS, &m_x_i8, None, &mut p_out_i64);
+        quantize_bfp_i8_group64_into(&x, &mut m_x_i8, &mut s_x_i8);
+        quantize_bfp_i16_group64_into(&x, &mut m_x_i16, &mut s_x_i16);
+        ternary_bfp_i8_matmul_into(&trits, ROWS, COLS, &m_x_i8, &s_x_i8, None, 1.0, &mut out);
+        ternary_bfp_i16_matmul_into(&trits, ROWS, COLS, &m_x_i16, &s_x_i16, None, 1.0, &mut out);
+        ternary_bfp_adaptive_mem8_matmul_into(&trits, ROWS, COLS, &m_x_i8, &s_x_i8, &m_x_i16, &s_x_i16, &scales, 0.7, 1.0, &mut out);
+        ternary_transformer_step_pq_into(
+            &p_x,
+            &p_row_scales,
+            &packed_i,
+            &packed_i,
+            &packed_i,
+            &packed_i,
+            &p_row_scales,
+            &packed_i,
+            &packed_i,
+            &packed_i,
+            COLS,
+            COLS,
+            0,
+            &mut p_k_cache,
+            &mut p_v_cache,
+            &mut ps_norm,
+            &mut ps_q,
+            &mut ps_k,
+            &mut ps_v,
+            &mut ps_attn,
+            &mut ps_scores,
+            &mut ps_gate,
+            &mut ps_up,
+            &mut ps_i64,
+            &mut p_tf_out,
+        );
         engram_hash_ngram_pq_into(&engram_tokens, 2, &engram_mults, 1, &engram_buckets, &mut engram_indices);
-        engram_gather_bfp64_heads_into(&bfp_head_table, &engram_indices[..1], &mut m_i8, &mut exp_x);
-        engram_bfp64_prequant_matmul_into(&m_i8, &exp_x, &trits, &mlx_scales, ROWS, COLS, &mut out);
-        engram_bfp64_int_aligned_matmul_into(&m_i8, &exp_x, &trits, &p_scales, ROWS, COLS, &mut out);
+        engram_gather_bfp64_heads_into(&bfp_head_table, &engram_indices[..1], &mut m_x_i8, &mut exp_x);
+        engram_bfp64_prequant_matmul_into(&m_x_i8, &exp_x, &trits, &mlx_scales, ROWS, COLS, &mut out);
+        engram_bfp64_int_aligned_matmul_into(&m_x_i8, &exp_x, &trits, &p_scales, ROWS, COLS, &mut out);
         engram_mem8_adaptive_matmul_into(&mem8_head_table, &engram_indices[..1], &trits, &mlx_scales, ROWS, COLS, &mut out);
         engram_step_bfp64_into(
             &bfp_head_table,
@@ -215,7 +296,7 @@ fn hot_paths_perform_zero_allocations() {
             1,
             ROWS,
             COLS,
-            &mut m_i8,
+            &mut m_x_i8,
             &mut exp_x,
             &mut s_v,
             &mut s_k,
@@ -223,7 +304,27 @@ fn hot_paths_perform_zero_allocations() {
             &mut s_q,
             &mut engram_out_hc,
         );
-        std::hint::black_box((sampling(&f1), sampling(&f2)));
+        let mut wupz_plan_buf = [0u8; 128];
+        let wupz_secs = [WupzSectionDesc {
+            id: 0,
+            name: b".rodata.b158",
+            addr: 0x1000,
+            len: packed.len() as u64,
+            hash: wupz_xor_fold(&packed),
+        }];
+        let wupz_blks = [WupzBlockDesc {
+            index: 0,
+            covers: &[0],
+        }];
+        let _ = wupz_pack_plan_into(&wupz_secs, &wupz_blks, &mut wupz_plan_buf);
+        let _ = wupz_plan_digest(WUPZ_DEFAULT_WINDOW_SIZE, &wupz_secs, &wupz_blks);
+        let _ = wupz_byte_diff(&packed, &packed_i);
+        let _ = wupz_popcount(&packed);
+        let _ = wupz_xor_fold_u64(&w_pos_u64);
+        let _ = wupz_bitplane_popcount_u64(&w_pos_u64, &w_neg_u64);
+        let _ = wupz_bitplane_diff_u64(&w_pos_u64, &w_neg_u64, &w_pos_u64, &w_neg_u64);
+        let _ = fold_to_quant_tern_pq(&fpq1);
+        std::hint::black_box((sampling(&f1), sampling(&f2), sampling_pq(&fpq1), sampling_pq(&fpq2)));
     }
     let after = ALLOCS.load(Ordering::Relaxed);
 

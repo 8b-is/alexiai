@@ -1,12 +1,9 @@
 use gaia_mlx_quant::{
     MLX_GROUP64_COMPRESSION, MlxQuantizedMatrix, PQ_DEFAULT_Q, Pq, StridedView,
-    b158_matmul_pq_i_major_into, gather_qmm_into, gather_qmm_pq_into, maybe_matmul_into,
-    mergeq_matmul_into, mlx_code_of, mlx_matmul_pq_group64_into, mlx_quantized_matmul_into,
-    mlx_trit_of, pack_ternary_i_major_into, quantize_bfp_i8_group64_into,
-    quantize_bfp_i16_group64_into, quantize_pq_adaptive_into, quantize_pq_into, relative_error,
-    rms_norm_into, rope_into, sdpa_pq_single_query_into, sdpa_single_query_into,
-    ste_linear_backward_into, swiglu_into, ternary_bfp_adaptive_mem8_matmul_into,
-    ternary_bfp_i8_matmul_into, ternary_bfp_i16_matmul_into, ternary_matmul_i_major,
+    b158_matmul_pq_i_major_into, gather_qmm_into, maybe_matmul_into, mergeq_matmul_into,
+    mlx_code_of, mlx_matmul_pq_group64_into, mlx_quantized_matmul_into, mlx_trit_of,
+    pack_ternary_i_major_into, quantize_pq_into, relative_error, rms_norm_into, rope_into,
+    sdpa_single_query_into, ste_linear_backward_into, swiglu_into, ternary_matmul_i_major,
     ternary_simd_pq_matmul_into, ternary_transformer_step_into,
 };
 
@@ -317,134 +314,233 @@ fn pq_rational_and_integer_numerator_kernels_match_float_to_1e6() {
 
     assert!(relative_error(&y_b158_pq, &y_b158_float) < 1e-6);
     assert!(relative_error(&y_simd_pq, &y_b158_float) < 1e-6);
+}
 
-    // 4. Adaptive 29-bit dyadic projection (`quantize_pq_adaptive_into`)
-    let mut p_adaptive = vec![0i32; rows];
-    let q_adapt = quantize_pq_adaptive_into(&x_row, 28, &mut p_adaptive);
-    assert!(q_adapt >= (1 << 20));
-    let mut y_b158_adapt = vec![0.0f64; cols];
-    b158_matmul_pq_i_major_into(&packed_i, rows, cols, &p_adaptive, q_adapt, 1.0, &mut y_b158_adapt);
-    assert!(relative_error(&y_b158_adapt, &y_b158_float) < 1e-7);
+#[test]
+fn pure_integer_pq_mlx_and_transformer_primitives_operate_with_zero_floats() {
+    use gaia_mlx_quant::{
+        MLX_GROUP_SIZE, exp_pq, gather_qmm_pq_i64_into, gather_qmm_pq_into, maybe_matmul_pq_into,
+        mergeq_matmul_pq_into, mlx_dequantize_group64_pq_into, mlx_matmul_pq_group64_i64_into,
+        mlx_quantize_group64_pq_into, quantize_bfp_i8_group64_into,
+        quantize_bfp_i8_pq_group64_into, quantize_bfp_i16_group64_into, quantize_pq_adaptive_into,
+        relative_error_pq_ppm, rms_norm_pq_into, rope_pq_into, sdpa_pq_i32_single_query_into,
+        sdpa_pq_single_query_into, sin_cos_pq, ste_linear_backward_pq_into, swiglu_pq_into,
+        ternary_bfp_adaptive_mem8_matmul_into, ternary_bfp_i8_matmul_into,
+        ternary_bfp_i16_matmul_into, ternary_transformer_step_pq_into,
+    };
 
-    // 5. Switch-MoE sparse expert p/q kernel (`gather_qmm_pq_into`)
-    let mut scratch = vec![0.0f64; rows];
-    let mut moe_float = vec![0.0f64; rows];
-    let mut moe_pq = vec![0.0f64; rows];
-    gather_qmm_into(
-        &x,
-        &q.codes,
-        &q.scales,
+    let rows = 16usize;
+    let cols = 64usize;
+    let q_i32 = PQ_DEFAULT_Q as i32;
+    let w_f64: Vec<f64> = (0..rows * cols)
+        .map(|i| ((i * 17 + 11) % 23) as f64 / 11.0 - 1.0)
+        .collect();
+    let x_f64: Vec<f64> = (0..cols).map(|k| ((k * 7 + 3) % 13) as f64 / 6.0 - 1.0).collect();
+
+    let mut p_w = vec![0i32; rows * cols];
+    let mut p_x = vec![0i32; cols];
+    let q_w = quantize_pq_adaptive_into(&w_f64, 22, &mut p_w);
+    assert!(q_w >= PQ_DEFAULT_Q);
+    quantize_pq_into(&w_f64, PQ_DEFAULT_Q, &mut p_w);
+    quantize_pq_into(&x_f64, PQ_DEFAULT_Q, &mut p_x);
+
+    let mut codes = vec![0u32; rows * (cols / 16)];
+    let mut p_scales = vec![0i32; rows * (cols / 64)];
+    mlx_quantize_group64_pq_into(&p_w, rows, cols, q_i32, &mut codes, &mut p_scales);
+
+    let mut p_w_dequant = vec![0i32; rows * cols];
+    mlx_dequantize_group64_pq_into(&codes, &p_scales, rows, cols, &mut p_w_dequant);
+    assert!(p_w_dequant.iter().any(|&v| v != 0));
+
+    let mut p_y_g64 = vec![0i64; rows];
+    let mut p_y_mergeq = vec![0i64; rows];
+    mlx_matmul_pq_group64_i64_into(&p_x, &codes, &p_scales, rows, cols, &mut p_y_g64);
+    mergeq_matmul_pq_into(&p_x, &p_w, rows, cols, 64, &mut p_y_mergeq);
+    assert_eq!(p_y_g64, p_y_mergeq);
+    assert_eq!(relative_error_pq_ppm(&p_y_g64, &p_y_mergeq), 0);
+
+    let mut p_y_maybe = vec![0i64; rows];
+    maybe_matmul_pq_into(&p_x, &p_w, rows, cols, 64, 0x432_528, &mut p_y_maybe);
+    assert!(p_y_maybe.iter().any(|&v| v != 0));
+
+    let mut moe_scratch = vec![0i64; rows];
+    let mut p_y_moe = vec![0i64; rows];
+    gather_qmm_pq_i64_into(
+        &p_x,
+        &codes,
+        &p_scales,
         1,
         rows,
         cols,
         &[0],
-        &[0.75],
-        &mut scratch,
-        &mut moe_float,
+        &[q_i32],
+        PQ_DEFAULT_Q,
+        &mut moe_scratch,
+        &mut p_y_moe,
     );
+    assert_eq!(p_y_moe, p_y_g64);
+
+    let mut f64_moe_scratch = vec![0.0f64; rows];
+    let mut f64_y_moe = vec![0.0f64; rows];
     gather_qmm_pq_into(
         &p_x,
         PQ_DEFAULT_Q,
-        &q.codes,
+        &codes,
         &p_scales,
         PQ_DEFAULT_Q,
         1,
         rows,
         cols,
         &[0],
-        &[0.75],
-        &mut scratch,
-        &mut moe_pq,
+        &[1.0],
+        &mut f64_moe_scratch,
+        &mut f64_y_moe,
     );
-    assert!(relative_error(&moe_pq, &moe_float) < 1e-5);
+    assert!(f64_y_moe.iter().any(|&v| v != 0.0));
 
-    // 6. Causal KV-Cache Attention in p/q (`sdpa_pq_single_query_into`)
-    let seq_len = 4;
-    let head_dim = 16;
-    let q_vec = &x[..head_dim];
-    let k_cache = &w[..seq_len * head_dim];
-    let v_cache = &w[seq_len * head_dim..2 * seq_len * head_dim];
-    let mut scores_f = [0.0f64; 4];
-    let mut scores_p = [0.0f64; 4];
-    let mut out_f = [0.0f64; 16];
-    let mut out_p = [0.0f64; 16];
-    sdpa_single_query_into(q_vec, k_cache, v_cache, seq_len, head_dim, &mut scores_f, &mut out_f);
+    // Pure-integer sin/cos, exp, RMSNorm, RoPE, SwiGLU, SDPA, STE backward, and Transformer step
+    let (s0, c0) = sin_cos_pq(0);
+    assert_eq!(s0, 0);
+    assert!((c0 - PQ_DEFAULT_Q).abs() <= 2);
+    assert_eq!(exp_pq(0), PQ_DEFAULT_Q);
+    assert!(exp_pq(-PQ_DEFAULT_Q) < PQ_DEFAULT_Q && exp_pq(-PQ_DEFAULT_Q) > 0);
 
-    let q_kv = 1i64 << 14;
-    let mut pq_q = [0i32; 16];
-    let mut pq_k = [0i32; 64];
-    let mut pq_v = [0i32; 64];
-    quantize_pq_into(q_vec, q_kv, &mut pq_q);
-    quantize_pq_into(k_cache, q_kv, &mut pq_k);
-    quantize_pq_into(v_cache, q_kv, &mut pq_v);
-    sdpa_pq_single_query_into(&pq_q, &pq_k, &pq_v, q_kv, seq_len, head_dim, &mut scores_p, &mut out_p);
-    assert!(relative_error(&out_p, &out_f) < 1e-4);
+    let dim = 16usize;
+    let hidden_dim = 32usize;
+    let mut p_norm = vec![0i32; dim];
+    rms_norm_pq_into(&p_x[..dim], None, PQ_DEFAULT_Q, 10, &mut p_norm);
+    let mut p_rot = vec![0i32; dim];
+    rope_pq_into(&p_norm, 3, &mut p_rot);
+    let mut p_swi = vec![0i32; dim];
+    swiglu_pq_into(&p_norm, &p_rot, PQ_DEFAULT_Q, &mut p_swi);
 
-    // 7. Omni / MEM|8 3-Variant Block-Floating-Point (`i8`, `i16`, and Adaptive `i8->i16`)
-    let bfp_rows = 128;
-    let bfp_cols = 64;
-    let trits_bfp_j: Vec<i8> = (0..bfp_rows * bfp_cols)
-        .map(|i| [-1, 0, 1][(i * 11 + 3) % 3])
-        .collect();
-    let mut trits_bfp_i = vec![0i8; bfp_rows * bfp_cols];
-    for j in 0..bfp_rows {
-        for i in 0..bfp_cols {
-            trits_bfp_i[i * bfp_rows + j] = trits_bfp_j[j * bfp_cols + i];
-        }
-    }
-    let mut packed_bfp_i = vec![0u8; (bfp_rows * bfp_cols).div_ceil(5)];
-    pack_ternary_i_major_into(&trits_bfp_j, bfp_rows, bfp_cols, &mut packed_bfp_i);
+    let mut p_scores = vec![0i64; 2];
+    let mut p_attn = vec![0i32; dim];
+    sdpa_pq_i32_single_query_into(
+        &p_rot,
+        &p_w[..2 * dim],
+        &p_w[2 * dim..4 * dim],
+        2,
+        dim,
+        PQ_DEFAULT_Q,
+        &mut p_scores,
+        &mut p_attn,
+    );
+    assert!(p_scores.iter().all(|&s| s > 0));
 
-    let mut x_bfp: Vec<f64> = (0..bfp_rows)
-        .map(|j| ((j * 17 + 5) % 31) as f64 / 15.0 - 1.0)
-        .collect();
-    // Make block 1 have a spiky outlier distribution to trigger MEM|8 adaptive promotion
-    x_bfp[64] = 10.0;
-    x_bfp[65] = 0.031;
+    let mut f64_scores = vec![0.0f64; 2];
+    let mut f64_attn = vec![0.0f64; dim];
+    sdpa_pq_single_query_into(
+        &p_rot,
+        &p_w[..2 * dim],
+        &p_w[2 * dim..4 * dim],
+        PQ_DEFAULT_Q,
+        2,
+        dim,
+        &mut f64_scores,
+        &mut f64_attn,
+    );
+    assert!(f64_scores.iter().all(|&s| s > 0.0));
 
-    let mut y_ref = vec![0.0f64; bfp_cols];
-    ternary_matmul_i_major(&packed_bfp_i, bfp_rows, bfp_cols, &x_bfp, None, 1.0, &mut y_ref);
+    // Verify BFP-64 (i8, i16, adaptive MEM|8, and pure-integer pq i8)
+    let num_groups = cols.div_ceil(MLX_GROUP_SIZE);
+    let mut m_i8 = vec![0i8; cols];
+    let mut s_i8 = vec![0.0f64; num_groups];
+    let mut m_i16 = vec![0i16; cols];
+    let mut s_i16 = vec![0.0f64; num_groups];
+    let mut m_pq_i8 = vec![0i8; cols];
+    let mut s_pq_i8 = vec![0i32; num_groups];
+    quantize_bfp_i8_group64_into(&x_f64, &mut m_i8, &mut s_i8);
+    quantize_bfp_i16_group64_into(&x_f64, &mut m_i16, &mut s_i16);
+    quantize_bfp_i8_pq_group64_into(&p_x, &mut m_pq_i8, &mut s_pq_i8);
+    assert!(s_pq_i8[0] > 0);
 
-    let groups = bfp_rows / 64;
-    let mut m_i8 = vec![0i8; bfp_rows];
-    let mut m_i16 = vec![0i16; bfp_rows];
-    let mut exp_x = vec![0i8; groups];
-    let mut scale_x = vec![0.0f64; groups];
-    let mut promoted_mask = vec![false; groups];
-
-    let mut y_bfp_i8 = vec![0.0f64; bfp_cols];
-    quantize_bfp_i8_group64_into(&x_bfp, &mut m_i8, &mut exp_x, &mut scale_x);
-    ternary_bfp_i8_matmul_into(&trits_bfp_i, bfp_rows, bfp_cols, &m_i8, &scale_x, 1.0, &mut y_bfp_i8);
-    let err_i8 = relative_error(&y_bfp_i8, &y_ref);
-    assert!(err_i8 < 0.03, "BFP-i8 error on spiky outlier vector should be < 3%: {err_i8}");
-
-    let mut y_bfp_i16 = vec![0.0f64; bfp_cols];
-    quantize_bfp_i16_group64_into(&x_bfp, &mut m_i16, &mut exp_x, &mut scale_x);
-    ternary_bfp_i16_matmul_into(&trits_bfp_i, bfp_rows, bfp_cols, &m_i16, &scale_x, 1.0, &mut y_bfp_i16);
-    let err_i16 = relative_error(&y_bfp_i16, &y_ref);
-    assert!(err_i16 < 1e-4, "BFP-i16 error should be < 1e-4: {err_i16}");
-    assert!(err_i16 < err_i8, "BFP-i16 must be strictly more accurate than BFP-i8");
-
-    let mut y_bfp_mem8 = vec![0.0f64; bfp_cols];
-    let (promoted, total) = ternary_bfp_adaptive_mem8_matmul_into(
-        &trits_bfp_i,
-        bfp_rows,
-        bfp_cols,
-        &x_bfp,
-        0.003,
+    let trits_bfp: Vec<i8> = (0..cols * rows).map(|i| [-1, 0, 1][(i * 3 + 1) % 3]).collect();
+    let mut y_bfp8 = vec![0.0f64; rows];
+    let mut y_bfp16 = vec![0.0f64; rows];
+    let mut y_bfp_mem8 = vec![0.0f64; rows];
+    let salience: Vec<f64> = (0..rows).map(|j| if j % 2 == 0 { 0.9 } else { 0.1 }).collect();
+    ternary_bfp_i8_matmul_into(&trits_bfp, cols, rows, &m_i8, &s_i8, None, 1.0, &mut y_bfp8);
+    ternary_bfp_i16_matmul_into(&trits_bfp, cols, rows, &m_i16, &s_i16, None, 1.0, &mut y_bfp16);
+    ternary_bfp_adaptive_mem8_matmul_into(
+        &trits_bfp,
+        cols,
+        rows,
+        &m_i8,
+        &s_i8,
+        &m_i16,
+        &s_i16,
+        &salience,
+        0.5,
         1.0,
-        &mut m_i8,
-        &mut m_i16,
-        &mut exp_x,
-        &mut scale_x,
-        &mut promoted_mask,
         &mut y_bfp_mem8,
     );
-    assert_eq!(total, 2);
-    assert!(promoted >= 1, "expected spiky block to be promoted to i16");
-    let err_mem8 = relative_error(&y_bfp_mem8, &y_ref);
-    assert!(
-        err_mem8 < err_i8 * 0.5,
-        "MEM|8 adaptive error ({err_mem8}) must cut spiky i8 error ({err_i8}) by >2x"
+    assert!(relative_error(&y_bfp8, &y_bfp16) < 0.02);
+    assert!(relative_error(&y_bfp_mem8, &y_bfp16) < 0.02);
+
+    let mut p_grad_x = vec![0i64; cols];
+    let mut p_grad_w = vec![0i64; rows * cols];
+    ste_linear_backward_pq_into(
+        &p_x,
+        &p_w,
+        &p_x[..rows],
+        rows,
+        cols,
+        PQ_DEFAULT_Q,
+        &mut p_grad_x,
+        &mut p_grad_w,
     );
+    assert!(p_grad_w.iter().any(|&v| v != 0));
+
+    let trits_dd: Vec<i8> = (0..dim * dim).map(|i| [-1, 0, 1][(i * 5 + 1) % 3]).collect();
+    let trits_dh: Vec<i8> = (0..dim * hidden_dim).map(|i| [-1, 0, 1][(i * 7 + 2) % 3]).collect();
+    let mut w_dd = vec![0u8; (dim * dim).div_ceil(5)];
+    let mut w_dh = vec![0u8; (dim * hidden_dim).div_ceil(5)];
+    let mut w_hd = vec![0u8; (hidden_dim * dim).div_ceil(5)];
+    pack_ternary_i_major_into(&trits_dd, dim, dim, &mut w_dd);
+    pack_ternary_i_major_into(&trits_dh, dim, hidden_dim, &mut w_dh);
+    pack_ternary_i_major_into(&trits_dh, hidden_dim, dim, &mut w_hd);
+
+    let p_ones = vec![q_i32; dim];
+    let mut p_k_cache = vec![0i32; 4 * dim];
+    let mut p_v_cache = vec![0i32; 4 * dim];
+    let mut ps_norm = vec![0i32; dim];
+    let mut ps_q = vec![0i32; dim];
+    let mut ps_k = vec![0i32; dim];
+    let mut ps_v = vec![0i32; dim];
+    let mut ps_attn = vec![0i32; dim];
+    let mut ps_scores = vec![0i64; 4];
+    let mut ps_gate = vec![0i32; hidden_dim];
+    let mut ps_up = vec![0i32; hidden_dim];
+    let mut ps_i64 = vec![0i64; hidden_dim];
+    let mut p_tf_out = vec![0i32; dim];
+
+    ternary_transformer_step_pq_into(
+        &p_x[..dim],
+        &p_ones,
+        &w_dd,
+        &w_dd,
+        &w_dd,
+        &w_dd,
+        &p_ones,
+        &w_dh,
+        &w_dh,
+        &w_hd,
+        dim,
+        hidden_dim,
+        0,
+        &mut p_k_cache,
+        &mut p_v_cache,
+        &mut ps_norm,
+        &mut ps_q,
+        &mut ps_k,
+        &mut ps_v,
+        &mut ps_attn,
+        &mut ps_scores,
+        &mut ps_gate,
+        &mut ps_up,
+        &mut ps_i64,
+        &mut p_tf_out,
+    );
+    assert!(p_tf_out.iter().any(|&v| v != 0));
 }

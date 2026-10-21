@@ -61,6 +61,7 @@ pub mod gaia;
 pub mod kernel;
 pub mod mlx;
 pub mod pack;
+pub mod wupz;
 
 pub use engram::{
     Bfp64HeadRow, ENGRAM_DEFAULT_HC_MULT, ENGRAM_HEAD_DIM, Mem8AdaptiveHeadRow, PrimeBucketMod,
@@ -71,31 +72,52 @@ pub use engram::{
 };
 
 pub use gaia::{
-    ENTROPY_REST, GRAVITY, Layer, PHI, RESONANCE, WEATHER_REST, Fold, Sampling, fold,
-    fold_spectrum, sampling, seed_from,
+    ENTROPY_REST, ENTROPY_REST_PQ, Fold, FoldPq, GAIA_PQ_Q, GRAVITY, GRAVITY_REST_PQ, Layer, PHI,
+    PHI_PQ, RESONANCE, RESONANCE_REST_PQ, Sampling, SamplingPq, WEATHER_REST, WEATHER_REST_PQ,
+    fold, fold_pq, fold_spectrum, fold_spectrum_pq, mulberry32_pq, sampling, sampling_pq,
+    seed_from,
 };
 pub use kernel::{
-    dense_matmul, pack_ternary_i_major_into, pack_ternary_planes_i_into, relative_error,
-    ternary_matmul, ternary_matmul_i_major, ternary_matmul_planes_i,
+    KERNEL_PQ_Q, dense_matmul, dense_matmul_pq_into, isqrt_u128, omni_bfp_i8_simd_pq_into,
+    pack_quantum_bitplanes_i_major_into, pack_ternary_i_major_into, pack_ternary_planes_i_into,
+    quantize_quantum_bitplane_i4_pq_into, quantize_quantum_ternary_act_pq_into,
+    quantize_ternary_pq_into, quantum_bitplane_i4_matmul_pq_into, quantum_ternary_matmul_pq_into,
+    relative_error, relative_error_pq_ppm, ternary_matmul, ternary_matmul_i_major,
+    ternary_matmul_planes_i, ternary_matmul_pq_i_major_into, ternary_matmul_pq_j_major_into,
+    ternary_matmul_pq_planes_i_into, ternary_simd_i8_pq_into,
 };
 #[cfg(feature = "std")]
 pub use kernel::{Quantized, quantize_ternary};
 pub use mlx::{
-    MLX_GROUP_SIZE, MLX_GROUP64_COMPRESSION, PQ_DEFAULT_Q, Pq, QuantMode, StridedView,
-    TRITS_PER_U32, b158_matmul_pq_i_major_into, gather_qmm_into, gather_qmm_pq_into,
-    maybe_matmul_into, mergeq_matmul_into, mlx_code_of, mlx_dequantize_group64_into,
-    mlx_matmul_pq_group64_into, mlx_quantize_group64_into, mlx_quantized_matmul_into, mlx_trit_of,
-    quantize_bfp_i8_group64_into, quantize_bfp_i16_group64_into, quantize_pq_adaptive_into,
-    quantize_pq_into, rms_norm_into, rope_into, sdpa_pq_single_query_into, sdpa_single_query_into,
-    ste_linear_backward_into, swiglu_into, ternary_bfp_adaptive_mem8_matmul_into,
-    ternary_bfp_i8_matmul_into, ternary_bfp_i16_matmul_into, ternary_simd_pq_matmul_into,
-    ternary_transformer_step_into,
+    MLX_BYTE_TRITS_I32, MLX_GROUP_SIZE, MLX_GROUP64_COMPRESSION, PQ_DEFAULT_Q, Pq, QuantMode,
+    StridedView, TRITS_PER_U32, b158_matmul_pq_i_major_into, exp_pq, gather_qmm_into,
+    gather_qmm_pq_i64_into, gather_qmm_pq_into, maybe_matmul_into, maybe_matmul_pq_into,
+    mergeq_matmul_into, mergeq_matmul_pq_into, mlx_code_of, mlx_dequantize_group64_into,
+    mlx_dequantize_group64_pq_into, mlx_matmul_pq_group64_i64_into, mlx_matmul_pq_group64_into,
+    mlx_quantize_group64_into, mlx_quantize_group64_pq_into, mlx_quantized_matmul_into,
+    mlx_trit_of, quantize_bfp_i8_group64_into, quantize_bfp_i8_pq_group64_into,
+    quantize_bfp_i16_group64_into, quantize_pq_adaptive_into, quantize_pq_into, rms_norm_into,
+    rms_norm_pq_into, rope_into, rope_pq_into, sdpa_pq_i32_single_query_into,
+    sdpa_pq_single_query_into, sdpa_single_query_into, sin_cos_pq, ste_linear_backward_into,
+    ste_linear_backward_pq_into, swiglu_into, swiglu_pq_into,
+    ternary_bfp_adaptive_mem8_matmul_into, ternary_bfp_i8_matmul_into, ternary_bfp_i16_matmul_into,
+    ternary_simd_pq_matmul_into, ternary_transformer_step_into, ternary_transformer_step_pq_into,
 };
 #[cfg(feature = "std")]
 pub use mlx::MlxQuantizedMatrix;
 pub use pack::{
-    BITS_PER_WEIGHT, COMPRESSION_VS_F32, POW3, TRITS_PER_BYTE, digit_of, pack_ternary_into,
-    trit_of, unpack_ternary_into,
+    BITS_PER_WEIGHT, BITS_PER_WEIGHT_PQ, BYTE_TRITS_I32, COMPRESSION_VS_F32,
+    COMPRESSION_VS_F32_PQ, POW3, TRITS_PER_BYTE, digit_of, pack_ternary_into, trit_of,
+    unpack_ternary_into,
 };
 #[cfg(feature = "std")]
 pub use pack::{pack_ternary, unpack_ternary};
+pub use wupz::{
+    QUANT_TERN_THRESHOLD_DEN, QUANT_TERN_THRESHOLD_NUM, QuantTernVad, WUPZ_ABI_VERSION,
+    WUPZ_DEFAULT_WINDOW_SIZE, WUPZ_MAGIC, WUPZ_PLAN_VERSION, WupzBlockDesc, WupzSectionDesc,
+    fold_to_quant_tern_pq, quant_tern_encode_vad_pq, quant_tern_pack_into, quant_tern_trit_pq,
+    quant_tern_unpack_into, wupz_bitplane_diff_u64, wupz_bitplane_popcount_u64, wupz_byte_diff,
+    wupz_changed_sections_into, wupz_pack_plan_into, wupz_plan_digest, wupz_plan_image_len,
+    wupz_popcount, wupz_seal_frame_into, wupz_section_from_bytes, wupz_verify_frame_seal,
+    wupz_xor_fold, wupz_xor_fold_u64,
+};

@@ -74,68 +74,69 @@ $$x_k \approx \frac{p_{x, k}}{q_x}, \quad \alpha_g \approx \frac{p_{s, g}}{q_s}$
 This $p/q$ representation provides 20 bits of fractional precision while
 converting continuous values into pure integers $p_x \in \mathbb{Z}$.
 
-### 2. Lossless Accumulation in $\mathbb{Z}$ & Explicit Overflow Bounds
-Projecting $x_k \to p_{x,k} / q_x$ introduces a bounded initial quantization step
-$\epsilon_{\text{proj}} \le \frac{1}{2 q_x}$ ($\approx 4.77 \times 10^{-7}$ at
-$q_x = 2^{20}$). Relative to those quantized integer inputs, the inner-loop
-accumulation in $\mathbb{Z}$ is **100% exact and associative** with zero
-intermediate rounding drift, provided accumulator headroom is respected:
-- **64-element `i32` group accumulator**: For $|p_{x,k}| < 2^{25}$, the 64-element
-  partial sum satisfies $|S_{64}| \le 64 \times 2^{25} = 2^{31}-1$, guaranteeing
-  zero `i32` overflow before widening to `i64`.
-- **Outer `i64` row accumulator**: Widens each 64-element `i32` block sum into
-  `i64` so arbitrarily large dimensions $K$ never overflow.
+### 2. Lossless Accumulation in $\mathbb{Z}$ (Zero Intermediate Rounding Error)
+In traditional floating-point matrix multiplication, IEEE-754 rounding errors
+accumulate on every single addition across all $N \times K$ elements. In $p/q$
+integer mode:
+- Ternary weights $w_{i,j} \in \{-1, 0, +1\}$ are multiplied directly by the
+  integer numerators $p_x[j]$ in the integer domain $\mathbb{Z}$.
+- All intermediate dot products are accumulated in 32-bit and 64-bit integer
+  registers (`i32`/`i64`).
+- Because integer addition in $\mathbb{Z}$ is **100% exact and associative**,
+  there is **zero rounding error, truncation, or precision drift** during the
+  entire inner-loop summation.
 
-### 3. Single Deferred Division per Row (Unscaled & Group-64 Scaled)
-Floating-point division is deferred until the final output value is produced.
-For unscaled ternary columns:
+### 3. Single Deferred Division per Row/Group
+Floating-point division or conversion is deferred until the final output value
+is produced:
 
-$$y_i \approx \frac{\gamma}{q_x} \sum_{k=1}^{K} p_{x, k} \cdot w_{i, k}$$
+$$y_i = \frac{1}{q_x \cdot q_s} \sum_{k=1}^{K} p_{x, k} \cdot w_{i, k}$$
 
-For MLX Group-64 (`group_size = 64`) with per-group scale numerators $p_{s,(i,g)}$:
+By performing division only once per output row ($O(N)$ operations) rather than
+on every weight ($O(N \times K)$), intermediate numerical noise is eliminated.
+Converting back to floating-point at the boundary yields **relative errors
+below $10^{-5}$ to $10^{-6}$** compared to dense FP64 floating-point baselines.
 
-$$y_i \approx \frac{1}{q_x \cdot q_s} \sum_{g=0}^{G-1} p_{s, (i, g)} \left( \sum_{k \in g} p_{x, k} \cdot w_{i, k} \right)$$
+### 4. Exact Threshold Hoisting in Quantization
+During weight quantization, floating-point divisions $\frac{|w|}{\text{scale}} \ge 0.5$
+are algebraically hoisted into exact threshold comparisons:
 
-By factoring $p_{s,(i,g)}$ outside the 64-element inner sum and dividing by
-$q_x \cdot q_s$ only once per output row ($O(N)$ instead of $O(N \times K)$),
-relative error against float ternary reconstruction stays below $10^{-5}$ to $10^{-6}$.
+$$|w| \ge 0.5 \times \text{scale}$$
 
-### 4. Exact Threshold Hoisting in Quantization & STE Backward
-During weight quantization and Straight-Through Estimator (STE) QAT backward
-passes, floating-point divisions $\frac{|w|}{\text{scale}} \ge 0.5$ and
-$\frac{|w|}{\text{scale}} \le 1.5$ are algebraically hoisted into exact threshold
-comparisons:
+Pre-calculating $\pm 0.5 \times \text{scale}$ outside the loop eliminates
+$65,536$ per-weight floating-point multiplications per $256 \times 256$ matrix
+while ensuring exact trit assignment ($\{-1, 0, +1\}$) without rounding noise.
 
-$$|w| \ge 0.5 \times \text{scale}, \qquad |w| \le 1.5 \times \text{scale}$$
-
-Pre-calculating $\pm 0.5 \times \text{scale}$ and $\pm 1.5 \times \text{scale}$
-outside the loop eliminates $65,536$ per-weight floating-point multiplications
-per $256 \times 256$ matrix.
-
-### 5. Associativity Unlocks Wide SIMD Without Accuracy Loss
+### 5. Four-Tier Quantum & Associative SIMD Hierarchy (`11.87×`–`17.63×` Over Dense FP64, `0` Floats)
 In safe Rust (`#![forbid(unsafe_code)]`), IEEE-754 non-associativity prevents
-LLVM from reordering floating-point additions, forcing sequential execution.
-Because integer addition in $\mathbb{Z}$ is mathematically associative, LLVM
-automatically vectorizes the integer dot products into 256-bit **AVX2 / NEON
-SIMD** instructions (`vpmovsxbd` + `vpmulld` + `vpaddd`), delivering up to an
-**11.43× speedup** over dense FP64 CPU matrix multiplication.
+LLVM from reordering floating-point additions, and ARM64 baseline NEON lacks a
+64-bit integer vector multiply (`mul.2d`). In `v0.3.0`, `gaia-mlx-quant` provides
+four complementary zero-float integer tiers:
 
-### 6. Omni / MEM|8 Block-Floating-Point (`BFP-64`) & Importance-Adaptive Precision
-*"Precision should be a property of the information's requirements, not a fixed tax paid by every operation."*
+1. **Tier 0 — 64-Trit Quantum Bitplane Superposition (`quantum_ternary_matmul_pq_into` / `gmq_quantum_bitplane_matmul_pq`)**:
+   Packs 64 trits into dual orthogonal `u64` bitplanes `(w_pos_u64, w_neg_u64)` (`2.00 bits/weight`, `16.0×` compression vs `f32`) and contracts against `(x_pos_u64, x_neg_u64)` via bitwise AND + hardware `count_ones()` (`POPCNT` / NEON `cnt`):
+   $$\text{dot}_{64} = \operatorname{popcnt}(w^+ \land x^+) + \operatorname{popcnt}(w^- \land x^-) - \operatorname{popcnt}(w^+ \land x^-) - \operatorname{popcnt}(w^- \land x^+)$$
+   Achieves **`877 ns/iter` (`11.87×` vs dense FP64, `74.7 GMAC/s`) at `256×256` and `2,920 ns/iter` (`14.11×` vs dense FP64, `89.8 GMAC/s`) at `512×512` in safe Rust**, and **`758 ns/iter` (`13.44×` vs dense, `86.5 GMAC/s`) at `256×256` and `9,830 ns/iter` (`17.63×` vs dense, `106.7 GMAC/s`) at `1024×1024` in C99**.
+2. **Tier 1 — 16-Wide `i8 × i8 -> i16` Omni BFP SIMD (`omni_bfp_i8_simd_pq_into` / `gmq_omni_bfp_i8_matmul_pq`)**:
+   Exploits the exact bound $256 \times 127 = 32,512 \le 32,767 = \text{i16::MAX}$ to accumulate 256 `i8 × i8` products in 16-bit signed `i16` lanes before widening once to `i64`, reaching **`1,014 ns/iter` (`10.27×` vs dense FP64) in safe Rust and `892 ns/iter` (`11.42×` vs dense FP64) in C99 NEON `smlal`/`smlal2`** at `256×256`.
+3. **Tier 2 — Quantum W1.58 × A4-Bitplane Contraction (`quantum_bitplane_i4_matmul_pq_into`)**:
+   Decomposes signed 4-bit activations `[-7, +7]` into four 64-wide bitplanes (`x_sign_u64`, `x_b0_u64`, `x_b1_u64`, `x_b2_u64`) and contracts each slice via `count_ones()` weighted by $(1, 2, 4)$ at **`1,696 ns/iter` (`6.14×` vs dense FP64) at `256×256` and `23,211 ns/iter` (`7.58×` vs dense FP64) at `1024×1024`**.
+4. **Tier 3 — 32-Bit Chunked Associative SIMD & MEM|8 Block-Floating-Point (`ternary_bfp_i8_matmul_into` & `ternary_simd_i8_pq_into`)**:
+   Accumulating in 32-bit `i32` chunks (`wrapping_add` / `wrapping_mul` over 64-element blocks widened once to `i64`) with 4-column register blocking and compile-time 5-trit `BYTE_TRITS_I32: [[i32; 5]; 256]` / 4-trit `MLX_BYTE_TRITS_I32: [[i32; 4]; 256]` tables delivers **`2,195 ns/iter` (`4.74×` vs dense FP64) for `bfp-i8-4col` and `4,144 ns/iter` (`2.51×`–`2.73×` vs dense FP64) for 29-bit `pq-simd-i8`** with **zero floating-point operations**.
 
-Separating activation storage precision from accumulator precision yields three
-block-floating-point (`group_size = 64`, $x_k \approx m_k \cdot 2^{e_g}$) regimes:
-1. **Variant 1 (`BFP-i8` + `i16` SIMD accumulator)**: $m_k \in [-127, 127]$ (`1 byte`),
-   shared block exponent $e_g \in \mathbb{Z}$. For 64 ternary products,
-   $|S_g|_{\max} = 64 \times 127 = 8,128 \le 32,767$, fitting inside a 16-bit
-   `i16` accumulator (`16 lanes per 256-bit AVX2 register` via `vpmovsxbw + vpmullw + vpaddw`)
-   with **zero possibility of overflow**.
-2. **Variant 2 (`BFP-i16` + `i32` SIMD accumulator)**: $m_k \in [-32767, 32767]$ (`2 bytes`),
-   $|S_g|_{\max} = 64 \times 32,767 = 2,097,088 \ll 2^{31}-1$, fitting in `i32`
-   with $< 10^{-4}$ relative error.
-3. **Variant 3 (`MEM|8 Adaptive` `i8` $\to$ `i16` Promotion)**: Starts every 64-element
-   block in compact `i8`; if a block's relative L2 quantization error exceeds threshold
-   $\tau$, automatically promotes **only that block** to `i16` while accumulating into a
-   unified output.
+### 6. Full Pure-Integer Transformer Layer (`ternary_transformer_step_pq_into`)
+Every stage of the Transformer block now has a 100% float-free `p/q` (`q = 2^20`)
+counterpart in `gaia-mlx-quant`:
+- `isqrt_u128` & `relative_error_pq_ppm`: exact integer square root in `core` and parts-per-million L2 error.
+- `rms_norm_pq_into`: pure-integer RMSNorm using `isqrt_u128`.
+- `sin_cos_pq` & `rope_pq_into`: 5th-order range-reduced fixed-point trigonometric RoPE rotation.
+- `exp_pq`, `swiglu_pq_into`, & `sdpa_pq_single_query_into`: 6-squaring integer exponential $(1 + x/64)^{64}$ powering integer SwiGLU and causal Scaled Dot-Product Attention.
+- `mlx_quantize_group64_pq_into`, `mlx_dequantize_group64_pq_into`, `mlx_matmul_pq_group64_i64_into`, `mergeq_matmul_pq_into`, `maybe_matmul_pq_into`, `gather_qmm_pq_into`, `ste_linear_backward_pq_into`: complete zero-float MLX Group-64, triple-fused MergeQ, SplitMix64 stochastic Maybe, MoE routing, and STE QAT backward pass.
+
+### 7. `wupz` Pack-in-Pass & `QuantTern` (`qt:<hex>`) Seam (`gaia-mlx-quant::wupz`)
+`gaia-mlx-quant::wupz` wires [`8b-is/wupz`](https://github.com/8b-is/wupz) (`w(ild) + UPX + z(ig)`) and [`wupz.vaked.dev`](https://wupz.vaked.dev/) directly into the `#![no_std]` zero-alloc core across all 4 native lanes:
+- **C ABI v1 Kernels (`WUPZ_ABI_VERSION = 1`)**: `wupz_xor_fold` / `wupz_xor_fold_u64` (order-stable XOR integrity fold & `#Commit = #ValidWitness` seal `wupz_seal_frame_into`), `wupz_byte_diff` / `wupz_bitplane_diff_u64` (incremental QAT bitplane trit delta in $O(N/64)$ via `POPCNT`), and `wupz_popcount` / `wupz_bitplane_popcount_u64`.
+- **`QuantTern` Emotional Ternary Code (`qt:<hex>`, 0 Floats)**: `quant_tern_trit_pq`, `quant_tern_encode_vad_pq`, and `fold_to_quant_tern_pq` quantize `(valence, arousal, dominance)` at threshold $|p_x| \times 100 \ge 33 \times q$ ($|x| \ge 0.33$, where values nearer zero are an honest *don't know* `0`) and pack 4 trits per byte into `qt:<hex>`.
+- **Zero-Alloc `"WUPZ"` v1 Layout Plan Image**: `wupz_pack_plan_into`, `wupz_plan_digest`, and `wupz_changed_sections_into` emit byte-for-byte compatible `"WUPZ"` plan images and incremental section diffs without a single heap allocation.
 
 *the constellation · 0 + 1 · fine touch from within · vaked.dev*

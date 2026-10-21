@@ -50,6 +50,14 @@ pub const T4: [i8; 256] = build_slot_lut(4);
 /// The five slot LUTs as a flat reference — handy for parameterized code.
 pub const SLOT_LUTS: [[i8; 256]; TRITS_PER_BYTE] = [T0, T1, T2, T3, T4];
 
+/// Unified compile-time 5-trit `i32` lookup table (`256 × 5 × 4 = 5,120` bytes).
+///
+/// `BYTE_TRITS_I32[b as usize]` yields `[t0, t1, t2, t3, t4]` pre-widened to
+/// signed `i32` in a single contiguous cache line, eliminating 5 separate table
+/// base calculations and `i8 -> i32` sign-extension instructions in `p/q` integer
+/// inner loops.
+pub const BYTE_TRITS_I32: [[i32; TRITS_PER_BYTE]; 256] = build_byte_trits_i32();
+
 /// Build the LUT for one slot, at compile time.
 const fn build_slot_lut(slot: usize) -> [i8; 256] {
     let mut out = [0i8; 256];
@@ -57,6 +65,23 @@ const fn build_slot_lut(slot: usize) -> [i8; 256] {
     while b < 256 {
         let digit = (b / POW3[slot] as usize) % 3;
         out[b] = trit_of(digit as u8);
+        b += 1;
+    }
+    out
+}
+
+/// Build the unified `[i32; 5]` LUT at compile time.
+const fn build_byte_trits_i32() -> [[i32; TRITS_PER_BYTE]; 256] {
+    let mut out = [[0i32; TRITS_PER_BYTE]; 256];
+    let mut b = 0usize;
+    while b < 256 {
+        out[b] = [
+            trit_of(((b / POW3[0] as usize) % 3) as u8) as i32,
+            trit_of(((b / POW3[1] as usize) % 3) as u8) as i32,
+            trit_of(((b / POW3[2] as usize) % 3) as u8) as i32,
+            trit_of(((b / POW3[3] as usize) % 3) as u8) as i32,
+            trit_of(((b / POW3[4] as usize) % 3) as u8) as i32,
+        ];
         b += 1;
     }
     out
@@ -132,3 +157,9 @@ pub const BITS_PER_WEIGHT: f64 = 1.5849625007211561814537389439478;
 
 /// Compression ratio versus float32.
 pub const COMPRESSION_VS_F32: f64 = 32.0 / BITS_PER_WEIGHT;
+
+/// Rational `p/q` (`q = 2^20 = 1_048_576`) numerator for `log2(3) ≈ 1.5849625`.
+pub const BITS_PER_WEIGHT_PQ: i64 = 1_661_955;
+
+/// Rational `p/q` (`q = 2^20 = 1_048_576`) numerator for `32 / log2(3) ≈ 20.18975`.
+pub const COMPRESSION_VS_F32_PQ: i64 = 21_169_585;

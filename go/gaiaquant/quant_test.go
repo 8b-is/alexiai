@@ -176,33 +176,85 @@ func TestFoldSpectrumModulatesEntropy(t *testing.T) {
 	if s.Temperature < 0.05 || s.Temperature > 1.2 || s.TopK < 20 || s.TopK > 80 {
 		t.Fatalf("sampling out of bounds: %+v", s)
 	}
+
+	lowPq := FoldSpectrumPq(prompt, 524288, nil)
+	highPq := FoldSpectrumPq(prompt, 5033165, nil)
+	if lowPq.Seed != low.Seed || !(highPq.EntropyP > lowPq.EntropyP) {
+		t.Fatalf("FoldSpectrumPq mismatch: low=%+v high=%+v", lowPq, highPq)
+	}
 }
 
-func TestTernaryMatMulPqMatchesFloatTo1e6(t *testing.T) {
-	rows, cols := 64, 64
-	w := make([]float64, rows*cols)
-	for i := range w {
-		w[i] = float64((i*17+3)%23)/11.0 - 1.0
+func TestTernaryMatMulPqMatchesExactInteger(t *testing.T) {
+	rows, cols := 4, 7
+	trits := make([]int8, rows*cols)
+	for i := range trits {
+		trits[i] = []int8{-1, 0, 1}[i%3]
 	}
-	x := make([]float64, rows)
-	for j := range x {
-		x[j] = float64((j*11+5)%19)/9.0 - 1.0
-	}
-	trits, scales := QuantizePerRow(w, rows, cols)
+	pX := []int32{1048576, -524288, 2097152, 262144}
 	packed := make([]uint8, (rows*cols+TritPerByte-1)/TritPerByte)
 	PackTrits(trits, packed)
+	pOut := make([]int64, cols)
+	TernaryMatMulPq(packed, rows, cols, pX, nil, int32(PqDefaultQ), pOut)
 
-	outFloat := make([]float64, cols)
-	TernaryMatMul(packed, rows, cols, x, scales, 1.0, outFloat)
+	for c := 0; c < cols; c++ {
+		var want int64
+		for r := 0; r < rows; r++ {
+			want += int64(trits[r*cols+c]) * int64(pX[r])
+		}
+		if pOut[c] != want {
+			t.Fatalf("col %d: got %d want %d", c, pOut[c], want)
+		}
+	}
 
-	pX := make([]int32, rows)
-	QuantizePqInto(x, PqDefaultQ, pX)
-	acc := make([]int64, cols)
-	outPq := make([]float64, cols)
-	TernaryMatMulPq(packed, rows, cols, pX, PqDefaultQ, scales, 1.0, acc, outPq)
+	// Verify 64-trit Quantum Bitplane POPCNT kernel matches exact integer reference
+	qRows, qCols := 68, 9
+	words := (qRows + 63) / 64
+	qTrits := make([]int8, qRows*qCols)
+	for i := range qTrits {
+		qTrits[i] = []int8{-1, 0, 1}[(i*5+1)%3]
+	}
+	qPx := make([]int32, qRows)
+	for r := 0; r < qRows; r++ {
+		qPx[r] = []int32{-int32(PqDefaultQ), 0, int32(PqDefaultQ)}[(r*3+2)%3]
+	}
+	wPos := make([]uint64, qCols*words)
+	wNeg := make([]uint64, qCols*words)
+	xPos := make([]uint64, words)
+	xNeg := make([]uint64, words)
+	PackQuantumBitplanesIMajor(qTrits, qRows, qCols, wPos, wNeg)
+	scaleQx := QuantizeQuantumActPq(qPx, xPos, xNeg)
+	qOut := make([]int64, qCols)
+	QuantumBitplaneMatMulPq(wPos, wNeg, qRows, qCols, xPos, xNeg, scaleQx, qOut)
+	for c := 0; c < qCols; c++ {
+		var tritDot int64
+		for r := 0; r < qRows; r++ {
+			var xt int64
+			if qPx[r] > 0 {
+				xt = 1
+			} else if qPx[r] < 0 {
+				xt = -1
+			}
+			tritDot += int64(qTrits[r*qCols+c]) * xt
+		}
+		want := tritDot * int64(scaleQx)
+		if qOut[c] != want {
+			t.Fatalf("quantum bitplane col %d: got %d want %d", c, qOut[c], want)
+		}
+	}
 
-	err := RelativeError(outPq, outFloat)
-	if err > 1e-5 {
-		t.Fatalf("TernaryMatMulPq relative error vs float too high: %v", err)
+	// Verify wupz C ABI v1 seam & QuantTern (qt:56)
+	a := []byte{1, 2, 3, 4, 5, 6, 7, 8, 9}
+	b := []byte{1, 2, 0, 4, 5, 6, 7, 8, 0}
+	if diff := WupzByteDiff(a, b); diff != 2 {
+		t.Fatalf("WupzByteDiff: got %d want 2", diff)
+	}
+	if WupzXorFold(a) == WupzXorFold(b) {
+		t.Fatalf("WupzXorFold failed to detect byte mutation")
+	}
+	if WupzPopcount(a) == 0 {
+		t.Fatalf("WupzPopcount returned 0")
+	}
+	if qt := QuantTernEncodePq((PqDefaultQ*8)/10, PqDefaultQ/10, 0, PqDefaultQ); qt != 0x56 {
+		t.Fatalf("QuantTernEncodePq: got 0x%02x want 0x56", qt)
 	}
 }

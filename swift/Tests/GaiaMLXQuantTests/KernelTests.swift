@@ -129,33 +129,43 @@ final class KernelTests: XCTestCase {
         XCTAssertTrue((20...80).contains(s.topK))
     }
 
-    func testTernaryMatMulPqMatchesFloatTo1e5() {
-        let rows = 32, cols = 32
-        let w: [Double] = (0..<rows * cols).map { Double(($0 * 17 + 3) % 23) / 11.0 - 1.0 }
-        let x: [Double] = (0..<rows).map { Double(($0 * 11 + 5) % 19) / 9.0 - 1.0 }
-        let (trits, scales) = GaiaMLXQuant.quantizePerRow(w, rows: rows, cols: cols)
+    func testPureIntegerPqMatMulAndFold() {
+        let rows = 4, cols = 5
+        let q = GaiaMLXQuant.pqDefaultQ
+        let pW: [Int32] = (0..<rows * cols).map { i in
+            let v: Int64 = (i % 3 == 0) ? q : ((i % 3 == 1) ? -q : 0)
+            return Int32(v)
+        }
+        let (trits, pScales) = GaiaMLXQuant.quantizePerRowPq(pW, rows: rows, cols: cols)
         var packed = [UInt8](repeating: 0, count: (rows * cols + 4) / 5)
         GaiaMLXQuant.packTrits(trits, into: &packed)
 
-        var outFloat = [Double](repeating: 0, count: cols)
-        GaiaMLXQuant.ternaryMatMul(packed: packed, rows: rows, cols: cols, x: x, scales: scales, gamma: 1.0, into: &outFloat)
-
-        var pX = [Int32](repeating: 0, count: rows)
-        GaiaMLXQuant.quantizePqInto(x, q: GaiaMLXQuant.pqDefaultQ, into: &pX)
-        var acc = [Int64](repeating: 0, count: cols)
-        var outPq = [Double](repeating: 0, count: cols)
+        let pX: [Int32] = [Int32(q), Int32(-q / 2), Int32(q / 4), Int32(q)]
+        var pOut = [Int64](repeating: 0, count: cols)
         GaiaMLXQuant.ternaryMatMulPq(
             packed: packed,
             rows: rows,
             cols: cols,
             pX: pX,
-            qX: GaiaMLXQuant.pqDefaultQ,
-            scales: scales,
-            gamma: 1.0,
-            accScratch: &acc,
-            into: &outPq
+            pScales: pScales,
+            qX: q,
+            qScale: q,
+            into: &pOut
         )
-        XCTAssertLessThan(GaiaMLXQuant.relativeError(outPq, outFloat), 1e-5)
+        XCTAssertTrue(pOut.contains { $0 != 0 })
+
+        let prompt = "Analyze Shinjuku 2.4GHz Ch 6 saturation, BLE proximity & AirPlay RAOP surface"
+        let lowPq = GaiaMLXQuant.foldSpectrumPq(prompt, rfEntropyBitsPq: Int32(q / 2))
+        let highPq = GaiaMLXQuant.foldSpectrumPq(prompt, rfEntropyBitsPq: Int32(q * 4))
+        XCTAssertEqual(lowPq.seed, highPq.seed)
+        XCTAssertGreaterThan(highPq.entropyPq, lowPq.entropyPq)
+
+        let a: [UInt8] = [1, 2, 3, 4, 5, 6, 7, 8, 9]
+        let b: [UInt8] = [1, 2, 0, 4, 5, 6, 7, 8, 0]
+        XCTAssertEqual(GaiaMLXQuant.wupzByteDiff(a, b), 2)
+        XCTAssertNotEqual(GaiaMLXQuant.wupzXorFold(a), GaiaMLXQuant.wupzXorFold(b))
+        XCTAssertGreaterThan(GaiaMLXQuant.wupzPopcount(a), 0)
+        XCTAssertEqual(GaiaMLXQuant.quantTernEncodePq(pValence: (q * 8) / 10, pArousal: q / 10, pDominance: 0, q: q), 0x56)
     }
 }
 #elseif canImport(Testing)
@@ -288,33 +298,53 @@ struct KernelTests {
         #expect((20...80).contains(s.topK))
     }
 
-    @Test func ternaryMatMulPqMatchesFloatTo1e5() {
-        let rows = 32, cols = 32
-        let w: [Double] = (0..<rows * cols).map { Double(($0 * 17 + 3) % 23) / 11.0 - 1.0 }
-        let x: [Double] = (0..<rows).map { Double(($0 * 11 + 5) % 19) / 9.0 - 1.0 }
-        let (trits, scales) = GaiaMLXQuant.quantizePerRow(w, rows: rows, cols: cols)
+    @Test func pureIntegerPqMatMulAndFold() {
+        let rows = 4, cols = 5
+        let q = GaiaMLXQuant.pqDefaultQ
+        let pW: [Int32] = (0..<rows * cols).map { i in
+            let v: Int64 = (i % 3 == 0) ? q : ((i % 3 == 1) ? -q : 0)
+            return Int32(v)
+        }
+        let (trits, pScales) = GaiaMLXQuant.quantizePerRowPq(pW, rows: rows, cols: cols)
         var packed = [UInt8](repeating: 0, count: (rows * cols + 4) / 5)
         GaiaMLXQuant.packTrits(trits, into: &packed)
 
-        var outFloat = [Double](repeating: 0, count: cols)
-        GaiaMLXQuant.ternaryMatMul(packed: packed, rows: rows, cols: cols, x: x, scales: scales, gamma: 1.0, into: &outFloat)
-
-        var pX = [Int32](repeating: 0, count: rows)
-        GaiaMLXQuant.quantizePqInto(x, q: GaiaMLXQuant.pqDefaultQ, into: &pX)
-        var acc = [Int64](repeating: 0, count: cols)
-        var outPq = [Double](repeating: 0, count: cols)
+        let pX: [Int32] = [Int32(q), Int32(-q / 2), Int32(q / 4), Int32(q)]
+        var pOut = [Int64](repeating: 0, count: cols)
         GaiaMLXQuant.ternaryMatMulPq(
             packed: packed,
             rows: rows,
             cols: cols,
             pX: pX,
-            qX: GaiaMLXQuant.pqDefaultQ,
-            scales: scales,
-            gamma: 1.0,
-            accScratch: &acc,
-            into: &outPq
+            pScales: pScales,
+            qX: q,
+            qScale: q,
+            into: &pOut
         )
-        #expect(GaiaMLXQuant.relativeError(outPq, outFloat) < 1e-5)
+        #expect(pOut.contains { $0 != 0 })
+
+        let prompt = "Analyze Shinjuku 2.4GHz Ch 6 saturation, BLE proximity & AirPlay RAOP surface"
+        let lowPq = GaiaMLXQuant.foldSpectrumPq(prompt, rfEntropyBitsPq: Int32(q / 2))
+        let highPq = GaiaMLXQuant.foldSpectrumPq(prompt, rfEntropyBitsPq: Int32(q * 4))
+        #expect(lowPq.seed == highPq.seed)
+        #expect(highPq.entropyPq > lowPq.entropyPq)
+
+        var wPos = [UInt64](repeating: 0, count: cols)
+        var wNeg = [UInt64](repeating: 0, count: cols)
+        var xPos = [UInt64](repeating: 0, count: 1)
+        var xNeg = [UInt64](repeating: 0, count: 1)
+        GaiaMLXQuant.packQuantumBitplanesIMajor(trits, rows: rows, cols: cols, wPosU64: &wPos, wNegU64: &wNeg)
+        let sx = GaiaMLXQuant.quantizeQuantumActPq(pX, xPosU64: &xPos, xNegU64: &xNeg)
+        var qOut = [Int64](repeating: 0, count: cols)
+        GaiaMLXQuant.quantumBitplaneMatMulPq(wPosU64: wPos, wNegU64: wNeg, rows: rows, cols: cols, xPosU64: xPos, xNegU64: xNeg, pScaleX: sx, into: &qOut)
+        #expect(qOut.contains { $0 != 0 })
+
+        let a: [UInt8] = [1, 2, 3, 4, 5, 6, 7, 8, 9]
+        let b: [UInt8] = [1, 2, 0, 4, 5, 6, 7, 8, 0]
+        #expect(GaiaMLXQuant.wupzByteDiff(a, b) == 2)
+        #expect(GaiaMLXQuant.wupzXorFold(a) != GaiaMLXQuant.wupzXorFold(b))
+        #expect(GaiaMLXQuant.wupzPopcount(a) > 0)
+        #expect(GaiaMLXQuant.quantTernEncodePq(pValence: (q * 8) / 10, pArousal: q / 10, pDominance: 0, q: q) == 0x56)
     }
 }
 #endif

@@ -534,64 +534,6 @@ pub fn gather_qmm_into(
     }
 }
 
-/// **`gather_qmm_pq_into`** — Pure $p/q$ Integer-Numerator Switch-MoE Sparse Expert Kernel.
-///
-/// Reuses pre-projected input numerators `p_x` (`x[k] ≈ p_x[k] / q_x`) and pre-projected
-/// expert scale numerators `expert_pscales` across all routed `active_experts`, running every
-/// expert projection in $\mathbb{Z}$ via [`mlx_matmul_pq_group64_into`].
-///
-/// Performs **zero heap allocations**.
-#[inline]
-#[allow(clippy::too_many_arguments)]
-pub fn gather_qmm_pq_into(
-    p_x: &[i32],
-    q_x: i64,
-    expert_codes: &[u32],
-    expert_pscales: &[i32],
-    q_s: i64,
-    num_experts: usize,
-    n_out: usize,
-    k_in: usize,
-    active_experts: &[usize],
-    router_weights: &[f64],
-    expert_scratch: &mut [f64],
-    y_out: &mut [f64],
-) {
-    debug_assert!(k_in.is_multiple_of(MLX_GROUP_SIZE));
-    debug_assert_eq!(active_experts.len(), router_weights.len());
-    debug_assert!(expert_scratch.len() >= n_out);
-    debug_assert!(y_out.len() >= n_out);
-
-    let words_per_expert = n_out * (k_in / TRITS_PER_U32);
-    let scales_per_expert = n_out * (k_in / MLX_GROUP_SIZE);
-
-    for slot in y_out[..n_out].iter_mut() {
-        *slot = 0.0;
-    }
-
-    for (&expert_idx, &gate) in active_experts.iter().zip(router_weights.iter()) {
-        if expert_idx >= num_experts || gate == 0.0 {
-            continue;
-        }
-        let e_codes = &expert_codes[expert_idx * words_per_expert..(expert_idx + 1) * words_per_expert];
-        let e_pscales = &expert_pscales[expert_idx * scales_per_expert..(expert_idx + 1) * scales_per_expert];
-
-        mlx_matmul_pq_group64_into(
-            p_x,
-            q_x,
-            e_codes,
-            e_pscales,
-            q_s,
-            n_out,
-            k_in,
-            expert_scratch,
-        );
-        for i in 0..n_out {
-            y_out[i] = fma(expert_scratch[i], gate, y_out[i]);
-        }
-    }
-}
-
 /// **Pure-Rust MLX Transformer Primitive 1: `rms_norm_into`** (Root Mean Square LayerNorm).
 ///
 /// $$y_i = \frac{x_i}{\sqrt{\frac{1}{D}\sum_{j=0}^{D-1} x_j^2 + \epsilon}} \cdot w_i$$
@@ -624,6 +566,16 @@ pub fn rms_norm_into(x: &[f64], weight: Option<&[f64]>, eps: f64, out: &mut [f64
     }
 }
 
+/// Core-only round-half-away-from-zero (`f64 -> i64`), because `f64::round` lives in `std`.
+#[inline(always)]
+fn round_f64_to_i64(x: f64) -> i64 {
+    if x >= 0.0 {
+        (x + 0.5) as i64
+    } else {
+        (x - 0.5) as i64
+    }
+}
+
 /// Core-only cosine/sine approximation (7th-order minimax polynomial with range reduction)
 /// so Rotary Position Embeddings (`rope_into`) work in `#![no_std]` with zero dependencies.
 #[inline]
@@ -631,7 +583,7 @@ fn sin_cos_approx(theta: f64) -> (f64, f64) {
     use core::f64::consts::{FRAC_PI_2 as HALF_PI, PI, TAU};
 
     // Reduce into [-PI, PI]
-    let k = (theta / TAU).round();
+    let k = round_f64_to_i64(theta / TAU) as f64;
     let mut x = theta - k * TAU;
     let mut sign_cos = 1.0;
     if x > HALF_PI {
@@ -732,39 +684,16 @@ pub fn sdpa_single_query_into(
     let scale = 1.0 / sqrt_f64(head_dim as f64);
     let mut max_score = f64::NEG_INFINITY;
 
-    // Fast p/q integer-SIMD Q·K^T path when head_dim <= 512 (zero heap allocations!)
-    let mut pq_q = [0i32; 512];
-    let mut pq_k = [0i32; 512];
-    if head_dim <= pq_q.len() {
-        const Q_ATTN: i64 = 1 << 14; // 16,384 -> product <= 2^28, zero i32 overflow
-        quantize_pq_into(&q[..head_dim], Q_ATTN, &mut pq_q[..head_dim]);
-        let inv_q2_scale = scale / ((Q_ATTN as f64) * (Q_ATTN as f64));
-        for (t, score_slot) in scores_scratch[..seq_len].iter_mut().enumerate() {
-            let k_row = &k_cache[t * head_dim..(t + 1) * head_dim];
-            quantize_pq_into(k_row, Q_ATTN, &mut pq_k[..head_dim]);
-            let dot_i64: i64 = pq_q[..head_dim]
-                .iter()
-                .zip(pq_k[..head_dim].iter())
-                .map(|(&qv, &kv)| (qv as i64) * (kv as i64))
-                .sum();
-            let s = (dot_i64 as f64) * inv_q2_scale;
-            *score_slot = s;
-            if s > max_score {
-                max_score = s;
-            }
+    for t in 0..seq_len {
+        let k_row = &k_cache[t * head_dim..(t + 1) * head_dim];
+        let mut dot = 0.0f64;
+        for d in 0..head_dim {
+            dot = fma(q[d], k_row[d], dot);
         }
-    } else {
-        for (t, score_slot) in scores_scratch[..seq_len].iter_mut().enumerate() {
-            let k_row = &k_cache[t * head_dim..(t + 1) * head_dim];
-            let mut dot = 0.0f64;
-            for d in 0..head_dim {
-                dot = fma(q[d], k_row[d], dot);
-            }
-            let s = dot * scale;
-            *score_slot = s;
-            if s > max_score {
-                max_score = s;
-            }
+        let s = dot * scale;
+        scores_scratch[t] = s;
+        if s > max_score {
+            max_score = s;
         }
     }
 
@@ -788,81 +717,6 @@ pub fn sdpa_single_query_into(
     }
 }
 
-/// **`sdpa_pq_single_query_into`** — Pure $p/q$ Integer-Numerator KV-Cache Attention.
-///
-/// Takes pre-projected integer query numerators `p_q` (`[head_dim]`), pre-projected integer
-/// KV-cache numerators `p_k_cache` and `p_v_cache` (`[seq_len, head_dim]`), and shared
-/// denominator `q_kv` (e.g. `1 << 14`), computing both $q K^T$ and $\text{prob} \cdot V$
-/// in associative integer arithmetic ($\mathbb{Z}$) with single deferred division at the end.
-///
-/// Performs **zero heap allocations**.
-#[inline]
-#[allow(clippy::too_many_arguments)]
-pub fn sdpa_pq_single_query_into(
-    p_q: &[i32],
-    p_k_cache: &[i32],
-    p_v_cache: &[i32],
-    q_kv: i64,
-    seq_len: usize,
-    head_dim: usize,
-    scores_scratch: &mut [f64],
-    out: &mut [f64],
-) {
-    debug_assert!(p_q.len() >= head_dim);
-    debug_assert!(p_k_cache.len() >= seq_len * head_dim);
-    debug_assert!(p_v_cache.len() >= seq_len * head_dim);
-    debug_assert!(scores_scratch.len() >= seq_len);
-    debug_assert!(out.len() >= head_dim);
-
-    if seq_len == 0 || head_dim == 0 {
-        return;
-    }
-    let inv_q2_scale = 1.0 / ((q_kv as f64) * (q_kv as f64) * sqrt_f64(head_dim as f64));
-    let mut max_score = f64::NEG_INFINITY;
-    let pq_slice = &p_q[..head_dim];
-
-    for (t, score_slot) in scores_scratch[..seq_len].iter_mut().enumerate() {
-        let pk_row = &p_k_cache[t * head_dim..(t + 1) * head_dim];
-        let dot_i64: i64 = pq_slice
-            .iter()
-            .zip(pk_row.iter())
-            .map(|(&qv, &kv)| (qv as i64) * (kv as i64))
-            .sum();
-        let s = (dot_i64 as f64) * inv_q2_scale;
-        *score_slot = s;
-        if s > max_score {
-            max_score = s;
-        }
-    }
-
-    let mut sum_exp = 0.0f64;
-    for s in scores_scratch[..seq_len].iter_mut() {
-        let e = exp_approx(*s - max_score);
-        *s = e;
-        sum_exp += e;
-    }
-    let inv_sum = if sum_exp > 0.0 { 1.0 / sum_exp } else { 0.0 };
-
-    // Project probabilities onto Q_PROB = 2^20 and accumulate prob * V in i64, dividing ONCE at the end!
-    const Q_PROB: i64 = 1 << 20;
-    let q_prob_f64 = Q_PROB as f64;
-    let inv_total = 1.0 / ((Q_PROB as f64) * (q_kv as f64));
-
-    for slot in out[..head_dim].iter_mut() {
-        *slot = 0.0;
-    }
-    for (t, &unnorm_prob) in scores_scratch[..seq_len].iter().enumerate() {
-        let p_prob = ((unnorm_prob * inv_sum) * q_prob_f64).round() as i64;
-        if p_prob == 0 {
-            continue;
-        }
-        let pv_row = &p_v_cache[t * head_dim..(t + 1) * head_dim];
-        for (slot, &pv) in out[..head_dim].iter_mut().zip(pv_row.iter()) {
-            *slot += ((p_prob * (pv as i64)) as f64) * inv_total;
-        }
-    }
-}
-
 /// **Pure-Rust MLX Autodiff (`value_and_grad`): `ste_linear_backward_into`**
 ///
 /// Straight-Through Estimator (STE) backward pass for BitNet b1.58 Quantization-Aware
@@ -872,8 +726,7 @@ pub fn sdpa_pq_single_query_into(
 ///   - $\nabla_x = \nabla_y \cdot \hat{W}$
 ///   - $\nabla_W = \nabla_y^T \otimes x \cdot \mathbb{1}_{|W / \text{scale}| \le 1.5}$ (clipped straight-through gradient)
 ///
-/// Uses algebraic threshold hoisting ($\pm 0.5 \times \text{scale}$ and $\pm 1.5 \times \text{scale}$)
-/// to eliminate per-weight float divisions and multiplications. Performs **zero heap allocations**.
+/// Performs **zero heap allocations**.
 #[inline]
 #[allow(clippy::too_many_arguments)]
 pub fn ste_linear_backward_into(
@@ -905,26 +758,22 @@ pub fn ste_linear_backward_into(
             abs_sum += v.abs();
         }
         let scale = (abs_sum / (k_in.max(1) as f64)).max(1e-12);
-        // Hoist thresholds outside the k loop: eliminates 4 float multiplies + 1 division per weight!
-        let pos_thresh = 0.5 * scale;
-        let neg_thresh = -pos_thresh;
-        let ste_pos = 1.5 * scale;
-        let ste_neg = -ste_pos;
-        let gy_scaled = gy * scale;
+        let inv_scale = 1.0 / scale;
 
         for k in 0..k_in {
-            let wk = row_w[k];
-            if wk >= pos_thresh {
-                grad_x_out[k] += gy_scaled;
-            } else if wk <= neg_thresh {
-                grad_x_out[k] -= gy_scaled;
-            }
-            // Clipped STE window: pass gradient straight through inside [-1.5*scale, 1.5*scale]
-            row_gw[k] = if wk >= ste_neg && wk <= ste_pos {
-                gy * x[k]
+            let norm = row_w[k] * inv_scale;
+            let trit = if norm >= 0.5 {
+                1.0
+            } else if norm <= -0.5 {
+                -1.0
             } else {
                 0.0
             };
+            let w_hat = trit * scale;
+            grad_x_out[k] = fma(gy, w_hat, grad_x_out[k]);
+            // Clipped STE window: pass gradient straight through inside [-1.5, 1.5]
+            let ste_mask = if norm.abs() <= 1.5 { 1.0 } else { 0.0 };
+            row_gw[k] = gy * x[k] * ste_mask;
         }
     }
 }
@@ -1164,7 +1013,7 @@ impl Pq {
     #[inline]
     pub fn from_f64(val: f64, q: i64) -> Self {
         let q_pos = q.abs().max(1);
-        let p = (val * (q_pos as f64)).round() as i64;
+        let p = round_f64_to_i64(val * (q_pos as f64));
         Self { p, q: q_pos }
     }
 
@@ -1209,20 +1058,21 @@ const fn gcd_i64(mut a: i64, mut b: i64) -> i64 {
     if a == 0 { 1 } else { a }
 }
 
-/// Compile-time 256-entry byte LUTs for MLX 2-bit codes (`-1 -> 0`, `0 -> 1`, `+1 -> 2`) as `i32`.
-/// Each byte holds 4 trits; `MLX_B0..MLX_B3` unpack a byte into four `i32` trits with zero shifts
-/// and zero float conversions.
-const MLX_B0: [i32; 256] = build_mlx_byte_lut(0);
-const MLX_B1: [i32; 256] = build_mlx_byte_lut(2);
-const MLX_B2: [i32; 256] = build_mlx_byte_lut(4);
-const MLX_B3: [i32; 256] = build_mlx_byte_lut(6);
+/// Unified compile-time 4-trit `i32` LUT (`256 × 4 × 4 = 4,096` bytes, 16-byte power-of-two stride).
+/// `MLX_BYTE_TRITS_I32[b]` loads all 4 decoded `i32` trits of byte `b` from a single 16-byte aligned
+/// entry (`b << 4`), eliminating 4 separate table base calculations.
+pub const MLX_BYTE_TRITS_I32: [[i32; 4]; 256] = build_mlx_byte_trits_i32();
 
-const fn build_mlx_byte_lut(shift: usize) -> [i32; 256] {
-    let mut table = [0i32; 256];
+const fn build_mlx_byte_trits_i32() -> [[i32; 4]; 256] {
+    let mut table = [[0i32; 4]; 256];
     let mut b = 0usize;
     while b < 256 {
-        let code = ((b >> shift) & 0x03) as u32;
-        table[b] = mlx_trit_of(code) as i32;
+        table[b] = [
+            mlx_trit_of((b & 0x03) as u32) as i32,
+            mlx_trit_of(((b >> 2) & 0x03) as u32) as i32,
+            mlx_trit_of(((b >> 4) & 0x03) as u32) as i32,
+            mlx_trit_of(((b >> 6) & 0x03) as u32) as i32,
+        ];
         b += 1;
     }
     table
@@ -1235,7 +1085,7 @@ pub fn quantize_pq_into(x: &[f64], q: i64, p_out: &mut [i32]) {
     debug_assert!(p_out.len() >= x.len());
     let q_f64 = q as f64;
     for (dst, &val) in p_out.iter_mut().zip(x.iter()) {
-        *dst = (val * q_f64).round() as i32;
+        *dst = round_f64_to_i64(val * q_f64) as i32;
     }
 }
 
@@ -1244,12 +1094,6 @@ pub fn quantize_pq_into(x: &[f64], q: i64, p_out: &mut [i32]) {
 /// Computes $\max_k |x_k|$ in a single pass and selects the largest power-of-two denominator
 /// $q = 2^e \in [1, 2^{29}]$ such that $\max_k |p_k| \le 2^{\text{max\_bits}}$ (`max_bits` clamped
 /// to `1..=29`), returning the chosen denominator $q$.
-///
-/// At `max_bits = 29` (for `i64` accumulators like [`b158_matmul_pq_i_major_into`]), this provides
-/// **29 bits of effective mantissa precision** (exceeding IEEE-754 FP32's 24-bit mantissa across
-/// any activation dynamic range!). At `max_bits = 22` (for 64-element `i32` accumulators like
-/// [`mlx_matmul_pq_group64_into`]), it guarantees zero `i32` overflow.
-///
 /// Performs **zero heap allocations**.
 #[inline]
 pub fn quantize_pq_adaptive_into(x: &[f64], max_bits: u32, p_out: &mut [i32]) -> i64 {
@@ -1271,7 +1115,6 @@ pub fn quantize_pq_adaptive_into(x: &[f64], max_bits: u32, p_out: &mut [i32]) ->
         return PQ_DEFAULT_Q;
     }
 
-    // Find the largest power-of-two q = 2^e in [1, 2^29] such that max_abs * q <= max_num
     let ratio = max_num / max_abs;
     let mut q = 1i64;
     let mut exp = 0u32;
@@ -1283,13 +1126,140 @@ pub fn quantize_pq_adaptive_into(x: &[f64], max_bits: u32, p_out: &mut [i32]) ->
     q
 }
 
+/// Decode and dot-accumulate one `u32` word (16 two-bit MLX trits) against `px` (`[i32; 16]`)
+/// using [`MLX_BYTE_TRITS_I32`] in pure 32-bit integer arithmetic.
+#[inline(always)]
+fn dot_mlx_word_pq_i32(word: u32, px: &[i32]) -> i32 {
+    if word == 0x5555_5555 {
+        return 0;
+    }
+    let px = &px[..16];
+    let t0 = &MLX_BYTE_TRITS_I32[(word & 0xFF) as usize];
+    let t1 = &MLX_BYTE_TRITS_I32[((word >> 8) & 0xFF) as usize];
+    let t2 = &MLX_BYTE_TRITS_I32[((word >> 16) & 0xFF) as usize];
+    let t3 = &MLX_BYTE_TRITS_I32[(word >> 24) as usize];
+
+    let s0 = t0[0]
+        .wrapping_mul(px[0])
+        .wrapping_add(t0[1].wrapping_mul(px[1]))
+        .wrapping_add(t0[2].wrapping_mul(px[2]))
+        .wrapping_add(t0[3].wrapping_mul(px[3]));
+    let s1 = t1[0]
+        .wrapping_mul(px[4])
+        .wrapping_add(t1[1].wrapping_mul(px[5]))
+        .wrapping_add(t1[2].wrapping_mul(px[6]))
+        .wrapping_add(t1[3].wrapping_mul(px[7]));
+    let s2 = t2[0]
+        .wrapping_mul(px[8])
+        .wrapping_add(t2[1].wrapping_mul(px[9]))
+        .wrapping_add(t2[2].wrapping_mul(px[10]))
+        .wrapping_add(t2[3].wrapping_mul(px[11]));
+    let s3 = t3[0]
+        .wrapping_mul(px[12])
+        .wrapping_add(t3[1].wrapping_mul(px[13]))
+        .wrapping_add(t3[2].wrapping_mul(px[14]))
+        .wrapping_add(t3[3].wrapping_mul(px[15]));
+
+    s0.wrapping_add(s1).wrapping_add(s2).wrapping_add(s3)
+}
+
+/// Pure-integer Group-64 MLX-QUANT matrix-vector product (`p_out[n] = sum_g p_scales[n, g] * dot(codes, p_x)`).
+///
+/// Uses **4-row register blocking** and [`MLX_BYTE_TRITS_I32`] with **zero floating-point
+/// instructions** anywhere in the function.
+#[inline]
+pub fn mlx_matmul_pq_group64_i64_into(
+    p_x: &[i32],
+    w_codes: &[u32],
+    p_scales: &[i32],
+    n_out: usize,
+    k_in: usize,
+    p_out: &mut [i64],
+) {
+    debug_assert!(k_in.is_multiple_of(MLX_GROUP_SIZE));
+    let groups_per_row = k_in / MLX_GROUP_SIZE;
+    let words_per_row = k_in / TRITS_PER_U32;
+    debug_assert!(p_x.len() >= k_in);
+    debug_assert!(w_codes.len() >= n_out * words_per_row);
+    debug_assert!(p_scales.len() >= n_out * groups_per_row);
+    debug_assert!(p_out.len() >= n_out);
+
+    let mut n = 0usize;
+    while n + 4 <= n_out {
+        let c0 = &w_codes[n * words_per_row..(n + 1) * words_per_row];
+        let c1 = &w_codes[(n + 1) * words_per_row..(n + 2) * words_per_row];
+        let c2 = &w_codes[(n + 2) * words_per_row..(n + 3) * words_per_row];
+        let c3 = &w_codes[(n + 3) * words_per_row..(n + 4) * words_per_row];
+
+        let s0 = &p_scales[n * groups_per_row..(n + 1) * groups_per_row];
+        let s1 = &p_scales[(n + 1) * groups_per_row..(n + 2) * groups_per_row];
+        let s2 = &p_scales[(n + 2) * groups_per_row..(n + 3) * groups_per_row];
+        let s3 = &p_scales[(n + 3) * groups_per_row..(n + 4) * groups_per_row];
+
+        let mut tot0 = 0i64;
+        let mut tot1 = 0i64;
+        let mut tot2 = 0i64;
+        let mut tot3 = 0i64;
+
+        for g in 0..groups_per_row {
+            let mut g0 = 0i32;
+            let mut g1 = 0i32;
+            let mut g2 = 0i32;
+            let mut g3 = 0i32;
+
+            for w_idx in 0..4 {
+                let px = &p_x[g * MLX_GROUP_SIZE + w_idx * TRITS_PER_U32
+                    ..g * MLX_GROUP_SIZE + (w_idx + 1) * TRITS_PER_U32];
+                let idx = g * 4 + w_idx;
+                g0 = g0.wrapping_add(dot_mlx_word_pq_i32(c0[idx], px));
+                g1 = g1.wrapping_add(dot_mlx_word_pq_i32(c1[idx], px));
+                g2 = g2.wrapping_add(dot_mlx_word_pq_i32(c2[idx], px));
+                g3 = g3.wrapping_add(dot_mlx_word_pq_i32(c3[idx], px));
+            }
+
+            tot0 += (g0 as i64) * (s0[g] as i64);
+            tot1 += (g1 as i64) * (s1[g] as i64);
+            tot2 += (g2 as i64) * (s2[g] as i64);
+            tot3 += (g3 as i64) * (s3[g] as i64);
+        }
+
+        p_out[n] = tot0;
+        p_out[n + 1] = tot1;
+        p_out[n + 2] = tot2;
+        p_out[n + 3] = tot3;
+        n += 4;
+    }
+
+    while n < n_out {
+        let row_codes = &w_codes[n * words_per_row..(n + 1) * words_per_row];
+        let row_pscales = &p_scales[n * groups_per_row..(n + 1) * groups_per_row];
+        let mut row_num_i64 = 0i64;
+
+        for g in 0..groups_per_row {
+            let p_scale = row_pscales[g];
+            if p_scale == 0 {
+                continue;
+            }
+            let mut g_acc = 0i32;
+            for w_idx in 0..4 {
+                let px = &p_x[g * MLX_GROUP_SIZE + w_idx * TRITS_PER_U32
+                    ..g * MLX_GROUP_SIZE + (w_idx + 1) * TRITS_PER_U32];
+                g_acc = g_acc.wrapping_add(dot_mlx_word_pq_i32(row_codes[g * 4 + w_idx], px));
+            }
+            row_num_i64 += (g_acc as i64) * (p_scale as i64);
+        }
+        p_out[n] = row_num_i64;
+        n += 1;
+    }
+}
+
 /// **`mlx_matmul_pq_group64_into`** — Pure $p/q$ Integer-Numerator MLX Group-64 Matmul.
 ///
 /// Given integer activation numerators `p_x` (`x[k] ≈ p_x[k] / q_x`), packed MLX `u32` ternary
 /// codes `w_codes`, and integer group-scale numerators `p_scales` (`scale[n, g] ≈ p_scales[n, g] / q_s`),
 /// computes the entire $N \times K$ matrix-vector product in **pure integer arithmetic ($\mathbb{Z}$)**
-/// with **zero `int -> float` conversions in the inner loop**, dividing by $q_x \cdot q_s$
-/// **only once per output row**.
+/// with **4-row register blocking** and **zero `int -> float` conversions in the inner loop**,
+/// dividing by $q_x \cdot q_s$ **only once per output row**.
 ///
 /// Performs **zero heap allocations**.
 #[inline]
@@ -1313,6 +1283,14 @@ pub fn mlx_matmul_pq_group64_into(
     debug_assert!(y_out.len() >= n_out);
 
     let inv_q_total = 1.0 / ((q_x as f64) * (q_s as f64));
+    let mut pout_stack = [0i64; 2048];
+    if n_out <= pout_stack.len() {
+        mlx_matmul_pq_group64_i64_into(p_x, w_codes, p_scales, n_out, k_in, &mut pout_stack[..n_out]);
+        for (slot, &p_val) in y_out[..n_out].iter_mut().zip(pout_stack[..n_out].iter()) {
+            *slot = (p_val as f64) * inv_q_total;
+        }
+        return;
+    }
 
     for (n, slot) in y_out[..n_out].iter_mut().enumerate() {
         let row_codes = &w_codes[n * words_per_row..(n + 1) * words_per_row];
@@ -1324,57 +1302,23 @@ pub fn mlx_matmul_pq_group64_into(
             if p_scale == 0 {
                 continue;
             }
-            let mut g_acc0 = 0i32;
-            let mut g_acc1 = 0i32;
-            let mut g_acc2 = 0i32;
-            let mut g_acc3 = 0i32;
-
+            let mut g_acc = 0i32;
             for w_idx in 0..4 {
-                let word = row_codes[g * 4 + w_idx];
-                if word == 0x5555_5555 {
-                    continue;
-                }
                 let px = &p_x[g * MLX_GROUP_SIZE + w_idx * TRITS_PER_U32
                     ..g * MLX_GROUP_SIZE + (w_idx + 1) * TRITS_PER_U32];
-
-                let b0 = (word & 0xFF) as usize;
-                let b1 = ((word >> 8) & 0xFF) as usize;
-                let b2 = ((word >> 16) & 0xFF) as usize;
-                let b3 = (word >> 24) as usize;
-
-                g_acc0 = g_acc0.wrapping_add(MLX_B0[b0].wrapping_mul(px[0]));
-                g_acc1 = g_acc1.wrapping_add(MLX_B1[b0].wrapping_mul(px[1]));
-                g_acc2 = g_acc2.wrapping_add(MLX_B2[b0].wrapping_mul(px[2]));
-                g_acc3 = g_acc3.wrapping_add(MLX_B3[b0].wrapping_mul(px[3]));
-
-                g_acc0 = g_acc0.wrapping_add(MLX_B0[b1].wrapping_mul(px[4]));
-                g_acc1 = g_acc1.wrapping_add(MLX_B1[b1].wrapping_mul(px[5]));
-                g_acc2 = g_acc2.wrapping_add(MLX_B2[b1].wrapping_mul(px[6]));
-                g_acc3 = g_acc3.wrapping_add(MLX_B3[b1].wrapping_mul(px[7]));
-
-                g_acc0 = g_acc0.wrapping_add(MLX_B0[b2].wrapping_mul(px[8]));
-                g_acc1 = g_acc1.wrapping_add(MLX_B1[b2].wrapping_mul(px[9]));
-                g_acc2 = g_acc2.wrapping_add(MLX_B2[b2].wrapping_mul(px[10]));
-                g_acc3 = g_acc3.wrapping_add(MLX_B3[b2].wrapping_mul(px[11]));
-
-                g_acc0 = g_acc0.wrapping_add(MLX_B0[b3].wrapping_mul(px[12]));
-                g_acc1 = g_acc1.wrapping_add(MLX_B1[b3].wrapping_mul(px[13]));
-                g_acc2 = g_acc2.wrapping_add(MLX_B2[b3].wrapping_mul(px[14]));
-                g_acc3 = g_acc3.wrapping_add(MLX_B3[b3].wrapping_mul(px[15]));
+                g_acc = g_acc.wrapping_add(dot_mlx_word_pq_i32(row_codes[g * 4 + w_idx], px));
             }
-            let group_sum = (g_acc0 + g_acc1 + g_acc2 + g_acc3) as i64;
-            row_num_i64 += group_sum * (p_scale as i64);
+            row_num_i64 += (g_acc as i64) * (p_scale as i64);
         }
-        // Single division by q_x * q_s at the end of the row!
         *slot = (row_num_i64 as f64) * inv_q_total;
     }
 }
 
 /// **`b158_matmul_pq_i_major_into`** — Pure $p/q$ Integer-Numerator GAIA Base-3 (`5 trits/byte`) i-major Matmul.
 ///
-/// Accumulates `T0..T4` LUT trits $\times$ integer numerators `p_x` in pure `i32`/`i64` arithmetic
-/// without a single `int -> float` conversion in the $O(N \times K)$ loop, dividing by `q_x`
-/// **only once per output column**.
+/// Accumulates [`crate::pack::BYTE_TRITS_I32`] LUT trits $\times$ integer numerators `p_x` in
+/// **4-column register-blocked `i32`/`i64` arithmetic** without a single `int -> float` conversion
+/// in the $O(N \times K)$ loop, dividing by `q_x` **only once per output column**.
 ///
 /// Performs **zero heap allocations**.
 #[inline]
@@ -1387,37 +1331,26 @@ pub fn b158_matmul_pq_i_major_into(
     gamma: f64,
     y_out: &mut [f64],
 ) {
+    use crate::kernel::{KERNEL_PQ_Q, ternary_matmul_pq_i_major_into};
     use crate::pack::{T0, T1, T2, T3, T4};
     debug_assert!(p_x.len() >= rows);
     debug_assert!(y_out.len() >= cols);
     debug_assert!(packed_i.len() * TRITS_PER_BYTE >= rows * cols);
 
     let scale_out = gamma / (q_x as f64);
-
-    if rows.is_multiple_of(TRITS_PER_BYTE) {
-        let bytes_per_col = rows / TRITS_PER_BYTE;
-        for (i, slot) in y_out[..cols].iter_mut().enumerate() {
-            let col_bytes = &packed_i[i * bytes_per_col..(i + 1) * bytes_per_col];
-            let mut acc0 = 0i64;
-            let mut acc1 = 0i64;
-            let mut acc2 = 0i64;
-            let mut acc3 = 0i64;
-            let mut acc4 = 0i64;
-            let mut j = 0usize;
-            for &byte in col_bytes {
-                if byte == 0 {
-                    j += TRITS_PER_BYTE;
-                    continue;
-                }
-                let b = byte as usize;
-                acc0 += (T0[b] as i64) * (p_x[j] as i64);
-                acc1 += (T1[b] as i64) * (p_x[j + 1] as i64);
-                acc2 += (T2[b] as i64) * (p_x[j + 2] as i64);
-                acc3 += (T3[b] as i64) * (p_x[j + 3] as i64);
-                acc4 += (T4[b] as i64) * (p_x[j + 4] as i64);
-                j += TRITS_PER_BYTE;
-            }
-            *slot = ((acc0 + acc1 + acc2 + acc3 + acc4) as f64) * scale_out;
+    let mut pout_stack = [0i64; 2048];
+    if cols <= pout_stack.len() {
+        ternary_matmul_pq_i_major_into(
+            packed_i,
+            rows,
+            cols,
+            p_x,
+            None,
+            KERNEL_PQ_Q,
+            &mut pout_stack[..cols],
+        );
+        for (slot, &p_val) in y_out[..cols].iter_mut().zip(pout_stack[..cols].iter()) {
+            *slot = (p_val as f64) * scale_out;
         }
         return;
     }
@@ -1459,16 +1392,14 @@ pub fn b158_matmul_pq_i_major_into(
     }
 }
 
-/// **`ternary_simd_pq_matmul_into`** — Wide-SIMD Auto-Vectorized $p/q$ Integer Dot Product
-/// with Explicit 64-Element Overflow Bounds (`i32` inner SIMD $\to$ `i64` outer accumulator).
+/// **`ternary_simd_pq_matmul_into`** — 4-Column Blocked Wide-SIMD Auto-Vectorized $p/q$ Integer Dot Product.
 ///
-/// - **Inner 64-element block**: Accumulates in `i32`, which LLVM lowers to 8-wide AVX2 / 4-wide NEON
-///   (`vpmovsxbd` + `vpmulld` + `vpaddd`) in 100% safe `#![forbid(unsafe_code)]` Rust.
-///   For $|p_{x,k}| < 2^{25}$ (guaranteed for $q = 2^{20}$ up to $|x_k| < 32$), the 64-element sum
-///   satisfies $|S_{64}| \le 64 \times 2^{25} = 2^{31}-1$, making `i32` overflow impossible.
-/// - **Outer row sum**: Widens each 64-element `i32` block sum into `i64` so arbitrarily long
-///   dimensions $K$ never overflow.
-/// - Divides by `q_x` **only once per output column** and performs **zero heap allocations**.
+/// Because integer addition in $\mathbb{Z}$ is associative (unlike IEEE-754 `f64`), LLVM
+/// compiles this 4-column blocked contiguous `i8 × i32 -> i32` dot product directly into
+/// 256-bit AVX2 / 128-bit NEON vector instructions (`vpmovsxbd` + `vpmulld` + `vpaddd` /
+/// `sxtl` + `mla.4s`) in 100% safe `#![forbid(unsafe_code)]` Rust.
+///
+/// Divides by `q_x` **only once per output column** and performs **zero heap allocations**.
 #[inline]
 #[allow(clippy::too_many_arguments)]
 pub fn ternary_simd_pq_matmul_into(
@@ -1481,331 +1412,1357 @@ pub fn ternary_simd_pq_matmul_into(
     gamma: f64,
     y_out: &mut [f64],
 ) {
+    use crate::kernel::{KERNEL_PQ_Q, ternary_simd_i8_pq_into};
     debug_assert!(trits_i_major.len() >= rows * cols);
     debug_assert!(p_x.len() >= rows);
     debug_assert!(y_out.len() >= cols);
 
     let inv_q = gamma / (q_x as f64);
-    let px_slice = &p_x[..rows];
+    let mut pout_stack = [0i64; 2048];
+    if cols <= pout_stack.len() {
+        ternary_simd_i8_pq_into(
+            trits_i_major,
+            rows,
+            cols,
+            p_x,
+            None,
+            KERNEL_PQ_Q,
+            &mut pout_stack[..cols],
+        );
+        if let Some(sc) = scales_col {
+            for i in 0..cols {
+                y_out[i] = (pout_stack[i] as f64) * inv_q * sc[i];
+            }
+        } else {
+            for i in 0..cols {
+                y_out[i] = (pout_stack[i] as f64) * inv_q;
+            }
+        }
+        return;
+    }
 
+    let px_slice = &p_x[..rows];
     for (i, slot) in y_out[..cols].iter_mut().enumerate() {
         let col_trits = &trits_i_major[i * rows..(i + 1) * rows];
-        let mut dot_i64 = 0i64;
-        for (t_chunk, px_chunk) in col_trits.chunks(MLX_GROUP_SIZE).zip(px_slice.chunks(MLX_GROUP_SIZE)) {
-            let block_i32: i32 = t_chunk
-                .iter()
-                .zip(px_chunk.iter())
-                .map(|(&t, &px)| (t as i32).wrapping_mul(px))
-                .fold(0i32, i32::wrapping_add);
-            dot_i64 += block_i32 as i64;
-        }
+        let dot_i32: i32 = col_trits
+            .iter()
+            .zip(px_slice.iter())
+            .map(|(&t, &px)| (t as i32).wrapping_mul(px))
+            .fold(0i32, i32::wrapping_add);
         let col_scale = scales_col.map(|s| s[i]).unwrap_or(1.0);
-        *slot = (dot_i64 as f64) * inv_q * col_scale;
+        *slot = (dot_i32 as f64) * inv_q * col_scale;
     }
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// Omni / MEM|8 Block-Floating-Point (BFP-64) Integer Engine:
-//   Variant 1: `i8` mantissa [-127, 127] + block exponent -> `i16` SIMD accumulator (|S_64| <= 8,128)
-//   Variant 2: `i16` mantissa [-32767, 32767] + block exponent -> `i32` SIMD accumulator (|S_64| <= 2,097,088)
-//   Variant 3: MEM|8 Adaptive Precision (`i8` default, promotes blocks to `i16` when error > threshold)
+// 100% Pure-Integer (`no-float`) MLX-QUANT & Transformer Primitives (`p/q`)
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// Compute the dyadic power-of-two scale $2^{e_g}$ and inverse $2^{-e_g}$ (`e_g: i8`)
-/// that maps `max_abs` into `[max_int / 2, max_int]`.
+/// Pure-integer Group-64 MLX-QUANT quantization (`w_p: &[i32]` -> `codes_out: &mut [u32]`, `p_scales_out: &mut [i32]`).
+///
+/// Uses the exact integer threshold `|val| * 128 >= abs_sum` so the hot loop performs
+/// **zero floating-point operations and zero per-weight divisions**.
 #[inline]
-fn dyadic_block_exponent(max_abs: f64, max_int: f64) -> (i8, f64, f64) {
-    if max_abs <= 1e-30 {
-        return (0, 1.0, 1.0);
-    }
-    // Find power-of-two step 2^e such that max_abs / 2^e <= max_int
-    let target_inv = max_int / max_abs;
-    let mut e: i8 = 0;
-    let mut inv_scale = 1.0f64; // 2^(-e)
-    let mut scale = 1.0f64;     // 2^e
-    if target_inv >= 1.0 {
-        while e > -40 && (inv_scale * 2.0) <= target_inv {
-            inv_scale *= 2.0;
-            scale *= 0.5;
-            e -= 1;
+pub fn mlx_quantize_group64_pq_into(
+    p_w: &[i32],
+    rows: usize,
+    cols: usize,
+    q: i32,
+    codes_out: &mut [u32],
+    p_scales_out: &mut [i32],
+) {
+    debug_assert!(cols.is_multiple_of(MLX_GROUP_SIZE));
+    let groups_per_row = cols / MLX_GROUP_SIZE;
+    let words_per_row = cols / TRITS_PER_U32;
+    debug_assert!(p_w.len() >= rows * cols);
+    debug_assert!(codes_out.len() >= rows * words_per_row);
+    debug_assert!(p_scales_out.len() >= rows * groups_per_row);
+
+    for r in 0..rows {
+        let row_w = &p_w[r * cols..(r + 1) * cols];
+        let row_codes = &mut codes_out[r * words_per_row..(r + 1) * words_per_row];
+        let row_scales = &mut p_scales_out[r * groups_per_row..(r + 1) * groups_per_row];
+
+        for g in 0..groups_per_row {
+            let group = &row_w[g * MLX_GROUP_SIZE..(g + 1) * MLX_GROUP_SIZE];
+            let mut abs_sum: i64 = 0;
+            for &v in group {
+                abs_sum += (v as i64).abs();
+            }
+            let scale_p = if abs_sum == 0 {
+                q
+            } else {
+                ((abs_sum + 32) >> 6) as i32
+            };
+            row_scales[g] = scale_p;
+
+            for w_idx in 0..4 {
+                let sub = &group[w_idx * TRITS_PER_U32..(w_idx + 1) * TRITS_PER_U32];
+                let mut word = 0u32;
+                for (k, &val) in sub.iter().enumerate() {
+                    let v64 = val as i64;
+                    let abs128 = v64.abs() << 7; // |val| * 128 >= abs_sum <=> |val| >= 0.5 * (abs_sum / 64)
+                    let trit: i8 = if abs_sum == 0 || abs128 < abs_sum {
+                        0
+                    } else if v64 > 0 {
+                        1
+                    } else {
+                        -1
+                    };
+                    word |= (mlx_code_of(trit) & 0x03) << (k * 2);
+                }
+                row_codes[g * 4 + w_idx] = word;
+            }
         }
-    } else {
-        while e < 40 && inv_scale > target_inv {
-            inv_scale *= 0.5;
-            scale *= 2.0;
-            e += 1;
-        }
     }
-    (e, scale, inv_scale)
 }
 
-/// **Variant 1 Quantizer (`quantize_bfp_i8_group64_into`)**:
+/// Pure-integer Group-64 MLX-QUANT dequantization (`codes: &[u32]`, `p_scales: &[i32]` -> `p_out: &mut [i32]`).
+/// Zero floating-point operations.
+#[inline]
+pub fn mlx_dequantize_group64_pq_into(
+    codes: &[u32],
+    p_scales: &[i32],
+    rows: usize,
+    cols: usize,
+    p_out: &mut [i32],
+) {
+    debug_assert!(cols.is_multiple_of(MLX_GROUP_SIZE));
+    let groups_per_row = cols / MLX_GROUP_SIZE;
+    let words_per_row = cols / TRITS_PER_U32;
+    debug_assert!(codes.len() >= rows * words_per_row);
+    debug_assert!(p_scales.len() >= rows * groups_per_row);
+    debug_assert!(p_out.len() >= rows * cols);
+
+    for r in 0..rows {
+        let row_codes = &codes[r * words_per_row..(r + 1) * words_per_row];
+        let row_scales = &p_scales[r * groups_per_row..(r + 1) * groups_per_row];
+        let row_out = &mut p_out[r * cols..(r + 1) * cols];
+
+        for g in 0..groups_per_row {
+            let scale_p = row_scales[g];
+            for w_idx in 0..4 {
+                let word = row_codes[g * 4 + w_idx];
+                let base = g * MLX_GROUP_SIZE + w_idx * TRITS_PER_U32;
+                for byte_idx in 0..4 {
+                    let b = ((word >> (byte_idx * 8)) & 0xFF) as usize;
+                    let trits = &MLX_BYTE_TRITS_I32[b];
+                    let dst = &mut row_out[base + byte_idx * 4..base + byte_idx * 4 + 4];
+                    dst[0] = trits[0].wrapping_mul(scale_p);
+                    dst[1] = trits[1].wrapping_mul(scale_p);
+                    dst[2] = trits[2].wrapping_mul(scale_p);
+                    dst[3] = trits[3].wrapping_mul(scale_p);
+                }
+            }
+        }
+    }
+}
+
+/// Pure-integer **`mergeq_matmul_pq_into`** — Triple-Fused `quantize + dequantize + matmul` in `p/q`.
 ///
-/// Projects `x` (`rows` elements, `rows % 64 == 0`) into **1-byte `i8` mantissas**
-/// $m_k \in [-127, 127]$ with a shared power-of-two block exponent $e_g \in \mathbb{Z}$ (`exp_out[g]`)
-/// per 64-element group:
-/// $$x_k \approx m_k \cdot 2^{e_g}, \qquad |S_g|_{\max} = 64 \times 127 = 8{,}128 < 32{,}767 \text{ (fits in } \texttt{i16}\text{!)}$$
+/// Uses the exact integer inequality `|wv| * 2 * gs >= abs_sum` and accumulates in `i64`
+/// with **zero floating-point operations** and **0 B intermediate weight storage**.
+#[inline]
+pub fn mergeq_matmul_pq_into(
+    p_x: &[i32],
+    p_w: &[i32],
+    n_out: usize,
+    k_in: usize,
+    group_size: usize,
+    p_out: &mut [i64],
+) {
+    let gs = if group_size == 0 { MLX_GROUP_SIZE } else { group_size };
+    debug_assert!(p_x.len() >= k_in);
+    debug_assert!(p_w.len() >= n_out * k_in);
+    debug_assert!(p_out.len() >= n_out);
+
+    for (n, slot) in p_out[..n_out].iter_mut().enumerate() {
+        let row_w = &p_w[n * k_in..(n + 1) * k_in];
+        let mut row_acc: i64 = 0;
+
+        let mut start = 0usize;
+        while start < k_in {
+            let end = (start + gs).min(k_in);
+            let group_w = &row_w[start..end];
+            let group_x = &p_x[start..end];
+            let glen = group_w.len() as i64;
+            let two_glen = glen * 2;
+
+            let mut abs_sum: i64 = 0;
+            for &v in group_w {
+                abs_sum += (v as i64).abs();
+            }
+            if abs_sum > 0 {
+                let scale_p = (abs_sum + (glen >> 1)) / glen;
+                let mut g_acc: i64 = 0;
+                for (&wv, &xv) in group_w.iter().zip(group_x.iter()) {
+                    let w64 = wv as i64;
+                    if w64.abs() * two_glen >= abs_sum {
+                        if w64 > 0 {
+                            g_acc += xv as i64;
+                        } else {
+                            g_acc -= xv as i64;
+                        }
+                    }
+                }
+                row_acc += g_acc * scale_p;
+            }
+            start = end;
+        }
+        *slot = row_acc;
+    }
+}
+
+/// Pure-integer **`maybe_matmul_pq_into`** — Stochastic Ternary Matmul in `p/q`.
 ///
+/// Uses a 20-bit uniform integer threshold from SplitMix64 (`(rnd & 0xFFFFF) * abs_max < (|w| << 20)`)
+/// so the stochastic rounding decision executes with **zero floating-point instructions**.
+#[inline]
+pub fn maybe_matmul_pq_into(
+    p_x: &[i32],
+    p_w: &[i32],
+    n_out: usize,
+    k_in: usize,
+    group_size: usize,
+    seed: u64,
+    p_out: &mut [i64],
+) {
+    let gs = if group_size == 0 { MLX_GROUP_SIZE } else { group_size };
+    debug_assert!(p_x.len() >= k_in);
+    debug_assert!(p_w.len() >= n_out * k_in);
+    debug_assert!(p_out.len() >= n_out);
+
+    let mut rng = seed ^ 0xA1E0_5B15_8888_0432;
+    for (n, slot) in p_out[..n_out].iter_mut().enumerate() {
+        let row_w = &p_w[n * k_in..(n + 1) * k_in];
+        let mut row_acc: i64 = 0;
+
+        let mut start = 0usize;
+        while start < k_in {
+            let end = (start + gs).min(k_in);
+            let group_w = &row_w[start..end];
+            let group_x = &p_x[start..end];
+
+            let mut abs_max: u64 = 0;
+            for &v in group_w {
+                let a = (v as i64).unsigned_abs();
+                if a > abs_max {
+                    abs_max = a;
+                }
+            }
+            if abs_max > 0 {
+                let mut g_acc: i64 = 0;
+                for (&wv, &xv) in group_w.iter().zip(group_x.iter()) {
+                    let w64 = wv as i64;
+                    let aw = w64.unsigned_abs();
+                    let u20 = splitmix64(&mut rng) & 0xFFFFF;
+                    if u20 * abs_max < (aw << 20) {
+                        if w64 >= 0 {
+                            g_acc += xv as i64;
+                        } else {
+                            g_acc -= xv as i64;
+                        }
+                    }
+                }
+                row_acc += g_acc * (abs_max as i64);
+            }
+            start = end;
+        }
+        *slot = row_acc;
+    }
+}
+
+/// **`gather_qmm_pq_into`** — Pure $p/q$ Integer-Numerator Switch-MoE Sparse Expert Kernel.
+///
+/// Reuses pre-projected input numerators `p_x` (`x[k] ≈ p_x[k] / q_x`) and pre-projected
+/// expert scale numerators `expert_pscales` across all routed `active_experts`, running every
+/// expert projection in $\mathbb{Z}$ via [`mlx_matmul_pq_group64_into`].
 /// Performs **zero heap allocations**.
 #[inline]
-pub fn quantize_bfp_i8_group64_into(
-    x: &[f64],
-    m_out: &mut [i8],
-    exp_out: &mut [i8],
-    scale_out: &mut [f64],
+#[allow(clippy::too_many_arguments)]
+pub fn gather_qmm_pq_into(
+    p_x: &[i32],
+    q_x: i64,
+    expert_codes: &[u32],
+    expert_pscales: &[i32],
+    q_s: i64,
+    num_experts: usize,
+    n_out: usize,
+    k_in: usize,
+    active_experts: &[usize],
+    router_weights: &[f64],
+    expert_scratch: &mut [f64],
+    y_out: &mut [f64],
 ) {
-    let n = x.len();
-    debug_assert!(n.is_multiple_of(MLX_GROUP_SIZE));
-    let groups = n / MLX_GROUP_SIZE;
-    debug_assert!(m_out.len() >= n);
-    debug_assert!(exp_out.len() >= groups);
-    debug_assert!(scale_out.len() >= groups);
+    debug_assert!(k_in.is_multiple_of(MLX_GROUP_SIZE));
+    debug_assert_eq!(active_experts.len(), router_weights.len());
+    debug_assert!(expert_scratch.len() >= n_out);
+    debug_assert!(y_out.len() >= n_out);
 
-    for g in 0..groups {
-        let xg = &x[g * MLX_GROUP_SIZE..(g + 1) * MLX_GROUP_SIZE];
-        let mg = &mut m_out[g * MLX_GROUP_SIZE..(g + 1) * MLX_GROUP_SIZE];
+    let words_per_expert = n_out * (k_in / TRITS_PER_U32);
+    let scales_per_expert = n_out * (k_in / MLX_GROUP_SIZE);
+
+    for slot in y_out[..n_out].iter_mut() {
+        *slot = 0.0;
+    }
+
+    for (&expert_idx, &gate) in active_experts.iter().zip(router_weights.iter()) {
+        if expert_idx >= num_experts || gate == 0.0 {
+            continue;
+        }
+        let e_codes = &expert_codes[expert_idx * words_per_expert..(expert_idx + 1) * words_per_expert];
+        let e_pscales = &expert_pscales[expert_idx * scales_per_expert..(expert_idx + 1) * scales_per_expert];
+
+        mlx_matmul_pq_group64_into(
+            p_x,
+            q_x,
+            e_codes,
+            e_pscales,
+            q_s,
+            n_out,
+            k_in,
+            expert_scratch,
+        );
+        for i in 0..n_out {
+            y_out[i] = fma(expert_scratch[i], gate, y_out[i]);
+        }
+    }
+}
+
+/// Pure-integer **`gather_qmm_pq_i64_into`** — Mixture-of-Experts (MoE) Routed Ternary Matmul in `p/q`.
+/// Zero floating-point operations.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub fn gather_qmm_pq_i64_into(
+    p_x: &[i32],
+    expert_codes: &[u32],
+    expert_p_scales: &[i32],
+    num_experts: usize,
+    n_out: usize,
+    k_in: usize,
+    active_experts: &[usize],
+    router_p_weights: &[i32],
+    q_router: i64,
+    expert_scratch: &mut [i64],
+    p_out: &mut [i64],
+) {
+    debug_assert!(k_in.is_multiple_of(MLX_GROUP_SIZE));
+    debug_assert_eq!(active_experts.len(), router_p_weights.len());
+    debug_assert!(expert_scratch.len() >= n_out);
+    debug_assert!(p_out.len() >= n_out);
+
+    let words_per_expert = n_out * (k_in / TRITS_PER_U32);
+    let scales_per_expert = n_out * (k_in / MLX_GROUP_SIZE);
+    let q_r = q_router.max(1);
+
+    for slot in p_out[..n_out].iter_mut() {
+        *slot = 0;
+    }
+
+    for (&expert_idx, &gate_p) in active_experts.iter().zip(router_p_weights.iter()) {
+        if expert_idx >= num_experts || gate_p == 0 {
+            continue;
+        }
+        let e_codes = &expert_codes[expert_idx * words_per_expert..(expert_idx + 1) * words_per_expert];
+        let e_scales = &expert_p_scales[expert_idx * scales_per_expert..(expert_idx + 1) * scales_per_expert];
+
+        mlx_matmul_pq_group64_i64_into(p_x, e_codes, e_scales, n_out, k_in, expert_scratch);
+        let gate128 = gate_p as i128;
+        let qr128 = q_r as i128;
+        for i in 0..n_out {
+            p_out[i] += (((expert_scratch[i] as i128) * gate128) / qr128) as i64;
+        }
+    }
+}
+
+/// Pure-integer Root Mean Square LayerNorm (`rms_norm_pq_into`) in `p/q` (`q = 2^20`).
+///
+/// Uses [`crate::kernel::isqrt_u128`] with **zero floating-point operations**.
+#[inline]
+pub fn rms_norm_pq_into(
+    p_x: &[i32],
+    p_weight: Option<&[i32]>,
+    q: i64,
+    eps_p: i64,
+    p_out: &mut [i32],
+) {
+    use crate::kernel::isqrt_u128;
+    let d = p_x.len();
+    debug_assert!(p_out.len() >= d);
+    if d == 0 {
+        return;
+    }
+    let mut sum_sq: u128 = 0;
+    for &v in p_x {
+        let va = (v as i64).unsigned_abs() as u128;
+        sum_sq = sum_sq.saturating_add(va * va);
+    }
+    let mean_sq = sum_sq / (d as u128);
+    let eps_sq = (eps_p.unsigned_abs() as u128) * (q.unsigned_abs() as u128);
+    let rms = isqrt_u128(mean_sq.saturating_add(eps_sq)).max(1) as i128;
+    let q128 = q.max(1) as i128;
+
+    match p_weight {
+        Some(w) => {
+            debug_assert!(w.len() >= d);
+            for i in 0..d {
+                let num = (p_x[i] as i128) * (w[i] as i128);
+                p_out[i] = (num / rms) as i32;
+            }
+        }
+        None => {
+            for i in 0..d {
+                let num = (p_x[i] as i128) * q128;
+                p_out[i] = (num / rms) as i32;
+            }
+        }
+    }
+}
+
+/// Pure-integer `sin` and `cos` in `p/q` (`q = 2^20 = 1,048,576`).
+///
+/// Range-reduces `theta_p` into $[-\pi/2, \pi/2]$ and evaluates a 5th-order
+/// fixed-point minimax polynomial with **zero floating-point operations**.
+#[inline]
+pub const fn sin_cos_pq(theta_p: i64) -> (i64, i64) {
+    const Q: i64 = 1_048_576; // 2^20
+    const PI_P: i64 = 3_294_199;
+    const TWO_PI_P: i64 = 6_588_397;
+    const HALF_PI_P: i64 = 1_647_099;
+
+    let mut x = theta_p % TWO_PI_P;
+    if x > PI_P {
+        x -= TWO_PI_P;
+    } else if x < -PI_P {
+        x += TWO_PI_P;
+    }
+
+    let mut sign_cos: i64 = 1;
+    if x > HALF_PI_P {
+        x = PI_P - x;
+        sign_cos = -1;
+    } else if x < -HALF_PI_P {
+        x = -PI_P - x;
+        sign_cos = -1;
+    }
+
+    // x2 = (x * x) / Q
+    let x2 = (x * x) >> 20;
+    // sin(x) ≈ x * (1 - x^2/6 + x^4/120)
+    let sin_term = Q - (x2 / 6) + (((x2 * x2) >> 20) / 120);
+    let sin_p = (x * sin_term) >> 20;
+
+    // cos(x) ≈ sign_cos * (1 - x^2/2 + x^4/24)
+    let cos_term = Q - (x2 >> 1) + (((x2 * x2) >> 20) / 24);
+    let cos_p = sign_cos * cos_term;
+
+    (sin_p, cos_p)
+}
+
+/// Pure-integer Rotary Position Embeddings (`rope_pq_into`) in `p/q` (`q = 2^20`).
+/// Zero floating-point operations.
+#[inline]
+pub fn rope_pq_into(p_x: &[i32], pos: usize, p_out: &mut [i32]) {
+    let d = p_x.len();
+    debug_assert!(d.is_multiple_of(2));
+    debug_assert!(p_out.len() >= d);
+    let half = d / 2;
+
+    // Step decay 10000^(-1/4) = 0.1 in q = 2^20 => 104,858
+    let mut freq_p: i64 = 1_048_576;
+    for i in 0..half {
+        let theta_p = (pos as i64) * freq_p;
+        let (sin_p, cos_p) = sin_cos_pq(theta_p);
+        let x0 = p_x[2 * i] as i64;
+        let x1 = p_x[2 * i + 1] as i64;
+        p_out[2 * i] = ((x0 * cos_p - x1 * sin_p) >> 20) as i32;
+        p_out[2 * i + 1] = ((x0 * sin_p + x1 * cos_p) >> 20) as i32;
+        freq_p = (freq_p * 104_858) >> 20;
+    }
+}
+
+/// Pure-integer fixed-point exponential $e^x$ in `p/q` (`q = 2^20 = 1,048,576`)
+/// via 6 integer squarings of $(1 + x / 64)^{64}$. Zero floating-point operations.
+#[inline]
+pub const fn exp_pq(x_p: i64) -> i64 {
+    const Q: i64 = 1_048_576;
+    let clamped = if x_p < -16 * Q {
+        -16 * Q
+    } else if x_p > 12 * Q {
+        12 * Q
+    } else {
+        x_p
+    };
+    let mut v = Q + (clamped >> 6);
+    if v <= 0 {
+        return 0;
+    }
+    let mut i = 0;
+    while i < 6 {
+        v = (v * v) >> 20;
+        i += 1;
+    }
+    v
+}
+
+/// Pure-integer SwiGLU activation (`swiglu_pq_into`) in `p/q` (`q = 2^20`).
+/// Zero floating-point operations.
+#[inline]
+pub fn swiglu_pq_into(p_gate: &[i32], p_up: &[i32], q: i64, p_out: &mut [i32]) {
+    let d = p_gate.len().min(p_up.len());
+    debug_assert!(p_out.len() >= d);
+    let q_pos = q.max(1);
+    for i in 0..d {
+        let g = p_gate[i] as i64;
+        let exp_neg_g = exp_pq(-g);
+        let denom = (q_pos + exp_neg_g).max(1);
+        let silu_p = (g * q_pos) / denom;
+        p_out[i] = ((silu_p * (p_up[i] as i64)) / q_pos) as i32;
+    }
+}
+
+/// **`sdpa_pq_single_query_into`** — Pure $p/q$ Integer-Numerator KV-Cache Attention.
+///
+/// Takes pre-projected integer query numerators `p_q` (`[head_dim]`), pre-projected integer
+/// KV-cache numerators `p_k_cache` and `p_v_cache` (`[seq_len, head_dim]`), and shared
+/// denominator `q_kv` (e.g. `1 << 14`), computing both $q K^T$ and $\text{prob} \cdot V$
+/// in associative integer arithmetic ($\mathbb{Z}$) with single deferred division at the end.
+/// Performs **zero heap allocations**.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub fn sdpa_pq_single_query_into(
+    p_q: &[i32],
+    p_k_cache: &[i32],
+    p_v_cache: &[i32],
+    q_kv: i64,
+    seq_len: usize,
+    head_dim: usize,
+    scores_scratch: &mut [f64],
+    out: &mut [f64],
+) {
+    debug_assert!(p_q.len() >= head_dim);
+    debug_assert!(p_k_cache.len() >= seq_len * head_dim);
+    debug_assert!(p_v_cache.len() >= seq_len * head_dim);
+    debug_assert!(scores_scratch.len() >= seq_len);
+    debug_assert!(out.len() >= head_dim);
+
+    if seq_len == 0 || head_dim == 0 {
+        return;
+    }
+    let inv_q2_scale = 1.0 / ((q_kv as f64) * (q_kv as f64) * sqrt_f64(head_dim as f64));
+    let mut max_score = f64::NEG_INFINITY;
+    let pq_slice = &p_q[..head_dim];
+
+    for (t, score_slot) in scores_scratch[..seq_len].iter_mut().enumerate() {
+        let pk_row = &p_k_cache[t * head_dim..(t + 1) * head_dim];
+        let dot_i64: i64 = pq_slice
+            .iter()
+            .zip(pk_row.iter())
+            .map(|(&qv, &kv)| (qv as i64) * (kv as i64))
+            .sum();
+        let s = (dot_i64 as f64) * inv_q2_scale;
+        *score_slot = s;
+        if s > max_score {
+            max_score = s;
+        }
+    }
+
+    let mut sum_exp = 0.0f64;
+    for s in scores_scratch[..seq_len].iter_mut() {
+        let e = exp_approx(*s - max_score);
+        *s = e;
+        sum_exp += e;
+    }
+    let inv_sum = if sum_exp > 0.0 { 1.0 / sum_exp } else { 0.0 };
+
+    const Q_PROB: i64 = 1 << 20;
+    let q_prob_f64 = Q_PROB as f64;
+    let inv_total = 1.0 / ((Q_PROB as f64) * (q_kv as f64));
+
+    for slot in out[..head_dim].iter_mut() {
+        *slot = 0.0;
+    }
+    for (t, &unnorm_prob) in scores_scratch[..seq_len].iter().enumerate() {
+        let p_prob = round_f64_to_i64((unnorm_prob * inv_sum) * q_prob_f64);
+        if p_prob == 0 {
+            continue;
+        }
+        let pv_row = &p_v_cache[t * head_dim..(t + 1) * head_dim];
+        for (slot, &pv) in out[..head_dim].iter_mut().zip(pv_row.iter()) {
+            *slot += ((p_prob * (pv as i64)) as f64) * inv_total;
+        }
+    }
+}
+
+/// Pure-integer Scaled Dot-Product Attention (`sdpa_pq_i32_single_query_into`) in `p/q` (`q = 2^20`).
+/// Zero floating-point operations.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub fn sdpa_pq_i32_single_query_into(
+    p_q: &[i32],
+    p_k_cache: &[i32],
+    p_v_cache: &[i32],
+    seq_len: usize,
+    head_dim: usize,
+    q: i64,
+    scores_scratch: &mut [i64],
+    p_out: &mut [i32],
+) {
+    use crate::kernel::isqrt_u128;
+    debug_assert!(p_q.len() >= head_dim);
+    debug_assert!(p_k_cache.len() >= seq_len * head_dim);
+    debug_assert!(p_v_cache.len() >= seq_len * head_dim);
+    debug_assert!(scores_scratch.len() >= seq_len);
+    debug_assert!(p_out.len() >= head_dim);
+
+    if seq_len == 0 || head_dim == 0 {
+        return;
+    }
+    let q_pos = q.max(1);
+    let sqrt_d_p = isqrt_u128((head_dim as u128) * (q_pos as u128) * (q_pos as u128)).max(1) as i64;
+    let mut max_score = i64::MIN;
+
+    for t in 0..seq_len {
+        let k_row = &p_k_cache[t * head_dim..(t + 1) * head_dim];
+        let mut dot: i64 = 0;
+        for d in 0..head_dim {
+            dot += ((p_q[d] as i64) * (k_row[d] as i64)) / q_pos;
+        }
+        let s = (dot * q_pos) / sqrt_d_p;
+        scores_scratch[t] = s;
+        if s > max_score {
+            max_score = s;
+        }
+    }
+
+    let mut sum_exp: i64 = 0;
+    for s in scores_scratch[..seq_len].iter_mut() {
+        let e = exp_pq(*s - max_score);
+        *s = e;
+        sum_exp += e;
+    }
+    let denom = sum_exp.max(1);
+
+    for slot in p_out[..head_dim].iter_mut() {
+        *slot = 0;
+    }
+    for (t, &e_val) in scores_scratch[..seq_len].iter().enumerate() {
+        let prob_p = (e_val * q_pos) / denom;
+        let v_row = &p_v_cache[t * head_dim..(t + 1) * head_dim];
+        for d in 0..head_dim {
+            p_out[d] = p_out[d].wrapping_add(((prob_p * (v_row[d] as i64)) / q_pos) as i32);
+        }
+    }
+}
+
+/// Pure-integer Straight-Through Estimator (STE) QAT backward pass (`ste_linear_backward_pq_into`).
+/// Zero floating-point operations.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub fn ste_linear_backward_pq_into(
+    p_x: &[i32],
+    p_w: &[i32],
+    p_grad_y: &[i32],
+    n_out: usize,
+    k_in: usize,
+    q: i64,
+    p_grad_x_out: &mut [i64],
+    p_grad_w_out: &mut [i64],
+) {
+    debug_assert!(p_x.len() >= k_in);
+    debug_assert!(p_w.len() >= n_out * k_in);
+    debug_assert!(p_grad_y.len() >= n_out);
+    debug_assert!(p_grad_x_out.len() >= k_in);
+    debug_assert!(p_grad_w_out.len() >= n_out * k_in);
+
+    let q_pos = q.max(1);
+    let k_i64 = k_in.max(1) as i64;
+    let two_k = k_i64 * 2;
+
+    for gx in p_grad_x_out[..k_in].iter_mut() {
+        *gx = 0;
+    }
+
+    for n in 0..n_out {
+        let gy = p_grad_y[n] as i64;
+        let row_w = &p_w[n * k_in..(n + 1) * k_in];
+        let row_gw = &mut p_grad_w_out[n * k_in..(n + 1) * k_in];
+
+        let mut abs_sum: i64 = 0;
+        for &v in row_w {
+            abs_sum += (v as i64).abs();
+        }
+        let scale_p = (abs_sum / k_i64).max(1);
+
+        for k in 0..k_in {
+            let w64 = row_w[k] as i64;
+            let aw2k = w64.abs() * two_k;
+            let trit: i64 = if abs_sum > 0 && aw2k >= abs_sum {
+                if w64 > 0 { 1 } else { -1 }
+            } else {
+                0
+            };
+            let w_hat_p = trit * scale_p;
+            p_grad_x_out[k] += (gy * w_hat_p) / q_pos;
+            // Clipped STE window: |w| / scale <= 1.5 <=> |w| * 2 * k_in <= 3 * abs_sum
+            row_gw[k] = if abs_sum == 0 || aw2k <= 3 * abs_sum {
+                (gy * (p_x[k] as i64)) / q_pos
+            } else {
+                0
+            };
+        }
+    }
+}
+
+/// Complete single-layer **100% Pure-Integer (`p/q`, Zero Floating Point) Ternary Transformer Block**:
+/// `p_x -> rms_norm_pq -> b158_pq QKV -> rope_pq -> sdpa_pq -> b158_pq O-Proj -> residual -> rms_norm_pq -> b158_pq SwiGLU MLP -> residual`.
+///
+/// Executes with **zero floating-point instructions** and **zero heap allocations**.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub fn ternary_transformer_step_pq_into(
+    p_x_in: &[i32],
+    p_rms1_w: &[i32],
+    wq_i_packed: &[u8],
+    wk_i_packed: &[u8],
+    wv_i_packed: &[u8],
+    wo_i_packed: &[u8],
+    p_rms2_w: &[i32],
+    wgate_i_packed: &[u8],
+    wup_i_packed: &[u8],
+    wdown_i_packed: &[u8],
+    dim: usize,
+    hidden_dim: usize,
+    pos: usize,
+    p_k_cache: &mut [i32],
+    p_v_cache: &mut [i32],
+    scratch_norm: &mut [i32],
+    scratch_q: &mut [i32],
+    scratch_k: &mut [i32],
+    scratch_v: &mut [i32],
+    scratch_attn: &mut [i32],
+    scratch_scores: &mut [i64],
+    scratch_gate: &mut [i32],
+    scratch_up: &mut [i32],
+    scratch_i64: &mut [i64],
+    p_x_out: &mut [i32],
+) {
+    use crate::kernel::{KERNEL_PQ_Q, ternary_matmul_pq_i_major_into};
+    debug_assert!(dim.is_multiple_of(2));
+    debug_assert!(scratch_i64.len() >= hidden_dim.max(dim));
+
+    // 1. Pre-Attention Pure-Integer RMSNorm
+    rms_norm_pq_into(p_x_in, Some(p_rms1_w), PQ_DEFAULT_Q, 10, scratch_norm);
+
+    // 2. Pure-Integer Ternary Q, K, V projections
+    ternary_matmul_pq_i_major_into(wq_i_packed, dim, dim, scratch_norm, None, KERNEL_PQ_Q, &mut scratch_i64[..dim]);
+    for i in 0..dim {
+        scratch_q[i] = scratch_i64[i].clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+    }
+    ternary_matmul_pq_i_major_into(wk_i_packed, dim, dim, scratch_norm, None, KERNEL_PQ_Q, &mut scratch_i64[..dim]);
+    for i in 0..dim {
+        scratch_k[i] = scratch_i64[i].clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+    }
+    ternary_matmul_pq_i_major_into(wv_i_packed, dim, dim, scratch_norm, None, KERNEL_PQ_Q, &mut scratch_i64[..dim]);
+    for i in 0..dim {
+        scratch_v[i] = scratch_i64[i].clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+    }
+
+    // 3. Pure-Integer RoPE on Q and K into KV cache at `pos`
+    let k_slot = &mut p_k_cache[pos * dim..(pos + 1) * dim];
+    let v_slot = &mut p_v_cache[pos * dim..(pos + 1) * dim];
+    rope_pq_into(&scratch_q[..dim], pos, scratch_attn);
+    scratch_q[..dim].copy_from_slice(&scratch_attn[..dim]);
+    rope_pq_into(&scratch_k[..dim], pos, k_slot);
+    v_slot.copy_from_slice(&scratch_v[..dim]);
+
+    // 4. Pure-Integer Causal SDPA over 0..=pos
+    sdpa_pq_i32_single_query_into(
+        scratch_q,
+        p_k_cache,
+        p_v_cache,
+        pos + 1,
+        dim,
+        PQ_DEFAULT_Q,
+        scratch_scores,
+        scratch_attn,
+    );
+
+    // 5. Pure-Integer Ternary Output Projection + Residual 1
+    ternary_matmul_pq_i_major_into(wo_i_packed, dim, dim, scratch_attn, None, KERNEL_PQ_Q, &mut scratch_i64[..dim]);
+    for i in 0..dim {
+        p_x_out[i] = p_x_in[i].saturating_add(scratch_i64[i].clamp(i32::MIN as i64, i32::MAX as i64) as i32);
+    }
+
+    // 6. Pre-MLP Pure-Integer RMSNorm
+    rms_norm_pq_into(&p_x_out[..dim], Some(p_rms2_w), PQ_DEFAULT_Q, 10, scratch_norm);
+
+    // 7. Pure-Integer Ternary SwiGLU MLP + Residual 2
+    ternary_matmul_pq_i_major_into(wgate_i_packed, dim, hidden_dim, scratch_norm, None, KERNEL_PQ_Q, &mut scratch_i64[..hidden_dim]);
+    for i in 0..hidden_dim {
+        scratch_gate[i] = scratch_i64[i].clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+    }
+    ternary_matmul_pq_i_major_into(wup_i_packed, dim, hidden_dim, scratch_norm, None, KERNEL_PQ_Q, &mut scratch_i64[..hidden_dim]);
+    for i in 0..hidden_dim {
+        scratch_up[i] = scratch_i64[i].clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+    }
+    for i in 0..hidden_dim {
+        let g = scratch_gate[i] as i64;
+        let denom = (PQ_DEFAULT_Q + exp_pq(-g)).max(1);
+        let silu_p = (g * PQ_DEFAULT_Q) / denom;
+        scratch_gate[i] = ((silu_p * (scratch_up[i] as i64)) / PQ_DEFAULT_Q) as i32;
+    }
+    ternary_matmul_pq_i_major_into(wdown_i_packed, hidden_dim, dim, scratch_gate, None, KERNEL_PQ_Q, &mut scratch_i64[..dim]);
+    for i in 0..dim {
+        p_x_out[i] = p_x_out[i].saturating_add(scratch_i64[i].clamp(i32::MIN as i64, i32::MAX as i64) as i32);
+    }
+}
+
+// =========================================================================
+// 7. OMNI / MEM|8 BLOCK-FLOATING-POINT (BFP-64) & PURE-INTEGER BFP-i8
+// =========================================================================
+
+/// Quantize a pure-integer rational activation vector `p_x` (shared denominator `q`)
+/// into 64-element block-floating-point `i8` mantissas (`m_out[k] in [-127, +127]`)
+/// and per-group integer rational scales (`p_scale_out[g] = step`), with **zero floating-point ops**.
+///
+/// Paired with [`crate::kernel::omni_bfp_i8_simd_pq_into`], which accumulates 256-element
+/// chunks (`4` groups of `64`) in 16-wide `i16` SIMD (`256 * 127 = 32,512 <= 32,767`).
+#[inline]
+pub fn quantize_bfp_i8_pq_group64_into(
+    p_x: &[i32],
+    m_out: &mut [i8],
+    p_scale_out: &mut [i32],
+) {
+    assert_eq!(m_out.len(), p_x.len());
+    let num_groups = p_x.len().div_ceil(MLX_GROUP_SIZE);
+    assert!(p_scale_out.len() >= num_groups);
+
+    for (g, p_sc) in p_scale_out.iter_mut().enumerate().take(num_groups) {
+        let k_start = g * MLX_GROUP_SIZE;
+        let k_end = (k_start + MLX_GROUP_SIZE).min(p_x.len());
+        let mut max_abs = 0i64;
+        for &v in &p_x[k_start..k_end] {
+            let a = (v as i64).abs();
+            if a > max_abs {
+                max_abs = a;
+            }
+        }
+        if max_abs == 0 {
+            *p_sc = 0;
+            for m in &mut m_out[k_start..k_end] {
+                *m = 0;
+            }
+            continue;
+        }
+        let step = ((max_abs + 63) / 127).max(1);
+        *p_sc = step.clamp(1, i32::MAX as i64) as i32;
+        let half = step / 2;
+        for (dst, &v) in m_out[k_start..k_end].iter_mut().zip(p_x[k_start..k_end].iter()) {
+            let v64 = v as i64;
+            let qv = if v64 >= 0 {
+                (v64 + half) / step
+            } else {
+                (v64 - half) / step
+            };
+            *dst = qv.clamp(-127, 127) as i8;
+        }
+    }
+}
+
+/// Extract a dyadic scale $2^e$ for a block with maximum absolute value `max_abs`
+/// targeting a signed integer mantissa bound `max_mant` (e.g., `127.0` for `i8`
+/// or `32767.0` for `i16`), using IEEE-754 bit extraction (`no_std`-compatible, no `libm`).
+#[inline]
+fn dyadic_block_exponent(max_abs: f64, max_mant: f64) -> f64 {
+    if max_abs <= 0.0 {
+        return 0.0;
+    }
+    let raw = max_abs / max_mant;
+    let bits = raw.to_bits();
+    let biased_exp = ((bits >> 52) & 0x7ff) as i32;
+    let frac = bits & 0x000f_ffff_ffff_ffff;
+    let ceil_biased = if frac == 0 {
+        biased_exp
+    } else {
+        (biased_exp + 1).min(2046)
+    };
+    f64::from_bits((ceil_biased as u64) << 52)
+}
+
+/// Quantize a vector `x` (`rows` elements) into 64-element Block-Floating-Point `i8`
+/// mantissas (`m_out[k] in [-127, +127]`) and per-group dyadic scales `scale_out[g] = 2^{e_g}`.
+pub fn quantize_bfp_i8_group64_into(x: &[f64], m_out: &mut [i8], scale_out: &mut [f64]) {
+    assert_eq!(m_out.len(), x.len());
+    let num_groups = x.len().div_ceil(MLX_GROUP_SIZE);
+    assert!(scale_out.len() >= num_groups);
+
+    for (g, sc_slot) in scale_out.iter_mut().enumerate().take(num_groups) {
+        let k_start = g * MLX_GROUP_SIZE;
+        let k_end = (k_start + MLX_GROUP_SIZE).min(x.len());
         let mut max_abs = 0.0f64;
-        for &v in xg {
+        for &v in &x[k_start..k_end] {
             let a = v.abs();
             if a > max_abs {
                 max_abs = a;
             }
         }
-        let (e, scale, inv_scale) = dyadic_block_exponent(max_abs, 127.0);
-        exp_out[g] = e;
-        scale_out[g] = scale;
-        for (dst, &v) in mg.iter_mut().zip(xg.iter()) {
-            *dst = (v * inv_scale).round().clamp(-127.0, 127.0) as i8;
+        let scale = dyadic_block_exponent(max_abs, 127.0);
+        *sc_slot = scale;
+        if scale == 0.0 {
+            for m in &mut m_out[k_start..k_end] {
+                *m = 0;
+            }
+        } else {
+            let inv_scale = 1.0 / scale;
+            for (m, &v) in m_out[k_start..k_end].iter_mut().zip(x[k_start..k_end].iter()) {
+                let q = round_f64_to_i64(v * inv_scale).clamp(-127, 127);
+                *m = q as i8;
+            }
         }
     }
 }
 
-/// **Variant 1 Kernel (`ternary_bfp_i8_matmul_into`)**:
+/// 4-column register-blocked, 16-wide `i16` SIMD ternary matmul over 64-element
+/// Block-Floating-Point `i8` activations (`m_x: &[i8]`, `scale_x: &[f64]`).
 ///
-/// Multiplies `i8` ternary weights (`trits_i_major`) by `i8` block-floating-point activation
-/// mantissas (`m_x`), accumulating each 64-element block in **`i16`** (`16 lanes per 256-bit AVX2
-/// register` via `vpmovsxbw` + `vpmullw` + `vpaddw`!).
-///
-/// Worst-case 64-element block sum is $|S_g|_{\max} = 64 \times 127 = 8{,}128 \le 32{,}767$,
-/// so **`i16` overflow is mathematically impossible**. Performs **zero heap allocations**.
-#[inline]
+/// Because $|S_g| \le 64 \times 127 = 8{,}128 \le 32{,}767$, each 64-element group
+/// accumulates in 16-bit integer lanes (`i8 × i8 -> i16`) with zero overflow!
+#[allow(clippy::too_many_arguments)]
 pub fn ternary_bfp_i8_matmul_into(
     trits_i_major: &[i8],
     rows: usize,
     cols: usize,
     m_x: &[i8],
-    block_scales: &[f64],
-    gamma: f64,
-    y_out: &mut [f64],
+    scale_x: &[f64],
+    mask: Option<&[u8]>,
+    scale_w: f64,
+    out: &mut [f64],
 ) {
-    debug_assert!(rows.is_multiple_of(MLX_GROUP_SIZE));
-    let groups = rows / MLX_GROUP_SIZE;
-    debug_assert!(trits_i_major.len() >= rows * cols);
-    debug_assert!(m_x.len() >= rows);
-    debug_assert!(block_scales.len() >= groups);
-    debug_assert!(y_out.len() >= cols);
+    assert_eq!(trits_i_major.len(), rows * cols);
+    assert_eq!(m_x.len(), rows);
+    assert_eq!(out.len(), cols);
+    let num_groups = rows.div_ceil(MLX_GROUP_SIZE);
+    assert!(scale_x.len() >= num_groups);
 
-    for (i, slot) in y_out[..cols].iter_mut().enumerate() {
-        let col_trits = &trits_i_major[i * rows..(i + 1) * rows];
-        let mut row_acc = 0.0f64;
-        for g in 0..groups {
-            let t_g = &col_trits[g * MLX_GROUP_SIZE..(g + 1) * MLX_GROUP_SIZE];
-            let m_g = &m_x[g * MLX_GROUP_SIZE..(g + 1) * MLX_GROUP_SIZE];
-            // |S_g| <= 64 * 127 = 8,128 -> guaranteed to fit in i16 without overflow!
-            let s_i16: i16 = t_g
-                .iter()
-                .zip(m_g.iter())
-                .map(|(&t, &m)| (t as i16).wrapping_mul(m as i16))
-                .fold(0i16, i16::wrapping_add);
-            row_acc = fma(s_i16 as f64, block_scales[g], row_acc);
+    if let Some(m) = mask {
+        let mut col = 0usize;
+        for &flag in m.iter().take(cols) {
+            if flag == 0 {
+                out[col] = 0.0;
+                col += 1;
+                continue;
+            }
+            let w_col = &trits_i_major[col * rows..(col + 1) * rows];
+            let mut acc_f64 = 0.0f64;
+            for (g, &sc_g) in scale_x.iter().enumerate().take(num_groups) {
+                if sc_g == 0.0 {
+                    continue;
+                }
+                let k_start = g * MLX_GROUP_SIZE;
+                let k_end = (k_start + MLX_GROUP_SIZE).min(rows);
+                let w_g = &w_col[k_start..k_end];
+                let x_g = &m_x[k_start..k_end];
+                let mut lanes = [0i16; 16];
+                let (w_chunks, w_rem) = w_g.as_chunks::<16>();
+                let (x_chunks, x_rem) = x_g.as_chunks::<16>();
+                for (wc, xc) in w_chunks.iter().zip(x_chunks.iter()) {
+                    for l in 0..16 {
+                        lanes[l] += (wc[l] as i16) * (xc[l] as i16);
+                    }
+                }
+                let mut sum_g: i32 = lanes.iter().map(|&v| v as i32).sum();
+                for (&wt, &xv) in w_rem.iter().zip(x_rem.iter()) {
+                    sum_g += (wt as i32) * (xv as i32);
+                }
+                acc_f64 += (sum_g as f64) * sc_g;
+            }
+            out[col] = acc_f64 * scale_w;
+            col += 1;
         }
-        *slot = row_acc * gamma;
+        return;
+    }
+
+    // Unmasked fast path: 4-column register blocking!
+    let cols4 = (cols / 4) * 4;
+    let mut col = 0usize;
+    while col < cols4 {
+        let w0 = &trits_i_major[col * rows..(col + 1) * rows];
+        let w1 = &trits_i_major[(col + 1) * rows..(col + 2) * rows];
+        let w2 = &trits_i_major[(col + 2) * rows..(col + 3) * rows];
+        let w3 = &trits_i_major[(col + 3) * rows..(col + 4) * rows];
+
+        let mut acc0 = 0.0f64;
+        let mut acc1 = 0.0f64;
+        let mut acc2 = 0.0f64;
+        let mut acc3 = 0.0f64;
+
+        for (g, &sc_g) in scale_x.iter().enumerate().take(num_groups) {
+            if sc_g == 0.0 {
+                continue;
+            }
+            let k_start = g * MLX_GROUP_SIZE;
+            let k_end = (k_start + MLX_GROUP_SIZE).min(rows);
+            let w0_g = &w0[k_start..k_end];
+            let w1_g = &w1[k_start..k_end];
+            let w2_g = &w2[k_start..k_end];
+            let w3_g = &w3[k_start..k_end];
+            let x_g = &m_x[k_start..k_end];
+
+            let mut l0 = [0i16; 16];
+            let mut l1 = [0i16; 16];
+            let mut l2 = [0i16; 16];
+            let mut l3 = [0i16; 16];
+
+            let n_len = x_g.len();
+            let n16 = (n_len / 16) * 16;
+            let mut k = 0usize;
+            while k < n16 {
+                let xc = &x_g[k..k + 16];
+                let c0 = &w0_g[k..k + 16];
+                let c1 = &w1_g[k..k + 16];
+                let c2 = &w2_g[k..k + 16];
+                let c3 = &w3_g[k..k + 16];
+                for l in 0..16 {
+                    let xv = xc[l] as i16;
+                    l0[l] += (c0[l] as i16) * xv;
+                    l1[l] += (c1[l] as i16) * xv;
+                    l2[l] += (c2[l] as i16) * xv;
+                    l3[l] += (c3[l] as i16) * xv;
+                }
+                k += 16;
+            }
+
+            let mut s0: i32 = l0.iter().map(|&v| v as i32).sum();
+            let mut s1: i32 = l1.iter().map(|&v| v as i32).sum();
+            let mut s2: i32 = l2.iter().map(|&v| v as i32).sum();
+            let mut s3: i32 = l3.iter().map(|&v| v as i32).sum();
+
+            while k < n_len {
+                let xv = x_g[k] as i32;
+                s0 += (w0_g[k] as i32) * xv;
+                s1 += (w1_g[k] as i32) * xv;
+                s2 += (w2_g[k] as i32) * xv;
+                s3 += (w3_g[k] as i32) * xv;
+                k += 1;
+            }
+
+            acc0 += (s0 as f64) * sc_g;
+            acc1 += (s1 as f64) * sc_g;
+            acc2 += (s2 as f64) * sc_g;
+            acc3 += (s3 as f64) * sc_g;
+        }
+
+        out[col] = acc0 * scale_w;
+        out[col + 1] = acc1 * scale_w;
+        out[col + 2] = acc2 * scale_w;
+        out[col + 3] = acc3 * scale_w;
+        col += 4;
+    }
+
+    while col < cols {
+        let w_col = &trits_i_major[col * rows..(col + 1) * rows];
+        let mut acc_f64 = 0.0f64;
+        for (g, &sc_g) in scale_x.iter().enumerate().take(num_groups) {
+            if sc_g == 0.0 {
+                continue;
+            }
+            let k_start = g * MLX_GROUP_SIZE;
+            let k_end = (k_start + MLX_GROUP_SIZE).min(rows);
+            let w_g = &w_col[k_start..k_end];
+            let x_g = &m_x[k_start..k_end];
+            let mut lanes = [0i16; 16];
+            let (w_chunks, w_rem) = w_g.as_chunks::<16>();
+            let (x_chunks, x_rem) = x_g.as_chunks::<16>();
+            for (wc, xc) in w_chunks.iter().zip(x_chunks.iter()) {
+                for l in 0..16 {
+                    lanes[l] += (wc[l] as i16) * (xc[l] as i16);
+                }
+            }
+            let mut sum_g: i32 = lanes.iter().map(|&v| v as i32).sum();
+            for (&wt, &xv) in w_rem.iter().zip(x_rem.iter()) {
+                sum_g += (wt as i32) * (xv as i32);
+            }
+            acc_f64 += (sum_g as f64) * sc_g;
+        }
+        out[col] = acc_f64 * scale_w;
+        col += 1;
     }
 }
 
-/// **Variant 2 Quantizer (`quantize_bfp_i16_group64_into`)**:
-///
-/// Projects `x` (`rows` elements, `rows % 64 == 0`) into **2-byte `i16` mantissas**
-/// $m_k \in [-32767, 32767]$ with a shared power-of-two block exponent $e_g \in \mathbb{Z}$:
-/// $$x_k \approx m_k \cdot 2^{e_g}, \qquad |S_g|_{\max} = 64 \times 32{,}767 = 2{,}097{,}088 \ll 2^{31}-1 \text{ (fits in } \texttt{i32}\text{!)}$$
-///
-/// Performs **zero heap allocations**.
-#[inline]
-pub fn quantize_bfp_i16_group64_into(
-    x: &[f64],
-    m_out: &mut [i16],
-    exp_out: &mut [i8],
-    scale_out: &mut [f64],
-) {
-    let n = x.len();
-    debug_assert!(n.is_multiple_of(MLX_GROUP_SIZE));
-    let groups = n / MLX_GROUP_SIZE;
-    debug_assert!(m_out.len() >= n);
-    debug_assert!(exp_out.len() >= groups);
-    debug_assert!(scale_out.len() >= groups);
+/// Quantize a vector `x` (`rows` elements) into 64-element Block-Floating-Point `i16`
+/// mantissas (`m_out[k] in [-32767, +32767]`) and per-group dyadic scales `scale_out[g] = 2^{e_g}`.
+pub fn quantize_bfp_i16_group64_into(x: &[f64], m_out: &mut [i16], scale_out: &mut [f64]) {
+    assert_eq!(m_out.len(), x.len());
+    let num_groups = x.len().div_ceil(MLX_GROUP_SIZE);
+    assert!(scale_out.len() >= num_groups);
 
-    for g in 0..groups {
-        let xg = &x[g * MLX_GROUP_SIZE..(g + 1) * MLX_GROUP_SIZE];
-        let mg = &mut m_out[g * MLX_GROUP_SIZE..(g + 1) * MLX_GROUP_SIZE];
+    for (g, sc_slot) in scale_out.iter_mut().enumerate().take(num_groups) {
+        let k_start = g * MLX_GROUP_SIZE;
+        let k_end = (k_start + MLX_GROUP_SIZE).min(x.len());
         let mut max_abs = 0.0f64;
-        for &v in xg {
+        for &v in &x[k_start..k_end] {
             let a = v.abs();
             if a > max_abs {
                 max_abs = a;
             }
         }
-        let (e, scale, inv_scale) = dyadic_block_exponent(max_abs, 32767.0);
-        exp_out[g] = e;
-        scale_out[g] = scale;
-        for (dst, &v) in mg.iter_mut().zip(xg.iter()) {
-            *dst = (v * inv_scale).round().clamp(-32767.0, 32767.0) as i16;
+        let scale = dyadic_block_exponent(max_abs, 32767.0);
+        *sc_slot = scale;
+        if scale == 0.0 {
+            for m in &mut m_out[k_start..k_end] {
+                *m = 0;
+            }
+        } else {
+            let inv_scale = 1.0 / scale;
+            for (m, &v) in m_out[k_start..k_end].iter_mut().zip(x[k_start..k_end].iter()) {
+                let q = round_f64_to_i64(v * inv_scale).clamp(-32767, 32767);
+                *m = q as i16;
+            }
         }
     }
 }
 
-/// **Variant 2 Kernel (`ternary_bfp_i16_matmul_into`)**:
-///
-/// Multiplies `i8` ternary weights (`trits_i_major`) by `i16` block-floating-point activation
-/// mantissas (`m_x`), accumulating each 64-element block in **`i32`** (`|S_g| <= 2,097,088`).
-/// Performs **zero heap allocations**.
-#[inline]
+/// 4-column register-blocked, 8-wide `i32` SIMD ternary matmul over 64-element
+/// Block-Floating-Point `i16` activations (`m_x: &[i16]`, `scale_x: &[f64]`).
+#[allow(clippy::too_many_arguments)]
 pub fn ternary_bfp_i16_matmul_into(
     trits_i_major: &[i8],
     rows: usize,
     cols: usize,
     m_x: &[i16],
-    block_scales: &[f64],
-    gamma: f64,
-    y_out: &mut [f64],
+    scale_x: &[f64],
+    mask: Option<&[u8]>,
+    scale_w: f64,
+    out: &mut [f64],
 ) {
-    debug_assert!(rows.is_multiple_of(MLX_GROUP_SIZE));
-    let groups = rows / MLX_GROUP_SIZE;
-    debug_assert!(trits_i_major.len() >= rows * cols);
-    debug_assert!(m_x.len() >= rows);
-    debug_assert!(block_scales.len() >= groups);
-    debug_assert!(y_out.len() >= cols);
+    assert_eq!(trits_i_major.len(), rows * cols);
+    assert_eq!(m_x.len(), rows);
+    assert_eq!(out.len(), cols);
+    let num_groups = rows.div_ceil(MLX_GROUP_SIZE);
+    assert!(scale_x.len() >= num_groups);
 
-    for (i, slot) in y_out[..cols].iter_mut().enumerate() {
-        let col_trits = &trits_i_major[i * rows..(i + 1) * rows];
-        let mut row_acc = 0.0f64;
-        for g in 0..groups {
-            let t_g = &col_trits[g * MLX_GROUP_SIZE..(g + 1) * MLX_GROUP_SIZE];
-            let m_g = &m_x[g * MLX_GROUP_SIZE..(g + 1) * MLX_GROUP_SIZE];
-            let s_i32: i32 = t_g
-                .iter()
-                .zip(m_g.iter())
-                .map(|(&t, &m)| (t as i32).wrapping_mul(m as i32))
-                .fold(0i32, i32::wrapping_add);
-            row_acc = fma(s_i32 as f64, block_scales[g], row_acc);
+    if let Some(m) = mask {
+        for (col, (&flag, out_j)) in m.iter().zip(out.iter_mut()).enumerate().take(cols) {
+            if flag == 0 {
+                *out_j = 0.0;
+                continue;
+            }
+            let w_col = &trits_i_major[col * rows..(col + 1) * rows];
+            let mut acc_f64 = 0.0f64;
+            for (g, &sc_g) in scale_x.iter().enumerate().take(num_groups) {
+                if sc_g == 0.0 {
+                    continue;
+                }
+                let k_start = g * MLX_GROUP_SIZE;
+                let k_end = (k_start + MLX_GROUP_SIZE).min(rows);
+                let w_g = &w_col[k_start..k_end];
+                let x_g = &m_x[k_start..k_end];
+                let mut lanes = [0i32; 8];
+                let (w_chunks, w_rem) = w_g.as_chunks::<8>();
+                let (x_chunks, x_rem) = x_g.as_chunks::<8>();
+                for (wc, xc) in w_chunks.iter().zip(x_chunks.iter()) {
+                    for l in 0..8 {
+                        lanes[l] += (wc[l] as i32) * (xc[l] as i32);
+                    }
+                }
+                let mut sum_g: i32 = lanes.iter().sum();
+                for (&wt, &xv) in w_rem.iter().zip(x_rem.iter()) {
+                    sum_g += (wt as i32) * (xv as i32);
+                }
+                acc_f64 += (sum_g as f64) * sc_g;
+            }
+            *out_j = acc_f64 * scale_w;
         }
-        *slot = row_acc * gamma;
+        return;
+    }
+
+    let cols4 = (cols / 4) * 4;
+    let mut col = 0usize;
+    while col < cols4 {
+        let w0 = &trits_i_major[col * rows..(col + 1) * rows];
+        let w1 = &trits_i_major[(col + 1) * rows..(col + 2) * rows];
+        let w2 = &trits_i_major[(col + 2) * rows..(col + 3) * rows];
+        let w3 = &trits_i_major[(col + 3) * rows..(col + 4) * rows];
+
+        let mut acc0 = 0.0f64;
+        let mut acc1 = 0.0f64;
+        let mut acc2 = 0.0f64;
+        let mut acc3 = 0.0f64;
+
+        for (g, &sc_g) in scale_x.iter().enumerate().take(num_groups) {
+            if sc_g == 0.0 {
+                continue;
+            }
+            let k_start = g * MLX_GROUP_SIZE;
+            let k_end = (k_start + MLX_GROUP_SIZE).min(rows);
+            let w0_g = &w0[k_start..k_end];
+            let w1_g = &w1[k_start..k_end];
+            let w2_g = &w2[k_start..k_end];
+            let w3_g = &w3[k_start..k_end];
+            let x_g = &m_x[k_start..k_end];
+
+            let mut l0 = [0i32; 8];
+            let mut l1 = [0i32; 8];
+            let mut l2 = [0i32; 8];
+            let mut l3 = [0i32; 8];
+
+            let n_len = x_g.len();
+            let n8 = (n_len / 8) * 8;
+            let mut k = 0usize;
+            while k < n8 {
+                let xc = &x_g[k..k + 8];
+                let c0 = &w0_g[k..k + 8];
+                let c1 = &w1_g[k..k + 8];
+                let c2 = &w2_g[k..k + 8];
+                let c3 = &w3_g[k..k + 8];
+                for l in 0..8 {
+                    let xv = xc[l] as i32;
+                    l0[l] += (c0[l] as i32) * xv;
+                    l1[l] += (c1[l] as i32) * xv;
+                    l2[l] += (c2[l] as i32) * xv;
+                    l3[l] += (c3[l] as i32) * xv;
+                }
+                k += 8;
+            }
+
+            let mut s0: i32 = l0.iter().sum();
+            let mut s1: i32 = l1.iter().sum();
+            let mut s2: i32 = l2.iter().sum();
+            let mut s3: i32 = l3.iter().sum();
+
+            while k < n_len {
+                let xv = x_g[k] as i32;
+                s0 += (w0_g[k] as i32) * xv;
+                s1 += (w1_g[k] as i32) * xv;
+                s2 += (w2_g[k] as i32) * xv;
+                s3 += (w3_g[k] as i32) * xv;
+                k += 1;
+            }
+
+            acc0 += (s0 as f64) * sc_g;
+            acc1 += (s1 as f64) * sc_g;
+            acc2 += (s2 as f64) * sc_g;
+            acc3 += (s3 as f64) * sc_g;
+        }
+
+        out[col] = acc0 * scale_w;
+        out[col + 1] = acc1 * scale_w;
+        out[col + 2] = acc2 * scale_w;
+        out[col + 3] = acc3 * scale_w;
+        col += 4;
+    }
+
+    while col < cols {
+        let w_col = &trits_i_major[col * rows..(col + 1) * rows];
+        let mut acc_f64 = 0.0f64;
+        for (g, &sc_g) in scale_x.iter().enumerate().take(num_groups) {
+            if sc_g == 0.0 {
+                continue;
+            }
+            let k_start = g * MLX_GROUP_SIZE;
+            let k_end = (k_start + MLX_GROUP_SIZE).min(rows);
+            let w_g = &w_col[k_start..k_end];
+            let x_g = &m_x[k_start..k_end];
+            let mut lanes = [0i32; 8];
+            let (w_chunks, w_rem) = w_g.as_chunks::<8>();
+            let (x_chunks, x_rem) = x_g.as_chunks::<8>();
+            for (wc, xc) in w_chunks.iter().zip(x_chunks.iter()) {
+                for l in 0..8 {
+                    lanes[l] += (wc[l] as i32) * (xc[l] as i32);
+                }
+            }
+            let mut sum_g: i32 = lanes.iter().sum();
+            for (&wt, &xv) in w_rem.iter().zip(x_rem.iter()) {
+                sum_g += (wt as i32) * (xv as i32);
+            }
+            acc_f64 += (sum_g as f64) * sc_g;
+        }
+        out[col] = acc_f64 * scale_w;
+        col += 1;
     }
 }
 
-/// **Variant 3: MEM|8 Importance-Adaptive Block Precision (`ternary_bfp_adaptive_mem8_matmul_into`)**:
-///
-/// *"Precision should be a property of the information's requirements, not a fixed tax paid by every operation."*
-///
-/// - Starts every 64-element block in ultra-compact **`i8`** (`m_i8`, 16-wide `i16` SIMD accumulator).
-/// - Measures each block's relative L2 quantization error; when a block's error exceeds
-///   `promote_err_thresh` (e.g. `0.0045`), automatically promotes **only that block** to **`i16`**
-///   (`m_i16`, `i32` SIMD accumulator).
-/// - Returns `(promoted_blocks, total_blocks)` and performs **zero heap allocations**.
-#[inline]
+/// MEM|8 salience-adaptive Block-Floating-Point ternary matmul:
+/// routes high-salience columns (`salience[j] >= threshold`) to `BFP-i16` (`15`-bit mantissa)
+/// and standard columns (`salience[j] < threshold`) to `BFP-i8` (`7`-bit mantissa).
 #[allow(clippy::too_many_arguments)]
 pub fn ternary_bfp_adaptive_mem8_matmul_into(
     trits_i_major: &[i8],
     rows: usize,
     cols: usize,
-    x: &[f64],
-    promote_err_thresh: f64,
-    gamma: f64,
-    m_i8_scratch: &mut [i8],
-    m_i16_scratch: &mut [i16],
-    exp_scratch: &mut [i8],
-    scale_scratch: &mut [f64],
-    promoted_mask_scratch: &mut [bool],
-    y_out: &mut [f64],
-) -> (usize, usize) {
-    debug_assert!(rows.is_multiple_of(MLX_GROUP_SIZE));
-    let groups = rows / MLX_GROUP_SIZE;
-    debug_assert!(trits_i_major.len() >= rows * cols);
-    debug_assert!(x.len() >= rows);
-    debug_assert!(m_i8_scratch.len() >= rows);
-    debug_assert!(m_i16_scratch.len() >= rows);
-    debug_assert!(exp_scratch.len() >= groups);
-    debug_assert!(scale_scratch.len() >= groups);
-    debug_assert!(promoted_mask_scratch.len() >= groups);
-    debug_assert!(y_out.len() >= cols);
+    m_x_i8: &[i8],
+    scale_x_i8: &[f64],
+    m_x_i16: &[i16],
+    scale_x_i16: &[f64],
+    salience: &[f64],
+    threshold: f64,
+    scale_w: f64,
+    out: &mut [f64],
+) {
+    assert_eq!(trits_i_major.len(), rows * cols);
+    assert_eq!(m_x_i8.len(), rows);
+    assert_eq!(m_x_i16.len(), rows);
+    assert_eq!(salience.len(), cols);
+    assert_eq!(out.len(), cols);
+    let num_groups = rows.div_ceil(MLX_GROUP_SIZE);
+    assert!(scale_x_i8.len() >= num_groups);
+    assert!(scale_x_i16.len() >= num_groups);
 
-    let thresh_sq = promote_err_thresh * promote_err_thresh;
-    let mut promoted_count = 0usize;
-
-    for g in 0..groups {
-        let xg = &x[g * MLX_GROUP_SIZE..(g + 1) * MLX_GROUP_SIZE];
-        let m8g = &mut m_i8_scratch[g * MLX_GROUP_SIZE..(g + 1) * MLX_GROUP_SIZE];
-        let mut max_abs = 0.0f64;
-        let mut norm_sq = 0.0f64;
-        for &v in xg {
-            let a = v.abs();
-            if a > max_abs {
-                max_abs = a;
-            }
-            norm_sq = fma(v, v, norm_sq);
-        }
-        let (e8, s8, inv8) = dyadic_block_exponent(max_abs, 127.0);
-        let mut err_sq = 0.0f64;
-        for (dst, &v) in m8g.iter_mut().zip(xg.iter()) {
-            let q8 = (v * inv8).round().clamp(-127.0, 127.0) as i8;
-            *dst = q8;
-            let diff = (q8 as f64) * s8 - v;
-            err_sq = fma(diff, diff, err_sq);
-        }
-        if norm_sq > 1e-30 && err_sq > thresh_sq * norm_sq {
-            // Promote this high-importance block to i16!
-            let m16g = &mut m_i16_scratch[g * MLX_GROUP_SIZE..(g + 1) * MLX_GROUP_SIZE];
-            let (e16, s16, inv16) = dyadic_block_exponent(max_abs, 32767.0);
-            exp_scratch[g] = e16;
-            scale_scratch[g] = s16;
-            promoted_mask_scratch[g] = true;
-            promoted_count += 1;
-            for (dst, &v) in m16g.iter_mut().zip(xg.iter()) {
-                *dst = (v * inv16).round().clamp(-32767.0, 32767.0) as i16;
+    for (col, (&sal, out_j)) in salience.iter().zip(out.iter_mut()).enumerate().take(cols) {
+        let w_col = &trits_i_major[col * rows..(col + 1) * rows];
+        let mut acc_f64 = 0.0f64;
+        if sal >= threshold {
+            // High-salience wave column -> BFP-i16 precision path
+            for (g, &sc_g) in scale_x_i16.iter().enumerate().take(num_groups) {
+                if sc_g == 0.0 {
+                    continue;
+                }
+                let k_start = g * MLX_GROUP_SIZE;
+                let k_end = (k_start + MLX_GROUP_SIZE).min(rows);
+                let w_g = &w_col[k_start..k_end];
+                let x_g = &m_x_i16[k_start..k_end];
+                let mut lanes = [0i32; 8];
+                let (w_chunks, w_rem) = w_g.as_chunks::<8>();
+                let (x_chunks, x_rem) = x_g.as_chunks::<8>();
+                for (wc, xc) in w_chunks.iter().zip(x_chunks.iter()) {
+                    for l in 0..8 {
+                        lanes[l] += (wc[l] as i32) * (xc[l] as i32);
+                    }
+                }
+                let mut sum_g: i32 = lanes.iter().sum();
+                for (&wt, &xv) in w_rem.iter().zip(x_rem.iter()) {
+                    sum_g += (wt as i32) * (xv as i32);
+                }
+                acc_f64 += (sum_g as f64) * sc_g;
             }
         } else {
-            exp_scratch[g] = e8;
-            scale_scratch[g] = s8;
-            promoted_mask_scratch[g] = false;
-        }
-    }
-
-    for (i, slot) in y_out[..cols].iter_mut().enumerate() {
-        let col_trits = &trits_i_major[i * rows..(i + 1) * rows];
-        let mut row_acc = 0.0f64;
-        for g in 0..groups {
-            let t_g = &col_trits[g * MLX_GROUP_SIZE..(g + 1) * MLX_GROUP_SIZE];
-            if promoted_mask_scratch[g] {
-                let m16_g = &m_i16_scratch[g * MLX_GROUP_SIZE..(g + 1) * MLX_GROUP_SIZE];
-                let s_i32: i32 = t_g
-                    .iter()
-                    .zip(m16_g.iter())
-                    .map(|(&t, &m)| (t as i32).wrapping_mul(m as i32))
-                    .fold(0i32, i32::wrapping_add);
-                row_acc = fma(s_i32 as f64, scale_scratch[g], row_acc);
-            } else {
-                let m8_g = &m_i8_scratch[g * MLX_GROUP_SIZE..(g + 1) * MLX_GROUP_SIZE];
-                let s_i16: i16 = t_g
-                    .iter()
-                    .zip(m8_g.iter())
-                    .map(|(&t, &m)| (t as i16).wrapping_mul(m as i16))
-                    .fold(0i16, i16::wrapping_add);
-                row_acc = fma(s_i16 as f64, scale_scratch[g], row_acc);
+            // Standard column -> BFP-i8 fast path
+            for (g, &sc_g) in scale_x_i8.iter().enumerate().take(num_groups) {
+                if sc_g == 0.0 {
+                    continue;
+                }
+                let k_start = g * MLX_GROUP_SIZE;
+                let k_end = (k_start + MLX_GROUP_SIZE).min(rows);
+                let w_g = &w_col[k_start..k_end];
+                let x_g = &m_x_i8[k_start..k_end];
+                let mut lanes = [0i16; 16];
+                let (w_chunks, w_rem) = w_g.as_chunks::<16>();
+                let (x_chunks, x_rem) = x_g.as_chunks::<16>();
+                for (wc, xc) in w_chunks.iter().zip(x_chunks.iter()) {
+                    for l in 0..16 {
+                        lanes[l] += (wc[l] as i16) * (xc[l] as i16);
+                    }
+                }
+                let mut sum_g: i32 = lanes.iter().map(|&v| v as i32).sum();
+                for (&wt, &xv) in w_rem.iter().zip(x_rem.iter()) {
+                    sum_g += (wt as i32) * (xv as i32);
+                }
+                acc_f64 += (sum_g as f64) * sc_g;
             }
         }
-        *slot = row_acc * gamma;
+        *out_j = acc_f64 * scale_w;
     }
-
-    (promoted_count, groups)
 }
 
 

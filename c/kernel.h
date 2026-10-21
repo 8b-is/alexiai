@@ -18,7 +18,7 @@ extern "C" {
 #endif
 
 #define GMQ_TRITS_PER_BYTE 5
-#define GMQ_PQ_DEFAULT_Q (1048576LL) /* 2^20: "Counting Divided" dyadic denominator */
+#define GMQ_PQ_DEFAULT_Q 1048576
 
 /* Pack trits into a caller-owned, zero-initialized byte buffer. */
 void gmq_pack_ternary(const int8_t *trits, size_t n, uint8_t *out);
@@ -29,23 +29,47 @@ void gmq_unpack_ternary(const uint8_t *bytes, size_t count, int8_t *out);
 /* sum_j (pos[j] - neg[j]) * x[j] — the primitive the kernels are built on. */
 double gmq_trit_dot(const int8_t *pos, const int8_t *neg, const double *x, size_t n);
 
-/* Project double values onto int32 numerators p_out[k] = round(x[k] * q) in O(n). */
-void gmq_quantize_pq(const double *x, size_t n, int64_t q, int32_t *p_out);
-
-/* Pure integer-numerator dot product sum_j trits[j] * p_x[j] in Z (SSE4.1 pmulld / NEON smull). */
+/* Pure-integer p/q trit dot product: sum_j trits[j] * p_x[j] with NEON/SSE4.1 integer SIMD (0 floats). */
 int64_t gmq_trit_dot_pq(const int8_t *trits, const int32_t *p_x, size_t n);
+
+/* Pure-integer per-row absmean ternary quantization in p/q (0 floats, 0 per-weight divisions). */
+void gmq_quantize_per_row_pq(const int32_t *w_p, size_t rows, size_t cols,
+                             int32_t q, int8_t *trits_out, int32_t *scales_p_out);
+
+/* Pure-integer j-major 5-trits/byte matmul in p/q (0 floats). */
+void gmq_ternary_matmul_pq(const uint8_t *packed, size_t rows, size_t cols,
+                           const int32_t *p_x, const int32_t *p_scales,
+                           int32_t q_scale, int64_t *p_out);
+
+/* Pure-integer i-major NEON/SSE4.1 SIMD matmul in p/q (0 floats). */
+void gmq_simd_matmul_pq(const int8_t *trits_i_major, size_t rows, size_t cols,
+                        const int32_t *p_x, int64_t *p_out);
+
+/* Pure-integer i8×i8->i16 NEON/SSE4.1 16-lane BFP-i8 dot product (0 floats). */
+int64_t gmq_trit_dot_bfp_i8(const int8_t *trits, const int8_t *m_x, size_t n);
+
+/* Pure-integer Omni BFP-i8 i-major matmul in p/q (0 floats). */
+void gmq_omni_bfp_i8_matmul_pq(const int8_t *trits_i_major, size_t rows, size_t cols,
+                               const int8_t *m_x, int64_t *p_out);
+
+/* Pack j-major trits into i-major 64-trit quantum bitplanes (w_pos_u64, w_neg_u64). */
+void gmq_pack_quantum_bitplanes_i_major(const int8_t *trits, size_t rows, size_t cols,
+                                        uint64_t *w_pos_u64, uint64_t *w_neg_u64);
+
+/* Quantize p_x into 64-trit quantum bitplanes (x_pos_u64, x_neg_u64) + return p_scale_x (0 floats). */
+int32_t gmq_quantize_quantum_act_pq(const int32_t *p_x, size_t n,
+                                    uint64_t *x_pos_u64, uint64_t *x_neg_u64);
+
+/* 8-column register-blocked 64-trit quantum POPCNT matmul in p/q (512 MACs/step, 0 floats). */
+void gmq_quantum_bitplane_matmul_pq(const uint64_t *w_pos_u64, const uint64_t *w_neg_u64,
+                                    size_t rows, size_t cols,
+                                    const uint64_t *x_pos_u64, const uint64_t *x_neg_u64,
+                                    int32_t p_scale_x, int64_t *p_out);
 
 /* The masked kernel, j-major: out[i] = gamma * sum_j trit[j][i] * scale[j] * x[j]. */
 void gmq_ternary_matmul(const uint8_t *packed, size_t rows, size_t cols,
                         const double *x, const double *scales, double gamma,
                         double *out);
-
-/* Pure p/q ("Counting Divided") integer-numerator masked kernel: accumulates in Z (acc_scratch)
- * with zero inner-loop int->double conversions, dividing by q_x only once per output column. */
-void gmq_ternary_matmul_pq(const uint8_t *packed, size_t rows, size_t cols,
-                           const int32_t *p_x, int64_t q_x,
-                           const double *scales, double gamma,
-                           int64_t *acc_scratch, double *out);
 
 /* Dense float64 reference. */
 void gmq_dense_matmul(const double *w, size_t rows, size_t cols,
@@ -67,11 +91,37 @@ typedef struct {
     double coherence;
 } gmq_fold_t;
 
+/* Pure-integer p/q (q = 2^20) 4-layer GAIA fold result (0 floats). */
+typedef struct {
+    uint32_t seed;
+    int64_t q;
+    int64_t gravity_p;
+    int64_t entropy_p;
+    int64_t weather_p;
+    int64_t resonance_p;
+    int64_t coherence_p;
+} gmq_fold_pq_t;
+
 /* 32-bit FNV-1a over prompt bytes. */
 uint32_t gmq_seed_from(const char *prompt, size_t len);
 
 /* Fold a prompt together with passive RF Shannon entropy (in bits). */
 gmq_fold_t gmq_fold_spectrum(const char *prompt, size_t len, double rf_entropy_bits);
+
+/* Fold a prompt together with passive RF Shannon entropy numerator (in q = 2^20, 0 floats). */
+gmq_fold_pq_t gmq_fold_spectrum_pq(const char *prompt, size_t len, int64_t rf_entropy_p);
+
+/* wupz C ABI v1 seam: XOR integrity fold over little-endian u64 words + trailing bytes. */
+uint64_t gmq_wupz_xor_fold(const uint8_t *ptr, size_t len);
+
+/* wupz C ABI v1 seam: number of differing bytes between two spans. */
+uint64_t gmq_wupz_byte_diff(const uint8_t *a, const uint8_t *b, size_t len);
+
+/* wupz C ABI v1 seam: population count over a byte span. */
+uint64_t gmq_wupz_popcount(const uint8_t *ptr, size_t len);
+
+/* wupz QuantTern (qt:<hex>) 3-axis emotional ternary encoding in pure p/q (|x| >= 0.33, 0 floats). */
+uint8_t gmq_quant_tern_encode_pq(int64_t p_valence, int64_t p_arousal, int64_t p_dominance, int64_t q);
 
 #ifdef __cplusplus
 }

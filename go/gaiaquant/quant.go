@@ -4,7 +4,10 @@
 // slices and static LUTs, allocate nothing, and read like a sentence.
 package gaiaquant
 
-import "math"
+import (
+	"math"
+	"math/bits"
+)
 
 // TritPerByte is the packing density: five base-3 digits per byte.
 const TritPerByte = 5
@@ -152,81 +155,17 @@ func QuantizePerRow(w []float64, rows, cols int) (trits []int8, scales []float64
 			scale = 1
 		}
 		scales[r] = scale
-		posThresh := 0.5 * scale
-		negThresh := -posThresh
 		for c, v := range row {
+			q := math.Round(v / scale)
 			switch {
-			case v >= posThresh:
+			case q > 0:
 				trits[r*cols+c] = 1
-			case v <= negThresh:
+			case q < 0:
 				trits[r*cols+c] = -1
 			}
 		}
 	}
 	return trits, scales
-}
-
-// PqDefaultQ is the default dyadic denominator q = 2^20 = 1,048,576 ("Counting Divided").
-const PqDefaultQ int64 = 1 << 20
-
-// QuantizePqInto projects a float64 slice onto int32 numerators pOut[k] = round(x[k] * q)
-// in O(K) with zero heap allocations.
-func QuantizePqInto(x []float64, q int64, pOut []int32) {
-	qf := float64(q)
-	for i, v := range x {
-		pOut[i] = int32(math.Round(v * qf))
-	}
-}
-
-// TernaryMatMulPq is the p/q ("Counting Divided") integer-numerator kernel:
-// accumulates all ternary products in Z (accScratch []int64) with zero inner-loop
-// int8->float64 conversions, dividing by qX only once per output column.
-func TernaryMatMulPq(packed []uint8, rows, cols int, pX []int32, qX int64, scales []float64, gamma float64, accScratch []int64, out []float64) {
-	for i := range accScratch[:cols] {
-		accScratch[i] = 0
-	}
-	for j := 0; j < rows; j++ {
-		pxj := int64(pX[j])
-		if pxj == 0 {
-			continue
-		}
-		if scales != nil {
-			pxj = int64(math.Round(float64(pxj) * scales[j]))
-			if pxj == 0 {
-				continue
-			}
-		}
-		startT := j * cols
-		endT := startT + cols
-		startB := startT / TritPerByte
-		endB := (endT + TritPerByte - 1) / TritPerByte
-		for b := startB; b < endB; b++ {
-			byte_ := packed[b]
-			if byte_ == 0 {
-				continue
-			}
-			base := b * TritPerByte
-			if t := base; t >= startT && t < endT {
-				accScratch[t-startT] += int64(T0[byte_]) * pxj
-			}
-			if t := base + 1; t >= startT && t < endT {
-				accScratch[t-startT] += int64(T1[byte_]) * pxj
-			}
-			if t := base + 2; t >= startT && t < endT {
-				accScratch[t-startT] += int64(T2[byte_]) * pxj
-			}
-			if t := base + 3; t >= startT && t < endT {
-				accScratch[t-startT] += int64(T3[byte_]) * pxj
-			}
-			if t := base + 4; t >= startT && t < endT {
-				accScratch[t-startT] += int64(T4[byte_]) * pxj
-			}
-		}
-	}
-	invQ := gamma / float64(qX)
-	for i := 0; i < cols; i++ {
-		out[i] = float64(accScratch[i]) * invQ
-	}
 }
 
 // RelativeError is the relative L2 error of actual against reference.
@@ -353,4 +292,356 @@ func DeriveSampling(f Fold) Sampling {
 		TopK:        uint32(clamp64(20.0+(1.0-f.Coherence)*60.0, 20.0, 80.0) + 0.5),
 		Seed:        f.Seed,
 	}
+}
+
+// ── Pure-Integer p/q ("Counting Divided" · Zero Floating Point) Go Lane ────
+
+// PqDefaultQ is the canonical rational denominator q = 2^20 = 1,048,576.
+const PqDefaultQ int64 = 1048576
+
+// FoldPq holds the 4-layer GAIA fold result in pure integer p/q (q = 2^20), zero floats.
+type FoldPq struct {
+	Seed       uint32
+	Q          int64
+	GravityP   int64
+	EntropyP   int64
+	WeatherP   int64
+	ResonanceP int64
+	Dominant   string
+	CoherenceP int64
+}
+
+func clampI64(v, minV, maxV int64) int64 {
+	if v < minV {
+		return minV
+	}
+	if v > maxV {
+		return maxV
+	}
+	return v
+}
+
+func absI64(v int64) int64 {
+	if v < 0 {
+		return -v
+	}
+	return v
+}
+
+// FoldSpectrumPq folds a prompt with passive RF Shannon entropy numerator rfEntropyP
+// (in q = 2^20) using 100% integer arithmetic and zero floating-point operations.
+func FoldSpectrumPq(prompt string, rfEntropyP int64, explicitSeed *uint32) FoldPq {
+	s := SeedFrom(prompt)
+	if explicitSeed != nil {
+		s = *explicitSeed
+	}
+	a := s + 0x6d2b79f5
+	t := (a ^ (a >> 15)) * (a | 1)
+	t ^= t + ((t ^ (t >> 7)) * (t | 61))
+	randP := int64((t ^ (t >> 14)) >> 12)
+
+	rfFactorP := clampI64((rfEntropyP-2621440)/20, -83886, 146801)
+	lenP := int64(len(prompt)) << 8
+	if lenP > 367002 {
+		lenP = 367002
+	}
+	entropyP := clampI64(650117+lenP-157286+rfFactorP, 0, PqDefaultQ)
+	weatherP := clampI64(524288+((randP-524288)*2)/5, 0, PqDefaultQ)
+	gravityP := PqDefaultQ
+	resonanceP := int64(1696632)
+
+	names := [4]string{"gravity", "entropy", "weather", "resonance"}
+	vals := [4]int64{gravityP, entropyP, weatherP, resonanceP}
+	rests := [4]int64{1048576, 650117, 524288, 1696632}
+	dominant := "gravity"
+	var best int64 = -1
+	for i := 0; i < 4; i++ {
+		d := absI64(vals[i] - rests[i])
+		if d > best {
+			best = d
+			dominant = names[i]
+		}
+	}
+
+	spreadP := (absI64(entropyP-650117)*3 + absI64(weatherP-524288)*2) / 5
+	coherenceP := clampI64(PqDefaultQ-spreadP, 0, PqDefaultQ)
+
+	return FoldPq{
+		Seed:       s,
+		Q:          PqDefaultQ,
+		GravityP:   gravityP,
+		EntropyP:   entropyP,
+		WeatherP:   weatherP,
+		ResonanceP: resonanceP,
+		Dominant:   dominant,
+		CoherenceP: coherenceP,
+	}
+}
+
+// QuantizePerRowPq quantizes integer numerators wP ([rows, cols]) to trits {-1, 0, +1}
+// and per-row absmean scale numerators scalesP using exact integer inequality
+// |v| * 2 * cols >= sumAbs (zero floats, zero divisions per weight).
+func QuantizePerRowPq(wP []int32, rows, cols int, q int32) (trits []int8, scalesP []int32) {
+	trits = make([]int8, len(wP))
+	scalesP = make([]int32, rows)
+	cols64 := int64(cols)
+	twoCols := cols64 * 2
+	for r := 0; r < rows; r++ {
+		row := wP[r*cols : (r+1)*cols]
+		var sumAbs int64
+		for _, v := range row {
+			sumAbs += absI64(int64(v))
+		}
+		if sumAbs == 0 {
+			scalesP[r] = q
+			continue
+		}
+		scalesP[r] = int32((sumAbs + (cols64 >> 1)) / cols64)
+		for c, v := range row {
+			v64 := int64(v)
+			if absI64(v64)*twoCols >= sumAbs {
+				if v64 > 0 {
+					trits[r*cols+c] = 1
+				} else {
+					trits[r*cols+c] = -1
+				}
+			}
+		}
+	}
+	return trits, scalesP
+}
+
+// TernaryMatMulPq is the pure-integer j-major 5-trits/byte kernel in p/q (zero floats).
+func TernaryMatMulPq(packed []uint8, rows, cols int, pX, pScales []int32, qScale int32, pOut []int64) {
+	for i := range pOut[:cols] {
+		pOut[i] = 0
+	}
+	qS := int64(qScale)
+	if qS <= 0 {
+		qS = 1
+	}
+	halfQ := qS >> 1
+	for j := 0; j < rows; j++ {
+		xj := int64(pX[j])
+		if xj == 0 {
+			continue
+		}
+		if pScales != nil {
+			prod := xj * int64(pScales[j])
+			if prod >= 0 {
+				xj = (prod + halfQ) / qS
+			} else {
+				xj = (prod - halfQ) / qS
+			}
+			if xj == 0 {
+				continue
+			}
+		}
+		startT := j * cols
+		endT := startT + cols
+		startB := startT / TritPerByte
+		endB := (endT + TritPerByte - 1) / TritPerByte
+		for b := startB; b < endB; b++ {
+			byte_ := packed[b]
+			if byte_ == 0 {
+				continue
+			}
+			base := b * TritPerByte
+			if base >= startT && base+TritPerByte <= endT {
+				col := base - startT
+				pOut[col+0] += int64(T0[byte_]) * xj
+				pOut[col+1] += int64(T1[byte_]) * xj
+				pOut[col+2] += int64(T2[byte_]) * xj
+				pOut[col+3] += int64(T3[byte_]) * xj
+				pOut[col+4] += int64(T4[byte_]) * xj
+			} else {
+				if t := base; t >= startT && t < endT {
+					pOut[t-startT] += int64(T0[byte_]) * xj
+				}
+				if t := base + 1; t >= startT && t < endT {
+					pOut[t-startT] += int64(T1[byte_]) * xj
+				}
+				if t := base + 2; t >= startT && t < endT {
+					pOut[t-startT] += int64(T2[byte_]) * xj
+				}
+				if t := base + 3; t >= startT && t < endT {
+					pOut[t-startT] += int64(T3[byte_]) * xj
+				}
+				if t := base + 4; t >= startT && t < endT {
+					pOut[t-startT] += int64(T4[byte_]) * xj
+				}
+			}
+		}
+	}
+}
+
+// PackQuantumBitplanesIMajor packs j-major trits ([rows, cols]) into column-major
+// 64-trit quantum bitplane words (wPosU64, wNegU64), each of length cols * ceil(rows/64).
+func PackQuantumBitplanesIMajor(trits []int8, rows, cols int, wPosU64, wNegU64 []uint64) {
+	words := (rows + 63) / 64
+	for i := 0; i < cols; i++ {
+		for w := 0; w < words; w++ {
+			var pMask, nMask uint64
+			jBase := w * 64
+			jEnd := jBase + 64
+			if jEnd > rows {
+				jEnd = rows
+			}
+			for b := 0; b < jEnd-jBase; b++ {
+				t := trits[(jBase+b)*cols+i]
+				if t > 0 {
+					pMask |= 1 << uint(b)
+				} else if t < 0 {
+					nMask |= 1 << uint(b)
+				}
+			}
+			wPosU64[i*words+w] = pMask
+			wNegU64[i*words+w] = nMask
+		}
+	}
+}
+
+// QuantizeQuantumActPq quantizes integer activation numerators pX into 64-trit
+// quantum bitplanes (xPosU64, xNegU64) and returns the absmean integer scale pScaleX (zero floats).
+func QuantizeQuantumActPq(pX []int32, xPosU64, xNegU64 []uint64) int32 {
+	n := len(pX)
+	words := (n + 63) / 64
+	for w := 0; w < words; w++ {
+		xPosU64[w] = 0
+		xNegU64[w] = 0
+	}
+	if n == 0 {
+		return 0
+	}
+	var sumAbs int64
+	for _, v := range pX {
+		sumAbs += absI64(int64(v))
+	}
+	if sumAbs == 0 {
+		return 0
+	}
+	n64 := int64(n)
+	twoN := n64 * 2
+	for w := 0; w < words; w++ {
+		var pm, nm uint64
+		jBase := w * 64
+		jEnd := jBase + 64
+		if jEnd > n {
+			jEnd = n
+		}
+		for b := 0; b < jEnd-jBase; b++ {
+			v := int64(pX[jBase+b])
+			if absI64(v)*twoN >= sumAbs {
+				if v > 0 {
+					pm |= 1 << uint(b)
+				} else if v < 0 {
+					nm |= 1 << uint(b)
+				}
+			}
+		}
+		xPosU64[w] = pm
+		xNegU64[w] = nm
+	}
+	return int32((sumAbs + (n64 >> 1)) / n64)
+}
+
+// QuantumBitplaneMatMulPq contracts 64-trit quantum bitplanes (wPosU64, wNegU64)
+// against (xPosU64, xNegU64) using hardware bits.OnesCount64 (POPCNT / NEON CNT)
+// with 4-column register blocking and zero floating-point operations.
+func QuantumBitplaneMatMulPq(wPosU64, wNegU64 []uint64, rows, cols int, xPosU64, xNegU64 []uint64, pScaleX int32, pOut []int64) {
+	words := (rows + 63) / 64
+	sx := int64(pScaleX)
+	i := 0
+	for i+4 <= cols {
+		wp0, wn0 := wPosU64[(i+0)*words:(i+1)*words], wNegU64[(i+0)*words:(i+1)*words]
+		wp1, wn1 := wPosU64[(i+1)*words:(i+2)*words], wNegU64[(i+1)*words:(i+2)*words]
+		wp2, wn2 := wPosU64[(i+2)*words:(i+3)*words], wNegU64[(i+2)*words:(i+3)*words]
+		wp3, wn3 := wPosU64[(i+3)*words:(i+4)*words], wNegU64[(i+3)*words:(i+4)*words]
+		var a0, a1, a2, a3 int64
+		for w := 0; w < words; w++ {
+			xp, xn := xPosU64[w], xNegU64[w]
+			a0 += int64(bits.OnesCount64((wp0[w]&xp)|(wn0[w]&xn)) - bits.OnesCount64((wp0[w]&xn)|(wn0[w]&xp)))
+			a1 += int64(bits.OnesCount64((wp1[w]&xp)|(wn1[w]&xn)) - bits.OnesCount64((wp1[w]&xn)|(wn1[w]&xp)))
+			a2 += int64(bits.OnesCount64((wp2[w]&xp)|(wn2[w]&xn)) - bits.OnesCount64((wp2[w]&xn)|(wn2[w]&xp)))
+			a3 += int64(bits.OnesCount64((wp3[w]&xp)|(wn3[w]&xn)) - bits.OnesCount64((wp3[w]&xn)|(wn3[w]&xp)))
+		}
+		pOut[i+0] = a0 * sx
+		pOut[i+1] = a1 * sx
+		pOut[i+2] = a2 * sx
+		pOut[i+3] = a3 * sx
+		i += 4
+	}
+	for ; i < cols; i++ {
+		wp, wn := wPosU64[i*words:(i+1)*words], wNegU64[i*words:(i+1)*words]
+		var a0 int64
+		for w := 0; w < words; w++ {
+			xp, xn := xPosU64[w], xNegU64[w]
+			a0 += int64(bits.OnesCount64((wp[w]&xp)|(wn[w]&xn)) - bits.OnesCount64((wp[w]&xn)|(wn[w]&xp)))
+		}
+		pOut[i] = a0 * sx
+	}
+}
+
+// WupzXorFold computes the wupz C ABI v1 integrity fold (XOR of little-endian u64 words + trailing bytes).
+func WupzXorFold(b []byte) uint64 {
+	var acc uint64
+	i := 0
+	for i+8 <= len(b) {
+		w := uint64(b[i+0]) |
+			(uint64(b[i+1]) << 8) |
+			(uint64(b[i+2]) << 16) |
+			(uint64(b[i+3]) << 24) |
+			(uint64(b[i+4]) << 32) |
+			(uint64(b[i+5]) << 40) |
+			(uint64(b[i+6]) << 48) |
+			(uint64(b[i+7]) << 56)
+		acc ^= w
+		i += 8
+	}
+	for ; i < len(b); i++ {
+		acc ^= uint64(b[i])
+	}
+	return acc
+}
+
+// WupzByteDiff returns the number of differing bytes between two spans.
+func WupzByteDiff(a, b []byte) uint64 {
+	n := len(a)
+	if len(b) < n {
+		n = len(b)
+	}
+	var count uint64
+	for i := 0; i < n; i++ {
+		if a[i] != b[i] {
+			count++
+		}
+	}
+	return count
+}
+
+// WupzPopcount returns the population count over a byte span.
+func WupzPopcount(b []byte) uint64 {
+	var count uint64
+	for _, v := range b {
+		count += uint64(bits.OnesCount8(v))
+	}
+	return count
+}
+
+// QuantTernEncodePq encodes 3 rational p/q axes (valence, arousal, dominance) into a wupz QuantTern byte (0 floats).
+func QuantTernEncodePq(pValence, pArousal, pDominance, q int64) uint8 {
+	trit := func(p int64) int8 {
+		qAbs := absI64(q)
+		lhs := p * 100
+		rhs := 33 * qAbs
+		if lhs >= rhs {
+			return 1
+		}
+		if lhs <= -rhs {
+			return -1
+		}
+		return 0
+	}
+	t0, t1, t2 := trit(pValence), trit(pArousal), trit(pDominance)
+	return uint8(((t0+1)&3) | (((t1+1)&3) << 2) | (((t2+1)&3) << 4) | (1 << 6))
 }

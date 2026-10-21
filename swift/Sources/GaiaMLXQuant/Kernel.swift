@@ -149,86 +149,12 @@ public enum GaiaMLXQuant {
             var scale = sum / Double(cols)
             if scale == 0 { scale = 1 }
             scales[r] = scale
-            let posThresh = 0.5 * scale
-            let negThresh = -posThresh
             for c in 0..<cols {
-                let v = w[r * cols + c]
-                trits[r * cols + c] = v >= posThresh ? 1 : (v <= negThresh ? -1 : 0)
+                let q = (w[r * cols + c] / scale).rounded()
+                trits[r * cols + c] = q > 0 ? 1 : (q < 0 ? -1 : 0)
             }
         }
         return (trits, scales)
-    }
-
-    // MARK: p/q ("Counting Divided" — integer-numerator engine)
-
-    /// Default dyadic denominator q = 2^20 = 1,048,576.
-    public static let pqDefaultQ: Int64 = 1 << 20
-
-    /// Project a Double slice onto Int32 numerators pOut[k] = round(x[k] * q) in O(K).
-    public static func quantizePqInto(_ x: [Double], q: Int64, into pOut: inout [Int32]) {
-        let qf = Double(q)
-        for i in x.indices {
-            pOut[i] = Int32((x[i] * qf).rounded())
-        }
-    }
-
-    /// Pure p/q ("Counting Divided") integer-numerator masked kernel:
-    /// accumulates in Z (accScratch) with zero inner-loop Int8->Double conversions,
-    /// dividing by qX only once per output column.
-    public static func ternaryMatMulPq(
-        packed: [UInt8],
-        rows: Int,
-        cols: Int,
-        pX: [Int32],
-        qX: Int64,
-        scales: [Double]?,
-        gamma: Double,
-        accScratch: inout [Int64],
-        into out: inout [Double]
-    ) {
-        for i in 0..<cols { accScratch[i] = 0 }
-        let luts = slotLuts
-        for j in 0..<rows {
-            var pxj = Int64(pX[j])
-            if pxj == 0 { continue }
-            if let scales {
-                pxj = Int64((Double(pxj) * scales[j]).rounded())
-                if pxj == 0 { continue }
-            }
-            let startT = j * cols
-            let endT = startT + cols
-            let startB = startT / tritsPerByte
-            let endB = (endT + tritsPerByte - 1) / tritsPerByte
-            for b in startB..<endB {
-                let byte = packed[b]
-                if byte == 0 { continue }
-                let base = b * tritsPerByte
-                let t0 = base
-                if t0 >= startT && t0 < endT {
-                    accScratch[t0 - startT] &+= Int64(luts[0][Int(byte)]) &* pxj
-                }
-                let t1 = base + 1
-                if t1 >= startT && t1 < endT {
-                    accScratch[t1 - startT] &+= Int64(luts[1][Int(byte)]) &* pxj
-                }
-                let t2 = base + 2
-                if t2 >= startT && t2 < endT {
-                    accScratch[t2 - startT] &+= Int64(luts[2][Int(byte)]) &* pxj
-                }
-                let t3 = base + 3
-                if t3 >= startT && t3 < endT {
-                    accScratch[t3 - startT] &+= Int64(luts[3][Int(byte)]) &* pxj
-                }
-                let t4 = base + 4
-                if t4 >= startT && t4 < endT {
-                    accScratch[t4 - startT] &+= Int64(luts[4][Int(byte)]) &* pxj
-                }
-            }
-        }
-        let invQ = gamma / Double(qX)
-        for i in 0..<cols {
-            out[i] = Double(accScratch[i]) * invQ
-        }
     }
 
     // MARK: honesty
@@ -343,5 +269,319 @@ public enum GaiaMLXQuant {
             topK: UInt32(clamp(20.0 + (1.0 - f.coherence) * 60.0, 20.0, 80.0) + 0.5),
             seed: f.seed
         )
+    }
+
+    // MARK: p / q ("Counting Divided" — Pure Integer Z/Q Substrate, 0 floats)
+
+    /// Canonical dyadic denominator q = 2^20 = 1,048,576.
+    public static let pqDefaultQ: Int64 = 1_048_576
+    public static let gravityRestPq: Int32 = 1_048_576
+    public static let entropyRestPq: Int32 = 650_117
+    public static let weatherRestPq: Int32 = 524_288
+    public static let phiPq: Int32 = 1_696_631
+
+    public struct FoldPq: Equatable, Sendable {
+        public let seed: UInt32
+        public let gravityPq: Int32
+        public let entropyPq: Int32
+        public let weatherPq: Int32
+        public let resonancePq: Int32
+        public let dominant: String
+        public let coherencePq: Int32
+    }
+
+    /// Pure-integer p/q per-row absmean ternary quantization (0 floats).
+    ///
+    /// Uses the exact algebraic identity `round(|w| / (sum_abs / cols)) >= 1 <=> |w| * 2 * cols >= sum_abs`.
+    public static func quantizePerRowPq(
+        _ pW: [Int32],
+        rows: Int,
+        cols: Int
+    ) -> (trits: [Int8], pScales: [Int32]) {
+        var trits = [Int8](repeating: 0, count: pW.count)
+        var pScales = [Int32](repeating: 0, count: rows)
+        if rows == 0 || cols == 0 { return (trits, pScales) }
+        let twoCols = Int64(cols) * 2
+        for r in 0..<rows {
+            var sumAbs: Int64 = 0
+            let rowBase = r * cols
+            for c in 0..<cols {
+                let v = Int64(pW[rowBase + c])
+                sumAbs += v < 0 ? -v : v
+            }
+            if sumAbs == 0 {
+                pScales[r] = Int32(pqDefaultQ)
+                continue
+            }
+            pScales[r] = Int32(clamping: (sumAbs + Int64(cols / 2)) / Int64(cols))
+            for c in 0..<cols {
+                let v = Int64(pW[rowBase + c])
+                let av = v < 0 ? -v : v
+                if av * twoCols >= sumAbs {
+                    trits[rowBase + c] = v >= 0 ? 1 : -1
+                } else {
+                    trits[rowBase + c] = 0
+                }
+            }
+        }
+        return (trits, pScales)
+    }
+
+    /// Pure-integer p/q j-major ternary matmul (0 floats).
+    public static func ternaryMatMulPq(
+        packed: [UInt8],
+        rows: Int,
+        cols: Int,
+        pX: [Int32],
+        pScales: [Int32]?,
+        qX: Int64 = pqDefaultQ,
+        qScale: Int64 = pqDefaultQ,
+        into pOut: inout [Int64]
+    ) {
+        for i in 0..<cols { pOut[i] = 0 }
+        let luts = slotLuts
+        let qS = qScale > 0 ? qScale : 1
+        for j in 0..<rows {
+            var xj = Int64(pX[j])
+            if xj == 0 { continue }
+            if let pScales {
+                xj = (xj * Int64(pScales[j])) / qS
+                if xj == 0 { continue }
+            }
+            let startT = j * cols
+            let endT = startT + cols
+            let startB = startT / tritsPerByte
+            let endB = (endT + tritsPerByte - 1) / tritsPerByte
+            for b in startB..<endB {
+                let byte = packed[b]
+                if byte == 0 { continue }
+                let base = b * tritsPerByte
+                let t0 = base
+                if t0 >= startT && t0 < endT {
+                    pOut[t0 - startT] += Int64(luts[0][Int(byte)]) * xj
+                }
+                let t1 = base + 1
+                if t1 >= startT && t1 < endT {
+                    pOut[t1 - startT] += Int64(luts[1][Int(byte)]) * xj
+                }
+                let t2 = base + 2
+                if t2 >= startT && t2 < endT {
+                    pOut[t2 - startT] += Int64(luts[2][Int(byte)]) * xj
+                }
+                let t3 = base + 3
+                if t3 >= startT && t3 < endT {
+                    pOut[t3 - startT] += Int64(luts[3][Int(byte)]) * xj
+                }
+                let t4 = base + 4
+                if t4 >= startT && t4 < endT {
+                    pOut[t4 - startT] += Int64(luts[4][Int(byte)]) * xj
+                }
+            }
+        }
+    }
+
+    @inline(__always)
+    private static func clampI32(_ v: Int32, _ minV: Int32, _ maxV: Int32) -> Int32 {
+        if v < minV { return minV }
+        if v > maxV { return maxV }
+        return v
+    }
+
+    /// Pure-integer p/q GAIA spectrum fold (0 floats).
+    public static func foldSpectrumPq(
+        _ prompt: String,
+        rfEntropyBitsPq: Int32,
+        seed: UInt32? = nil
+    ) -> FoldPq {
+        let s = seed ?? seedFrom(prompt)
+        let a = s &+ 0x6d2b79f5
+        var t = (a ^ (a >> 15)) &* (a | 1)
+        t ^= t &+ ((t ^ (t >> 7)) &* (t | 61))
+        let randPq = Int32(((t ^ (t >> 14)) >> 12) & 0xF_FFFF)
+
+        let rfDelta = Int64(rfEntropyBitsPq) - 2_621_440
+        let rfFactor = clampI32(Int32((rfDelta * 52_429) >> 20), -83_886, 146_801)
+        let rawLen = Int64(prompt.utf8.count) * 256
+        let lenFactor = Int32(min(rawLen, 367_002))
+        let entropyPq = clampI32(entropyRestPq + lenFactor - 157_286 + rfFactor, 0, Int32(pqDefaultQ))
+        let weatherDelta = ((Int64(randPq) - 524_288) * 419_430) >> 20
+        let weatherPq = clampI32(weatherRestPq + Int32(weatherDelta), 0, Int32(pqDefaultQ))
+
+        let de = abs(entropyPq - entropyRestPq)
+        let dw = abs(weatherPq - weatherRestPq)
+        let dominant = dw > de ? "weather" : (de > 0 ? "entropy" : "gravity")
+        let spreadPq = Int32((Int64(de) * 629_146 + Int64(dw) * 419_430) >> 20)
+        let coherencePq = clampI32(Int32(pqDefaultQ) - spreadPq, 0, Int32(pqDefaultQ))
+
+        return FoldPq(
+            seed: s,
+            gravityPq: gravityRestPq,
+            entropyPq: entropyPq,
+            weatherPq: weatherPq,
+            resonancePq: phiPq,
+            dominant: dominant,
+            coherencePq: coherencePq
+        )
+    }
+
+    /// Pack j-major trits ([rows, cols]) into column-major 64-trit quantum bitplanes (wPosU64, wNegU64).
+    public static func packQuantumBitplanesIMajor(
+        _ trits: [Int8],
+        rows: Int,
+        cols: Int,
+        wPosU64: inout [UInt64],
+        wNegU64: inout [UInt64]
+    ) {
+        let words = (rows + 63) / 64
+        for i in 0..<cols {
+            for w in 0..<words {
+                var pMask: UInt64 = 0
+                var nMask: UInt64 = 0
+                let jBase = w * 64
+                let jEnd = min(jBase + 64, rows)
+                for b in 0..<(jEnd - jBase) {
+                    let t = trits[(jBase + b) * cols + i]
+                    if t > 0 {
+                        pMask |= (1 << UInt64(b))
+                    } else if t < 0 {
+                        nMask |= (1 << UInt64(b))
+                    }
+                }
+                wPosU64[i * words + w] = pMask
+                wNegU64[i * words + w] = nMask
+            }
+        }
+    }
+
+    /// Quantize integer activations pX into 64-trit quantum bitplanes (xPosU64, xNegU64) + absmean scale (0 floats).
+    public static func quantizeQuantumActPq(
+        _ pX: [Int32],
+        xPosU64: inout [UInt64],
+        xNegU64: inout [UInt64]
+    ) -> Int32 {
+        let n = pX.count
+        let words = (n + 63) / 64
+        for w in 0..<words {
+            xPosU64[w] = 0
+            xNegU64[w] = 0
+        }
+        if n == 0 { return 0 }
+        var sumAbs: Int64 = 0
+        for v in pX {
+            let v64 = Int64(v)
+            sumAbs += v64 < 0 ? -v64 : v64
+        }
+        if sumAbs == 0 { return 0 }
+        let n64 = Int64(n)
+        let twoN = n64 * 2
+        for w in 0..<words {
+            var pm: UInt64 = 0
+            var nm: UInt64 = 0
+            let jBase = w * 64
+            let jEnd = min(jBase + 64, n)
+            for b in 0..<(jEnd - jBase) {
+                let v = Int64(pX[jBase + b])
+                let av = v < 0 ? -v : v
+                if av * twoN >= sumAbs {
+                    if v > 0 {
+                        pm |= (1 << UInt64(b))
+                    } else if v < 0 {
+                        nm |= (1 << UInt64(b))
+                    }
+                }
+            }
+            xPosU64[w] = pm
+            xNegU64[w] = nm
+        }
+        return Int32(clamping: (sumAbs + (n64 >> 1)) / n64)
+    }
+
+    /// 64-trit quantum bitplane POPCNT matmul using hardware `.nonzeroBitCount` (0 floats).
+    public static func quantumBitplaneMatMulPq(
+        wPosU64: [UInt64],
+        wNegU64: [UInt64],
+        rows: Int,
+        cols: Int,
+        xPosU64: [UInt64],
+        xNegU64: [UInt64],
+        pScaleX: Int32,
+        into pOut: inout [Int64]
+    ) {
+        let words = (rows + 63) / 64
+        let sx = Int64(pScaleX)
+        for i in 0..<cols {
+            let base = i * words
+            var acc: Int64 = 0
+            for w in 0..<words {
+                let wp = wPosU64[base + w]
+                let wn = wNegU64[base + w]
+                let xp = xPosU64[w]
+                let xn = xNegU64[w]
+                let posCount = ((wp & xp) | (wn & xn)).nonzeroBitCount
+                let negCount = ((wp & xn) | (wn & xp)).nonzeroBitCount
+                acc += Int64(posCount - negCount)
+            }
+            pOut[i] = acc * sx
+        }
+    }
+
+    /// wupz C ABI v1 integrity fold (XOR of little-endian u64 words + trailing bytes).
+    public static func wupzXorFold(_ bytes: [UInt8]) -> UInt64 {
+        var acc: UInt64 = 0
+        var i = 0
+        while i + 8 <= bytes.count {
+            var w: UInt64 = 0
+            for b in 0..<8 {
+                w |= UInt64(bytes[i + b]) << UInt64(b * 8)
+            }
+            acc ^= w
+            i += 8
+        }
+        while i < bytes.count {
+            acc ^= UInt64(bytes[i])
+            i += 1
+        }
+        return acc
+    }
+
+    /// wupz C ABI v1 byte diff count between two spans.
+    public static func wupzByteDiff(_ a: [UInt8], _ b: [UInt8]) -> UInt64 {
+        let n = min(a.count, b.count)
+        var count: UInt64 = 0
+        for i in 0..<n where a[i] != b[i] {
+            count += 1
+        }
+        return count
+    }
+
+    /// wupz C ABI v1 population count over a byte span.
+    public static func wupzPopcount(_ bytes: [UInt8]) -> UInt64 {
+        var count: UInt64 = 0
+        for byte in bytes {
+            count += UInt64(byte.nonzeroBitCount)
+        }
+        return count
+    }
+
+    /// wupz QuantTern (qt:<hex>) 3-axis emotional ternary encoding in pure p/q (0 floats).
+    public static func quantTernEncodePq(
+        pValence: Int64,
+        pArousal: Int64,
+        pDominance: Int64,
+        q: Int64 = pqDefaultQ
+    ) -> UInt8 {
+        func trit(_ p: Int64) -> Int8 {
+            let qAbs = q < 0 ? -q : q
+            let lhs = p * 100
+            let rhs = 33 * qAbs
+            if lhs >= rhs { return 1 }
+            if lhs <= -rhs { return -1 }
+            return 0
+        }
+        let t0 = UInt8((Int(trit(pValence)) + 1) & 3)
+        let t1 = UInt8(((Int(trit(pArousal)) + 1) & 3) << 2)
+        let t2 = UInt8(((Int(trit(pDominance)) + 1) & 3) << 4)
+        let t3 = UInt8(1 << 6)
+        return t0 | t1 | t2 | t3
     }
 }

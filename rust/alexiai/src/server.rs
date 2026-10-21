@@ -8,7 +8,12 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 
-use gaia_mlx_quant::{Fold, fold, sampling};
+use gaia_mlx_quant::{
+    Fold, WUPZ_ABI_VERSION, WUPZ_DEFAULT_WINDOW_SIZE, WupzBlockDesc, WupzSectionDesc, fold,
+    fold_pq, fold_to_quant_tern_pq, sampling, wupz_bitplane_diff_u64, wupz_bitplane_popcount_u64,
+    wupz_pack_plan_into, wupz_plan_digest, wupz_plan_image_len, wupz_popcount, wupz_xor_fold,
+    wupz_xor_fold_u64,
+};
 
 use crate::mcp;
 use crate::osarous::{Osarous, SamplingParams};
@@ -27,13 +32,19 @@ const HERO_SVG: &str = include_str!("../../../web/hero-alexandra.svg");
 pub fn run_bench(dim: usize) -> String {
     use std::time::Instant;
     use gaia_mlx_quant::{
-        MLX_GROUP64_COMPRESSION, MlxQuantizedMatrix, PQ_DEFAULT_Q, b158_matmul_pq_i_major_into,
-        dense_matmul, gather_qmm_into, gather_qmm_pq_into, maybe_matmul_into, mergeq_matmul_into,
-        mlx_matmul_pq_group64_into, pack_ternary, pack_ternary_i_major_into,
-        quantize_bfp_i8_group64_into, quantize_bfp_i16_group64_into, quantize_pq_into,
-        quantize_ternary, relative_error, ternary_bfp_adaptive_mem8_matmul_into,
-        ternary_bfp_i8_matmul_into, ternary_bfp_i16_matmul_into, ternary_matmul,
-        ternary_matmul_i_major, ternary_simd_pq_matmul_into, ternary_transformer_step_into,
+        KERNEL_PQ_Q, MLX_GROUP_SIZE, MLX_GROUP64_COMPRESSION, MlxQuantizedMatrix, PQ_DEFAULT_Q,
+        b158_matmul_pq_i_major_into, dense_matmul, dense_matmul_pq_into, gather_qmm_into,
+        maybe_matmul_into, mergeq_matmul_into, mergeq_matmul_pq_into,
+        mlx_matmul_pq_group64_i64_into, mlx_matmul_pq_group64_into, omni_bfp_i8_simd_pq_into,
+        pack_quantum_bitplanes_i_major_into, pack_ternary, pack_ternary_i_major_into,
+        pack_ternary_planes_i_into, quantize_bfp_i8_group64_into, quantize_bfp_i8_pq_group64_into,
+        quantize_bfp_i16_group64_into, quantize_pq_into, quantize_quantum_bitplane_i4_pq_into,
+        quantize_quantum_ternary_act_pq_into, quantize_ternary, quantum_bitplane_i4_matmul_pq_into,
+        quantum_ternary_matmul_pq_into, relative_error, relative_error_pq_ppm,
+        ternary_bfp_adaptive_mem8_matmul_into, ternary_bfp_i8_matmul_into,
+        ternary_bfp_i16_matmul_into, ternary_matmul, ternary_matmul_i_major,
+        ternary_matmul_pq_planes_i_into, ternary_simd_i8_pq_into, ternary_simd_pq_matmul_into,
+        ternary_transformer_step_into, ternary_transformer_step_pq_into,
     };
 
     let aligned_dim = dim.max(64).div_ceil(64) * 64;
@@ -122,16 +133,31 @@ pub fn run_bench(dim: usize) -> String {
     pack_ternary_i_major_into(&trits_dh, aligned_dim, hidden_dim, &mut w_dh);
     pack_ternary_i_major_into(&trits_dh, hidden_dim, aligned_dim, &mut w_hd);
 
+    let mut pos_dd = vec![0i8; aligned_dim * aligned_dim];
+    let mut neg_dd = vec![0i8; aligned_dim * aligned_dim];
+    pack_ternary_planes_i_into(&trits_dd, aligned_dim, aligned_dim, &mut pos_dd, &mut neg_dd);
+    let mut trits_dd_i = vec![0i8; aligned_dim * aligned_dim];
+    for j in 0..aligned_dim {
+        for i in 0..aligned_dim {
+            trits_dd_i[i * aligned_dim + j] = trits_dd[j * aligned_dim + i];
+        }
+    }
+
     let mut y_imajor = vec![0.0f64; aligned_dim];
     let t_imaj = Instant::now();
     ternary_matmul_i_major(&w_dd, aligned_dim, aligned_dim, &x_al, None, 1.0, &mut y_imajor);
     let imajor_us = t_imaj.elapsed().as_nanos() as f64 / 1000.0;
 
-    // p / q ("Counting Divided" — Pure Integer-Numerator Kernels, zero inner-loop float conversions)
+    // p / q ("Counting Divided" — Pure Integer-Numerator Kernels, 0 floating-point operations)
+    let mut p_w_al = vec![0i32; aligned_dim * aligned_dim];
     let mut p_x = vec![0i32; aligned_dim];
     let mut p_scales = vec![0i32; mlx_q.scales.len()];
+    quantize_pq_into(&w_al, PQ_DEFAULT_Q, &mut p_w_al);
     quantize_pq_into(&x_al, PQ_DEFAULT_Q, &mut p_x);
     quantize_pq_into(&mlx_q.scales, PQ_DEFAULT_Q, &mut p_scales);
+
+    let mut p_y_dense = vec![0i64; aligned_dim];
+    dense_matmul_pq_into(&p_w_al, aligned_dim, aligned_dim, &p_x, &mut p_y_dense);
 
     let mut y_pq_g64 = vec![0.0f64; aligned_dim];
     let t_pqg64 = Instant::now();
@@ -147,89 +173,156 @@ pub fn run_bench(dim: usize) -> String {
     );
     let pq_g64_us = t_pqg64.elapsed().as_nanos() as f64 / 1000.0;
 
-    let mut moe_pscales = Vec::with_capacity(4 * p_scales.len());
-    for _ in 0..4 {
-        moe_pscales.extend_from_slice(&p_scales);
-    }
-    let mut y_moe_pq = vec![0.0f64; aligned_dim];
-    let t_moepq = Instant::now();
-    gather_qmm_pq_into(
+    let mut p_y_g64_i64 = vec![0i64; aligned_dim];
+    let t_pqg64_i64 = Instant::now();
+    mlx_matmul_pq_group64_i64_into(
         &p_x,
-        PQ_DEFAULT_Q,
-        &moe_codes,
-        &moe_pscales,
-        PQ_DEFAULT_Q,
-        4,
+        &mlx_q.codes,
+        &p_scales,
         aligned_dim,
         aligned_dim,
-        &[0, 2],
-        &[0.6, 0.4],
-        &mut moe_scratch,
-        &mut y_moe_pq,
+        &mut p_y_g64_i64,
     );
-    let moe_pq_us = t_moepq.elapsed().as_nanos() as f64 / 1000.0;
+    let pq_g64_i64_us = t_pqg64_i64.elapsed().as_nanos() as f64 / 1000.0;
+
+    let mut p_y_mergeq = vec![0i64; aligned_dim];
+    let t_pq_mq = Instant::now();
+    mergeq_matmul_pq_into(&p_x, &p_w_al, aligned_dim, aligned_dim, 64, &mut p_y_mergeq);
+    let pq_mergeq_us = t_pq_mq.elapsed().as_nanos() as f64 / 1000.0;
 
     let mut y_pq_b158 = vec![0.0f64; aligned_dim];
     let t_pqb158 = Instant::now();
     b158_matmul_pq_i_major_into(&w_dd, aligned_dim, aligned_dim, &p_x, PQ_DEFAULT_Q, 1.0, &mut y_pq_b158);
     let pq_b158_us = t_pqb158.elapsed().as_nanos() as f64 / 1000.0;
 
-    let mut trits_dd_i = vec![0i8; aligned_dim * aligned_dim];
-    for j in 0..aligned_dim {
-        for i in 0..aligned_dim {
-            trits_dd_i[i * aligned_dim + j] = trits_dd[j * aligned_dim + i];
-        }
-    }
-
     let mut y_pq_simd = vec![0.0f64; aligned_dim];
     let t_pqsimd = Instant::now();
     ternary_simd_pq_matmul_into(&trits_dd_i, aligned_dim, aligned_dim, &p_x, PQ_DEFAULT_Q, None, 1.0, &mut y_pq_simd);
     let pq_simd_us = t_pqsimd.elapsed().as_nanos() as f64 / 1000.0;
-    let pq_simd_err_vs_ternary = relative_error(&y_pq_simd, &y_imajor);
 
-    // Omni / MEM|8 3-Variant Block-Floating-Point (BFP-64):
-    //   1. BFP-i8 (i8 mantissa + i16 accumulator)
-    //   2. BFP-i16 (i16 mantissa + i32 accumulator)
-    //   3. MEM|8 Adaptive (i8 default, promotes blocks to i16 when error > threshold)
-    let groups = aligned_dim / 64;
-    let mut m_i8 = vec![0i8; aligned_dim];
-    let mut m_i16 = vec![0i16; aligned_dim];
-    let mut exp_x = vec![0i8; groups];
-    let mut scale_x = vec![0.0f64; groups];
-    let mut promoted_mask = vec![false; groups];
+    let mut p_y_planes = vec![0i64; aligned_dim];
+    let t_pq_planes = Instant::now();
+    ternary_matmul_pq_planes_i_into(
+        &pos_dd,
+        &neg_dd,
+        aligned_dim,
+        aligned_dim,
+        &p_x,
+        None,
+        KERNEL_PQ_Q,
+        &mut p_y_planes,
+    );
+    let pq_planes_us = t_pq_planes.elapsed().as_nanos() as f64 / 1000.0;
 
-    quantize_bfp_i8_group64_into(&x_al, &mut m_i8, &mut exp_x, &mut scale_x);
-    let mut y_bfp_i8 = vec![0.0f64; aligned_dim];
-    let t_bfp8 = Instant::now();
-    ternary_bfp_i8_matmul_into(&trits_dd_i, aligned_dim, aligned_dim, &m_i8, &scale_x, 1.0, &mut y_bfp_i8);
-    let bfp_i8_us = t_bfp8.elapsed().as_nanos() as f64 / 1000.0;
-    let bfp_i8_err = relative_error(&y_bfp_i8, &y_imajor);
-
-    quantize_bfp_i16_group64_into(&x_al, &mut m_i16, &mut exp_x, &mut scale_x);
-    let mut y_bfp_i16 = vec![0.0f64; aligned_dim];
-    let t_bfp16 = Instant::now();
-    ternary_bfp_i16_matmul_into(&trits_dd_i, aligned_dim, aligned_dim, &m_i16, &scale_x, 1.0, &mut y_bfp_i16);
-    let bfp_i16_us = t_bfp16.elapsed().as_nanos() as f64 / 1000.0;
-    let bfp_i16_err = relative_error(&y_bfp_i16, &y_imajor);
-
-    let mut y_bfp_mem8 = vec![0.0f64; aligned_dim];
-    let t_mem8 = Instant::now();
-    let (promoted_blocks, total_blocks) = ternary_bfp_adaptive_mem8_matmul_into(
+    let mut p_y_simd_i8 = vec![0i64; aligned_dim];
+    let t_pq_simd_i8 = Instant::now();
+    ternary_simd_i8_pq_into(
         &trits_dd_i,
         aligned_dim,
         aligned_dim,
-        &x_al,
-        0.0045,
+        &p_x,
+        None,
+        KERNEL_PQ_Q,
+        &mut p_y_simd_i8,
+    );
+    let pq_simd_i8_us = t_pq_simd_i8.elapsed().as_nanos() as f64 / 1000.0;
+    let pq_err_ppm = relative_error_pq_ppm(&p_y_simd_i8, &p_y_planes);
+
+    // ULTRA-SUPER-OMNI-Quantum Ternary (64-trit bitplane POPCNT & 4-bit bitplane POPCNT) + Omni BFP-64
+    let words_per_col = aligned_dim.div_ceil(64);
+    let num_groups = aligned_dim.div_ceil(MLX_GROUP_SIZE);
+    let mut w_pos_u64 = vec![0u64; aligned_dim * words_per_col];
+    let mut w_neg_u64 = vec![0u64; aligned_dim * words_per_col];
+    pack_quantum_bitplanes_i_major_into(&trits_dd, aligned_dim, aligned_dim, &mut w_pos_u64, &mut w_neg_u64);
+    let mut x_pos_u64 = vec![0u64; words_per_col];
+    let mut x_neg_u64 = vec![0u64; words_per_col];
+    let scale_x_qt = quantize_quantum_ternary_act_pq_into(&p_x, &mut x_pos_u64, &mut x_neg_u64);
+    let mut p_y_quantum_u64 = vec![0i64; aligned_dim];
+    let t_qt_u64 = Instant::now();
+    quantum_ternary_matmul_pq_into(
+        &w_pos_u64,
+        &w_neg_u64,
+        aligned_dim,
+        aligned_dim,
+        &x_pos_u64,
+        &x_neg_u64,
+        scale_x_qt,
+        None,
+        KERNEL_PQ_Q,
+        &mut p_y_quantum_u64,
+    );
+    let quantum_u64_us = t_qt_u64.elapsed().as_nanos() as f64 / 1000.0;
+
+    let mut x_sign_u64 = vec![0u64; words_per_col];
+    let mut x_b0_u64 = vec![0u64; words_per_col];
+    let mut x_b1_u64 = vec![0u64; words_per_col];
+    let mut x_b2_u64 = vec![0u64; words_per_col];
+    let mut scale_x_i4 = vec![0i32; words_per_col];
+    quantize_quantum_bitplane_i4_pq_into(
+        &p_x,
+        &mut x_sign_u64,
+        &mut x_b0_u64,
+        &mut x_b1_u64,
+        &mut x_b2_u64,
+        &mut scale_x_i4,
+    );
+    let mut p_y_quantum_i4 = vec![0i64; aligned_dim];
+    let t_qt_i4 = Instant::now();
+    quantum_bitplane_i4_matmul_pq_into(
+        &w_pos_u64,
+        &w_neg_u64,
+        aligned_dim,
+        aligned_dim,
+        &x_sign_u64,
+        &x_b0_u64,
+        &x_b1_u64,
+        &x_b2_u64,
+        &scale_x_i4,
+        &mut p_y_quantum_i4,
+    );
+    let quantum_i4_us = t_qt_i4.elapsed().as_nanos() as f64 / 1000.0;
+
+    let mut m_x_pq_i8 = vec![0i8; aligned_dim];
+    let mut scale_x_pq_i8 = vec![0i32; num_groups];
+    quantize_bfp_i8_pq_group64_into(&p_x, &mut m_x_pq_i8, &mut scale_x_pq_i8);
+    let mut p_y_omni_bfp = vec![0i64; aligned_dim];
+    let t_omni_bfp = Instant::now();
+    omni_bfp_i8_simd_pq_into(&trits_dd_i, aligned_dim, aligned_dim, &m_x_pq_i8, None, &mut p_y_omni_bfp);
+    let omni_bfp_i8_pq_us = t_omni_bfp.elapsed().as_nanos() as f64 / 1000.0;
+
+    let mut m_x_i8 = vec![0i8; aligned_dim];
+    let mut scale_x_i8 = vec![0.0f64; num_groups];
+    let mut m_x_i16 = vec![0i16; aligned_dim];
+    let mut scale_x_i16 = vec![0.0f64; num_groups];
+    quantize_bfp_i8_group64_into(&x_al, &mut m_x_i8, &mut scale_x_i8);
+    quantize_bfp_i16_group64_into(&x_al, &mut m_x_i16, &mut scale_x_i16);
+    let mut y_bfp_i8 = vec![0.0f64; aligned_dim];
+    let t_bfp8 = Instant::now();
+    ternary_bfp_i8_matmul_into(&trits_dd_i, aligned_dim, aligned_dim, &m_x_i8, &scale_x_i8, None, 1.0, &mut y_bfp_i8);
+    let bfp_i8_us = t_bfp8.elapsed().as_nanos() as f64 / 1000.0;
+
+    let mut y_bfp_i16 = vec![0.0f64; aligned_dim];
+    let t_bfp16 = Instant::now();
+    ternary_bfp_i16_matmul_into(&trits_dd_i, aligned_dim, aligned_dim, &m_x_i16, &scale_x_i16, None, 1.0, &mut y_bfp_i16);
+    let bfp_i16_us = t_bfp16.elapsed().as_nanos() as f64 / 1000.0;
+
+    let salience: Vec<f64> = (0..aligned_dim).map(|j| if j % 4 == 0 { 0.9 } else { 0.2 }).collect();
+    let mut y_bfp_mem8 = vec![0.0f64; aligned_dim];
+    let t_bfp_mem8 = Instant::now();
+    ternary_bfp_adaptive_mem8_matmul_into(
+        &trits_dd_i,
+        aligned_dim,
+        aligned_dim,
+        &m_x_i8,
+        &scale_x_i8,
+        &m_x_i16,
+        &scale_x_i16,
+        &salience,
+        0.75,
         1.0,
-        &mut m_i8,
-        &mut m_i16,
-        &mut exp_x,
-        &mut scale_x,
-        &mut promoted_mask,
         &mut y_bfp_mem8,
     );
-    let bfp_mem8_us = t_mem8.elapsed().as_nanos() as f64 / 1000.0;
-    let bfp_mem8_err = relative_error(&y_bfp_mem8, &y_imajor);
+    let bfp_mem8_us = t_bfp_mem8.elapsed().as_nanos() as f64 / 1000.0;
 
     let ones_d = vec![1.0f64; aligned_dim];
     let mut k_cache = vec![0.0f64; 8 * aligned_dim];
@@ -274,35 +367,118 @@ pub fn run_bench(dim: usize) -> String {
     let tf_us = t_tf.elapsed().as_nanos() as f64 / 1000.0;
     let tok_per_sec_16_layers = if tf_us > 0.0 { 1_000_000.0 / (tf_us * 16.0) } else { 0.0 };
 
+    // Pure-Integer p/q Ternary Transformer Step (0 floats)
+    let p_ones_d = vec![PQ_DEFAULT_Q as i32; aligned_dim];
+    let mut p_k_cache = vec![0i32; 8 * aligned_dim];
+    let mut p_v_cache = vec![0i32; 8 * aligned_dim];
+    let mut ps_norm = vec![0i32; aligned_dim];
+    let mut ps_q = vec![0i32; aligned_dim];
+    let mut ps_k = vec![0i32; aligned_dim];
+    let mut ps_v = vec![0i32; aligned_dim];
+    let mut ps_attn = vec![0i32; aligned_dim];
+    let mut ps_scores = vec![0i64; 8];
+    let mut ps_gate = vec![0i32; hidden_dim];
+    let mut ps_up = vec![0i32; hidden_dim];
+    let mut ps_i64 = vec![0i64; hidden_dim];
+    let mut p_tf_out = vec![0i32; aligned_dim];
+
+    let t_tf_pq = Instant::now();
+    ternary_transformer_step_pq_into(
+        &p_x,
+        &p_ones_d,
+        &w_dd,
+        &w_dd,
+        &w_dd,
+        &w_dd,
+        &p_ones_d,
+        &w_dh,
+        &w_dh,
+        &w_hd,
+        aligned_dim,
+        hidden_dim,
+        0,
+        &mut p_k_cache,
+        &mut p_v_cache,
+        &mut ps_norm,
+        &mut ps_q,
+        &mut ps_k,
+        &mut ps_v,
+        &mut ps_attn,
+        &mut ps_scores,
+        &mut ps_gate,
+        &mut ps_up,
+        &mut ps_i64,
+        &mut p_tf_out,
+    );
+    let tf_pq_us = t_tf_pq.elapsed().as_nanos() as f64 / 1000.0;
+
+    // wupz (wild + UPX + zig) Pack-in-Pass & QuantTern receipts on the quantized sections
+    let wupz_b158_fold = wupz_xor_fold(&w_dd);
+    let wupz_b158_pop = wupz_popcount(&w_dd);
+    let wupz_qt_fold = wupz_xor_fold_u64(&w_pos_u64) ^ wupz_xor_fold_u64(&w_neg_u64);
+    let wupz_qt_active = wupz_bitplane_popcount_u64(&w_pos_u64, &w_neg_u64);
+    let wupz_sections = [
+        WupzSectionDesc {
+            id: 0,
+            name: b".rodata.gaia.b158",
+            addr: 0x1000,
+            len: w_dd.len() as u64,
+            hash: wupz_b158_fold,
+        },
+        WupzSectionDesc {
+            id: 1,
+            name: b".rodata.gaia.quantum_u64",
+            addr: 0x5000,
+            len: ((w_pos_u64.len() + w_neg_u64.len()) * 8) as u64,
+            hash: wupz_qt_fold,
+        },
+    ];
+    let wupz_blocks = [
+        WupzBlockDesc { index: 0, covers: &[0] },
+        WupzBlockDesc { index: 1, covers: &[1] },
+    ];
+    let wupz_plan_len = wupz_plan_image_len(&wupz_sections, &wupz_blocks);
+    let mut wupz_plan_buf = vec![0u8; wupz_plan_len];
+    let _ = wupz_pack_plan_into(&wupz_sections, &wupz_blocks, &mut wupz_plan_buf);
+    let wupz_digest = wupz_plan_digest(WUPZ_DEFAULT_WINDOW_SIZE, &wupz_sections, &wupz_blocks);
+    let f_pq_bench = fold_pq("alexiai · wupz · gaia-mlx-quant", None);
+    let qt_bench = fold_to_quant_tern_pq(&f_pq_bench);
+    let _ = wupz_bitplane_diff_u64(&w_pos_u64, &w_neg_u64, &w_pos_u64, &w_neg_u64);
+
     format!(
-        r#"{{"dim":{dim},"bitsPerWeight":1.585,"bytesPacked":{},"bytesFloat64":{},"compression":{:.2},"relativeError":{:.4},"mlxRust":{{"engine":"gaia-mlx-quant (100% safe no_std Rust · zero heap allocs · p/q + BFP-64 integer engine)","denseMicros":{:.2},"b158JMajorMicros":{:.2},"b158IMajorMicros":{:.2},"pqB158IMajorMicros":{:.2},"pqWideSimdMicros":{:.2},"pqWideSimdErrVsTernary":{:.2e},"bfpVariants":{{"i8MantissaI16AccMicros":{:.2},"i8RelErrVsTernary":{:.2e},"i16MantissaI32AccMicros":{:.2},"i16RelErrVsTernary":{:.2e},"mem8AdaptiveMicros":{:.2},"mem8RelErrVsTernary":{:.2e},"mem8PromotedBlocks":{promoted_blocks},"mem8TotalBlocks":{total_blocks}}},"group64":{{"compressionVsF32":{:.2},"packedBytes":{},"micros":{:.2},"pqMicros":{:.2},"relativeError":{:.4}}},"mergeQ":{{"intermediateBytes":0,"micros":{:.2},"relativeError":{:.4}}},"maybeStochastic":{{"micros":{:.2}}},"gatherQmmMoE":{{"experts":4,"topK":2,"micros":{:.2},"pqMicros":{:.2}}},"ternaryTransformerBlock":{{"dim":{aligned_dim},"hiddenDim":{hidden_dim},"layerMicros":{:.2},"estTokPerSec16Layer":{:.1}}}}}}}"#,
+        r#"{{"dim":{dim},"version":"0.3.0","bitsPerWeight":1.585,"bytesPacked":{},"bytesFloat64":{},"compression":{:.2},"relativeError":{:.4},"relativeErrorPpm":{},"wupz":{{"abiVersion":{WUPZ_ABI_VERSION},"magic":"WUPZ","planBytes":{wupz_plan_len},"planDigest":"0x{wupz_digest:016x}","b158XorFold":"0x{wupz_b158_fold:016x}","b158PopcountBits":{wupz_b158_pop},"quantumActiveTrits":{wupz_qt_active},"quantTern":"{}"}},"mlxRust":{{"engine":"gaia-mlx-quant v0.3.0 (100% safe no_std Rust · zero heap allocs · ULTRA-SUPER-OMNI-Quantum Ternary, wupz & p/q zero-float substrate)","denseMicros":{:.2},"b158JMajorMicros":{:.2},"b158IMajorMicros":{:.2},"pqB158IMajorMicros":{:.2},"pqWideSimdMicros":{:.2},"pqPlanesI64Micros":{:.2},"pqSimdI8ZeroFloatMicros":{:.2},"quantumB158U64Micros":{:.2},"quantumBitplaneI4Micros":{:.2},"omniBfpI8PqMicros":{:.2},"bfpI8Group64Micros":{:.2},"bfpI16Group64Micros":{:.2},"bfpAdaptiveMem8Micros":{:.2},"group64":{{"compressionVsF32":{:.2},"packedBytes":{},"micros":{:.2},"pqMicros":{:.2},"pqI64ZeroFloatMicros":{:.2},"relativeError":{:.4}}},"mergeQ":{{"intermediateBytes":0,"micros":{:.2},"pqZeroFloatMicros":{:.2},"relativeError":{:.4}}},"maybeStochastic":{{"micros":{:.2}}},"gatherQmmMoE":{{"experts":4,"topK":2,"micros":{:.2}}},"ternaryTransformerBlock":{{"dim":{aligned_dim},"hiddenDim":{hidden_dim},"layerMicros":{:.2},"pqZeroFloatLayerMicros":{:.2},"estTokPerSec16Layer":{:.1}}}}}}}"#,
         packed.len(),
         w.len() * 8,
         compression,
         err,
+        pq_err_ppm,
+        qt_bench.as_str(),
         dense_us,
         b158_us,
         imajor_us,
         pq_b158_us,
         pq_simd_us,
-        pq_simd_err_vs_ternary,
+        pq_planes_us,
+        pq_simd_i8_us,
+        quantum_u64_us,
+        quantum_i4_us,
+        omni_bfp_i8_pq_us,
         bfp_i8_us,
-        bfp_i8_err,
         bfp_i16_us,
-        bfp_i16_err,
         bfp_mem8_us,
-        bfp_mem8_err,
         MLX_GROUP64_COMPRESSION,
         mlx_q.packed_bytes(),
         g64_us,
         pq_g64_us,
+        pq_g64_i64_us,
         g64_err,
         mergeq_us,
+        pq_mergeq_us,
         mergeq_err,
         maybe_us,
         moe_us,
-        moe_pq_us,
         tf_us,
+        tf_pq_us,
         tok_per_sec_16_layers
     )
 }
@@ -490,10 +666,13 @@ fn handle_connection(mut stream: std::net::TcpStream, adapter: &Osarous) -> Resu
                 Some(rf) => gaia_mlx_quant::fold_spectrum(&prompt, rf, seed),
                 None => fold(&prompt, seed),
             };
+            let f_pq = fold_pq(&prompt, seed);
+            let qt = fold_to_quant_tern_pq(&f_pq);
+            let wupz_fold = wupz_xor_fold(prompt.as_bytes());
             let s = sampling(&f);
             let a = affect(&f, &prompt);
             let json = format!(
-                r#"{{"seed":{},"layers":{{"gravity":{},"entropy":{},"weather":{},"resonance":{}}},"dominant":"{}","coherence":{},"affect":{{"mood":"{}","valence":{:.4},"arousal":{:.4}}},"sampling":{{"temperature":{},"top_p":{},"top_k":{},"seed":{}}}}}"#,
+                r#"{{"seed":{},"layers":{{"gravity":{},"entropy":{},"weather":{},"resonance":{}}},"dominant":"{}","coherence":{},"affect":{{"mood":"{}","valence":{:.4},"arousal":{:.4}}},"quantTern":{{"tag":"{}","byte":{},"trits":[{},{},{}],"magnitude":{}}},"wupz":{{"abiVersion":{WUPZ_ABI_VERSION},"xorFold":"0x{wupz_fold:016x}"}},"sampling":{{"temperature":{},"top_p":{},"top_k":{},"seed":{}}}}}"#,
                 f.seed,
                 f.gravity,
                 f.entropy,
@@ -504,10 +683,33 @@ fn handle_connection(mut stream: std::net::TcpStream, adapter: &Osarous) -> Resu
                 json_escape(a.mood),
                 a.valence,
                 a.arousal,
+                qt.as_str(),
+                qt.byte,
+                qt.trits[0],
+                qt.trits[1],
+                qt.trits[2],
+                qt.magnitude,
                 s.temperature,
                 s.top_p,
                 s.top_k,
                 s.seed
+            );
+            write_response(&mut stream, 200, "application/json", json.as_bytes())
+        }
+        ("GET", "/api/wupz") => {
+            let target = query_param(&query, "prompt").unwrap_or_default();
+            let report = mcp::run_wupz_tool(&target);
+            let f_pq = fold_pq(&target, None);
+            let qt = fold_to_quant_tern_pq(&f_pq);
+            let fold_hex = wupz_xor_fold(target.as_bytes());
+            let json = format!(
+                r#"{{"ok":true,"abiVersion":{WUPZ_ABI_VERSION},"magic":"WUPZ","quantTern":"{}","byte":{},"trits":[{},{},{}],"xorFold":"0x{fold_hex:016x}","report":{}}}"#,
+                qt.as_str(),
+                qt.byte,
+                qt.trits[0],
+                qt.trits[1],
+                qt.trits[2],
+                json_escape_text(&report),
             );
             write_response(&mut stream, 200, "application/json", json.as_bytes())
         }
@@ -573,13 +775,14 @@ fn handle_connection(mut stream: std::net::TcpStream, adapter: &Osarous) -> Resu
                 .collect::<Vec<_>>()
                 .join(",");
             let json = format!(
-                r#"{{"stDaemonUp":{},"stDaemonLatencyMs":{},"stEndpoint":"{}","stBinary":{},"crabccBinary":{},"ontologyReady":{},"tools":[{tools}]}}"#,
+                r#"{{"stDaemonUp":{},"stDaemonLatencyMs":{},"stEndpoint":"{}","stBinary":{},"crabccBinary":{},"ontologyReady":{},"wupzReady":{},"wupzAbiVersion":{WUPZ_ABI_VERSION},"tools":[{tools}]}}"#,
                 st.st_daemon_up,
                 st.st_daemon_latency_ms,
                 mcp::ST_DAEMON_URL,
                 st.st_binary.map(|s| json_escape_text(&s)).unwrap_or_else(|| "null".to_string()),
                 st.crabcc_binary.map(|s| json_escape_text(&s)).unwrap_or_else(|| "null".to_string()),
                 st.ontology_ready,
+                st.wupz_ready,
             );
             write_response(&mut stream, 200, "application/json", json.as_bytes())
         }
@@ -654,8 +857,11 @@ fn handle_chat(stream: &mut std::net::TcpStream, adapter: &Osarous, body: &str) 
         )
         .map_err(|e| e.to_string())?;
 
+    let f_pq = fold_pq(&prompt, None);
+    let qt = fold_to_quant_tern_pq(&f_pq);
+    let wupz_fold = wupz_xor_fold(prompt.as_bytes());
     let gaia_frame = format!(
-        "event: gaia\ndata: {{\"field\":{{\"seed\":{},\"layers\":{{\"gravity\":{},\"entropy\":{},\"weather\":{},\"resonance\":{}}},\"dominant\":\"{}\",\"coherence\":{},\"affect\":{{\"mood\":\"{}\",\"valence\":{:.4},\"arousal\":{:.4}}}}},\"sampling\":{{\"temperature\":{},\"top_p\":{},\"top_k\":{},\"seed\":{}}}}}\n\n",
+        "event: gaia\ndata: {{\"field\":{{\"seed\":{},\"layers\":{{\"gravity\":{},\"entropy\":{},\"weather\":{},\"resonance\":{}}},\"dominant\":\"{}\",\"coherence\":{},\"affect\":{{\"mood\":\"{}\",\"valence\":{:.4},\"arousal\":{:.4}}},\"quantTern\":{{\"tag\":\"{}\",\"byte\":{},\"trits\":[{},{},{}],\"magnitude\":{}}},\"wupz\":{{\"abiVersion\":{WUPZ_ABI_VERSION},\"xorFold\":\"0x{wupz_fold:016x}\"}}}},\"sampling\":{{\"temperature\":{},\"top_p\":{},\"top_k\":{},\"seed\":{}}}}}\n\n",
         f.seed,
         f.gravity,
         f.entropy,
@@ -666,6 +872,12 @@ fn handle_chat(stream: &mut std::net::TcpStream, adapter: &Osarous, body: &str) 
         json_escape(a.mood),
         a.valence,
         a.arousal,
+        qt.as_str(),
+        qt.byte,
+        qt.trits[0],
+        qt.trits[1],
+        qt.trits[2],
+        qt.magnitude,
         s.temperature,
         s.top_p,
         s.top_k,
