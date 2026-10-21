@@ -321,6 +321,16 @@ struct KernelTests {
         let highPq = GaiaMLXQuant.foldSpectrumPq(prompt, rfEntropyBitsPq: Int32(q * 4))
         #expect(lowPq.seed == highPq.seed)
         #expect(highPq.entropyPq > lowPq.entropyPq)
+
+        var wPos = [UInt64](repeating: 0, count: cols)
+        var wNeg = [UInt64](repeating: 0, count: cols)
+        var xPos = [UInt64](repeating: 0, count: 1)
+        var xNeg = [UInt64](repeating: 0, count: 1)
+        GaiaMLXQuant.packQuantumBitplanesIMajor(trits, rows: rows, cols: cols, wPosU64: &wPos, wNegU64: &wNeg)
+        let sx = GaiaMLXQuant.quantizeQuantumActPq(pX, xPosU64: &xPos, xNegU64: &xNeg)
+        var qOut = [Int64](repeating: 0, count: cols)
+        GaiaMLXQuant.quantumBitplaneMatMulPq(wPosU64: wPos, wNegU64: wNeg, rows: rows, cols: cols, xPosU64: xPos, xNegU64: xNeg, pScaleX: sx, into: &qOut)
+        #expect(qOut.contains { $0 != 0 })
     }
 }
 #endif

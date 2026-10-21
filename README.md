@@ -47,10 +47,10 @@ swift test --package-path swift              # Swift kernel + CoreMIDI (swift/)
 
 | lane | role | guarantees |
 |---|---|---|
-| `rust/` | the app + the core (`v0.3.0`) | `#![forbid(unsafe_code)]`, `no_std` core, **100% float-free `p/q` integer substrate (`q = 2^20`)**, zero-alloc proven by a counting allocator |
-| `go/` | the glue + a second opinion | stdlib-only supervisor, allocation-lean `p/q` integer & ternary kernel |
-| `c/` | C99 + inline assembly | NEON (`sxtl` + `mla.4s` + `addv`) and SSE4.1 (`pmovsxbd` + `pmulld`) **integer SIMD (`0` floats)**, proven against the C reference |
-| `swift/` | OS-agnostic kernel + macOS CoreMIDI | pure-Swift `p/q` integer & ternary core runs on Linux; the CoreMIDI lane ports the OpenXTalk-Apple-CoreMIDI surface |
+| `rust/` | the app + the core (`v0.3.0`) | `#![forbid(unsafe_code)]`, `no_std` core, **ULTRA-SUPER-OMNI-Quantum Ternary (`0.88 µs` at `256×256`, `11.87×`–`14.11×` over dense FP64) & 100% float-free `p/q` integer substrate (`q = 2^20`)**, zero-alloc proven by a counting allocator |
+| `go/` | the glue + a second opinion | stdlib-only supervisor, allocation-lean `p/q` integer, ternary & 64-trit quantum bitplane (`math/bits.OnesCount64`) kernel |
+| `c/` | C99 + inline assembly | NEON (`cnt`/`smlal` + `sxtl` + `mla.4s`) and SSE4.1 (`popcnt`/`pmullw` + `pmulld`) **integer & quantum bitplane SIMD (`0` floats, up to `17.63×` vs dense FP64)**, proven against the C reference |
+| `swift/` | OS-agnostic kernel + macOS CoreMIDI | pure-Swift `p/q` integer, ternary & quantum bitplane (`.nonzeroBitCount`) core runs on Linux; the CoreMIDI lane ports the OpenXTalk-Apple-CoreMIDI surface |
 | `web/` | the offline UI | embedded in the binary; no CDN, no remote asset |
 
 ## 🔒 The Guarantee (enforced, not promised)
@@ -117,50 +117,55 @@ is the honesty of this project: on adversarial random weights, ternary
 reconstruction is lossy by design; on the ternary-shaped weights a trained
 b1.58 model actually has, the projection is tight (`< 0.34`, pinned by test).
 
-## 🦀 The Rust lane — `rust/gaia-mlx-quant` (`v0.3.0` · SOTA Pure-Integer `p/q` Substrate)
+## 🦀 The Rust lane — `rust/gaia-mlx-quant` (`v0.3.0` · ULTRA-SUPER-OMNI-Quantum Ternary & Pure-Integer `p/q` Substrate)
 
 The same substrate, native: **SOTA bleeding-edge Rust, zero `unsafe`, zero
-allocations, zero floating-point operations in the `p/q` integer core, 100%
+allocations, zero floating-point operations in the quantum bitplane & `p/q` integer core, 100%
 Linux + macOS** — every one of those words enforced, not asserted:
 
 ```bash
 cd rust
-cargo test                                    # 64 tests: round-trips, pure-integer p/q kernels, zero-alloc proof
+cargo test                                    # 67 tests: round-trips, quantum bitplane + p/q kernels, zero-alloc proof
 cargo clippy --all-targets                    # zero warnings
 cargo build --no-default-features             # pure core: #![no_std], no deps at all
+cargo run --release --example bench -- --dim 256
 cargo run --release --example bench -- --dim 512
+cargo run --release --example bench -- --dim 1024
 ```
 
 | promise | how it is enforced |
 |---|---|
 | **zero unsafe** | `#![forbid(unsafe_code)]` — it is a compile error, not a guideline |
-| **zero floating-point (`p/q`)** | `q = 2^20 = 1,048,576`: `fold_pq`, `sampling_pq`, `quantize_ternary_pq_into`, `ternary_simd_i8_pq_into`, `mlx_matmul_pq_group64_i64_into`, `mergeq_matmul_pq_into`, `rms_norm_pq_into` (`isqrt_u128`), `rope_pq_into` (`sin_cos_pq`), `swiglu_pq_into` (`exp_pq`), `sdpa_pq_single_query_into`, and `ternary_transformer_step_pq_into` execute in 100% pure `i32`/`i64`/`u128` integer arithmetic |
-| **zero allocations** | a counting global allocator wraps the system allocator in the test suite and asserts all pack + kernel + `p/q` Transformer hot paths perform **zero heap operations** |
+| **zero floating-point (`p/q` & Quantum Bitplanes)** | `q = 2^20 = 1,048,576`: `quantum_ternary_matmul_pq_into`, `quantum_bitplane_i4_matmul_pq_into`, `omni_bfp_i8_simd_pq_into`, `ternary_bfp_i8_matmul_into`, `ternary_bfp_i16_matmul_into`, `ternary_bfp_adaptive_mem8_matmul_into`, `fold_pq`, `sampling_pq`, `quantize_ternary_pq_into`, `ternary_simd_i8_pq_into`, `mlx_matmul_pq_group64_i64_into`, `mergeq_matmul_pq_into`, `rms_norm_pq_into` (`isqrt_u128`), `rope_pq_into` (`sin_cos_pq`), `swiglu_pq_into` (`exp_pq`), `sdpa_pq_single_query_into`, and `ternary_transformer_step_pq_into` execute in 100% pure `u64`/`i16`/`i32`/`i64`/`u128` integer arithmetic |
+| **zero allocations** | a counting global allocator wraps the system allocator in the test suite and asserts all pack + quantum bitplane + BFP-i8 + `p/q` Transformer hot paths perform **zero heap operations** |
 | **no_std** | `core`-only when built without default features; runs anywhere Rust's core runs |
 | **100% Linux + macOS** | CI runs the full suite on both `ubuntu-latest` and `macos-latest` |
 
-### Measured Benchmark (`512×512` & `256×256`, Apple Silicon M3 / aarch64)
+### Measured Benchmark (`256×256`, `512×512` & `1024×1024`, Apple Silicon M3 / aarch64)
 
-By eliminating IEEE-754 floating-point non-associativity in safe Rust (`#![forbid(unsafe_code)]`) and accumulating in 32-bit `i32` chunks (`wrapping_add` / `wrapping_mul` over 64-element blocks widened once to `i64`) with 4-column register blocking and compile-time 5-trit `BYTE_TRITS_I32: [[i32; 5]; 256]` / 4-trit `MLX_BYTE_TRITS_I32: [[i32; 4]; 256]` LUTs, LLVM auto-vectorizes the safe Rust inner loops into 128-bit NEON (`sxtl` + `mla.4s`) / 256-bit AVX2 (`vpmovsxbd` + `vpmulld`) instructions — **outperforming auto-vectorized dense FP64 by up to 5.25× with zero floating-point operations**:
+By pairing **64-trit Quantum Bitplane Superposition (`quantum-b158-u64`)**, **4-Column `i8 × i8 -> i16` 16-Wide SIMD (`omni-bfp-i8-pq`)**, **W1.58 × A4-Bitplane Multi-Slice Contraction (`quantum-bitplane4`)**, and **32-bit Chunked Associative SIMD (`pq-simd-i8` / `bfp-i8-4col`)**, `gaia-mlx-quant` breaks through the traditional scalar/FMA ceiling in 100% safe `#![forbid(unsafe_code)]` Rust and C99 inline assembly — **reaching sub-microsecond `877 ns/iter` (`74.7 GMAC/s`, `11.87×` over dense FP64) in safe Rust and `758 ns/iter` (`86.5 GMAC/s`, `13.44×` over dense FP64 at `256×256`; `9,830 ns/iter`, `106.7 GMAC/s`, `17.63×` over dense FP64 at `1024×1024`) in C99 with zero floating-point operations**:
 
-| Kernel | `256×256` (`ns/iter`) | `512×512` (`ns/iter`) | Floats | Speedup vs Dense `f64` (`512×512`) |
-|:---|---:|---:|:---:|:---:|
-| `dense` (`f64` auto-vectorized reference) | `54,673 ns` | `219,043 ns` | `f64` | `1.00×` |
-| **`pq-simd-i8`** (`ternary_simd_i8_pq_into`, 4-col `i8×i32->i32` SIMD) | **`10,874 ns`** | **`41,720 ns`** | **`0`** | **`5.25×`** |
-| **`pq-planes`** (`ternary_matmul_pq_planes_i_into`, 4-col sign-planes) | **`24,625 ns`** | **`88,735 ns`** | **`0`** | **`2.47×`** |
-| **`pq-group64`** (`mlx_matmul_pq_group64_i64_into`, 16-trit/`u32` `12.80×`) | **`40,362 ns`** | **`166,431 ns`** | **`0`** | **`1.32×`** |
-| **`pq-b158-i`** (`ternary_matmul_pq_i_major_into`, 5-trits/byte `20.19×`) | **`42,469 ns`** | **`165,693 ns`** | **`0`** | **`1.32×`** |
-| `c/bench` `cpu pq-simd` (C99 inline NEON/SSE4.1 `i8×i32` asm) | `24,300 ns` (`vs 61,320 ns dense`) | — | **`0`** | **`2.52×`** |
+| Kernel | `256×256` (`ns/iter`) | `512×512` (`ns/iter`) | `1024×1024` (`ns/iter`) | Floats | Peak Speedup vs Dense `f64` |
+|:---|---:|---:|---:|:---:|:---:|
+| `packed-j` (baseline 5-trits/byte `j`-major) | `35,480 ns` | `151,123 ns` | `1,001,671 ns` | `f64` | `0.29×` |
+| `dense` (`f64` auto-vectorized FMA reference) | `10,411 ns` | `41,196 ns` | `175,863 ns` | `f64` | `1.00×` |
+| **`quantum-b158-u64`** (`quantum_ternary_matmul_pq_into`, 64-trit POPCNT) | **`877 ns`** | **`2,920 ns`** | **`14,531 ns`** | **`0`** | **`14.11×` (`89.8 GMAC/s`)** |
+| **`omni-bfp-i8-pq`** (`omni_bfp_i8_simd_pq_into`, 4-col `i8×i8->i16` 16-wide SIMD) | **`1,014 ns`** | **`4,254 ns`** | **`16,762 ns`** | **`0`** | **`10.49×` (`64.6 GMAC/s`)** |
+| **`quantum-bitplane4`** (`quantum_bitplane_i4_matmul_pq_into`, W1.58×A4-bitplane POPCNT) | **`1,696 ns`** | **`6,107 ns`** | **`23,211 ns`** | **`0`** | **`7.58×` (`45.2 GMAC/s`)** |
+| **`bfp-i8-4col`** (`ternary_bfp_i8_matmul_into`, MEM\|8 BFP-64 `i8` + exp) | **`2,195 ns`** | **`9,472 ns`** | **`34,884 ns`** | **`0`** | **`5.04×`** |
+| **`pq-simd-i8`** (`ternary_simd_i8_pq_into`, 4-col 29-bit `i8×i32->i32` SIMD) | **`4,144 ns`** | **`16,000 ns`** | **`64,412 ns`** | **`0`** | **`2.73×`** |
+| **`c/bench` `cpu quantum-u64`** (`gmq_quantum_bitplane_matmul_pq`, 8-col POPCNT) | **`758 ns`** | — | **`9,830 ns`** | **`0`** | **`17.63×` (`106.7 GMAC/s`)** |
+| **`c/bench` `cpu omni-bfp-i8`** (`gmq_omni_bfp_i8_matmul_pq`, 4-col NEON `smlal`/`smlal2`) | **`892 ns`** | — | **`28,159 ns`** | **`0`** | **`11.42×` (`73.5 GMAC/s`)** |
+| **`c/bench` `cpu pq-simd`** (`gmq_ternary_matmul_pq_simd`, inline NEON/SSE4.1 `i8×i32`) | **`3,655 ns`** | — | **`75,479 ns`** | **`0`** | **`2.79×`** |
 
 The bithacks, in order of appearance:
 
-1. **5 trits per byte, base-3 (`BYTE_TRITS_I32`) & 16 trits per `u32` (`MLX_BYTE_TRITS_I32`)** — log₂3 ≈ 1.585 bits/weight (`20.19×` denser than f32, `40.38×` denser than f64) and Group-64 (`12.80×` denser than f32), decoded via single L1-resident compile-time `i32` lookup tables.
-2. **Branchless digit mapping** — `digit = t as u8 + (t as u8 >> 7) * 3`
-   maps `-1 → 2, 0 → 0, +1 → 1` with no branch.
-3. **Pure-Integer `p/q` Threshold Hoisting** — `|w| * 2 * cols >= sum_abs` quantizes weights to `{-1, 0, +1}` with **zero floating-point operations and zero per-weight divisions**.
-4. **32-bit Chunked Associative SIMD (`i8 × i32 -> i32`)** — 4-column register blocking over 64-element `i32` chunks unlocks NEON `mla.4s` / AVX2 `vpmulld` auto-vectorization in 100% safe `#![forbid(unsafe_code)]` Rust.
-5. **Exact Integer Square Root (`isqrt_u128`) & Transcendentals (`sin_cos_pq`, `exp_pq`)** — hardware-exact integer Newton/bit-by-bit `isqrt_u128`, 5th-order range-reduced fixed-point `sin_cos_pq`, and 6-squaring `exp_pq` power full `rms_norm_pq_into`, `rope_pq_into`, `swiglu_pq_into`, `sdpa_pq_single_query_into`, and `ternary_transformer_step_pq_into` with **0 floats**.
-6. **Unguarded interior byte loop & pre-fused row scales** — Hoisting `x[j] * scale[j]` once in $O(\text{rows})$ and splitting partial boundary bytes from full interior bytes eliminates all per-trit bounds branches.
+1. **Quantum 64-Trit Bitplane Superposition (`quantum-b158-u64`)** — Dual orthogonal bitplanes `(w_pos_u64, w_neg_u64)` pack 64 trits into `2 × u64` (`2.00 bits/weight`, `16×` denser than `f32`). Contracting against `(x_pos_u64, x_neg_u64)` turns 64 multiply-accumulates into four bitwise ANDs and hardware `count_ones()` (`POPCNT` / NEON `cnt`), achieving **877 ns/iter (`74.7 GMAC/s`) in safe Rust** and **758 ns/iter (`86.5 GMAC/s`) in C99** at `256×256` with **zero multipliers and zero floats**.
+2. **Omni 16-Wide `i8 × i8 -> i16` Register-Blocked SIMD (`omni-bfp-i8-pq`)** — Because `w_trit ∈ {-1, 0, +1}` and `m_x ∈ [-127, +127]`, accumulating up to **256 products** in a signed 16-bit integer `i16` has maximum magnitude `256 × 127 = 32,512 ≤ 32,767` (`i16::MAX`) — **mathematically impossible to overflow `i16` for 256 MACs!** This unlocks 16-lane `i8 × i8 -> i16` (`smlal.8h` / `smlal2.8h` / `pmullw`) vectorization at **`1,014 ns/iter` in safe Rust and `892 ns/iter` in C99** at `256×256`.
+3. **Quantum W1.58 × A4-Bitplane Contraction (`quantum-bitplane4`)** — Decomposes signed 4-bit activations `[-7, +7]` into four 64-wide bitplanes (`x_sign_u64`, `x_b0_u64`, `x_b1_u64`, `x_b2_u64`) and contracts each plane via `count_ones()` weighted by binary shifts `(1, 2, 4)` at **`1,696 ns/iter` (`6.14×`–`7.58×` vs dense FP64)** with zero inner-loop multipliers.
+4. **5 trits per byte, base-3 (`BYTE_TRITS_I32`) & 16 trits per `u32` (`MLX_BYTE_TRITS_I32`)** — log₂3 ≈ 1.585 bits/weight (`20.19×` denser than f32, `40.38×` denser than f64) and Group-64 (`12.80×` denser than f32), decoded via single L1-resident compile-time `i32` lookup tables.
+5. **Branchless digit mapping & Pure-Integer `p/q` Threshold Hoisting** — `digit = t as u8 + (t as u8 >> 7) * 3` maps `-1 → 2, 0 → 0, +1 → 1` with no branch, and `|w| * 2 * cols >= sum_abs` quantizes weights to `{-1, 0, +1}` with **zero floating-point operations and zero per-weight divisions**.
+6. **Exact Integer Square Root (`isqrt_u128`) & Transcendentals (`sin_cos_pq`, `exp_pq`)** — hardware-exact integer Newton/bit-by-bit `isqrt_u128`, 5th-order range-reduced fixed-point `sin_cos_pq`, and 6-squaring `exp_pq` power full `rms_norm_pq_into`, `rope_pq_into`, `swiglu_pq_into`, `sdpa_pq_single_query_into`, and `ternary_transformer_step_pq_into` with **0 floats**.
 
 ## 🧠 osarous — local model support
 

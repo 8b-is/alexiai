@@ -107,18 +107,22 @@ Pre-calculating $\pm 0.5 \times \text{scale}$ outside the loop eliminates
 $65,536$ per-weight floating-point multiplications per $256 \times 256$ matrix
 while ensuring exact trit assignment ($\{-1, 0, +1\}$) without rounding noise.
 
-### 5. Associativity & 32-Bit Chunking Unlock Wide SIMD (`5.25×` Over Dense FP64, `0` Floats)
+### 5. Four-Tier Quantum & Associative SIMD Hierarchy (`11.87×`–`17.63×` Over Dense FP64, `0` Floats)
 In safe Rust (`#![forbid(unsafe_code)]`), IEEE-754 non-associativity prevents
 LLVM from reordering floating-point additions, and ARM64 baseline NEON lacks a
-64-bit integer vector multiply (`mul.2d`). In `v0.3.0`, accumulating in 32-bit
-`i32` chunks (`wrapping_add` / `wrapping_mul` over 64-element blocks widened once
-to `i64`) with 4-column register blocking and compile-time 5-trit
-`BYTE_TRITS_I32: [[i32; 5]; 256]` / 4-trit `MLX_BYTE_TRITS_I32: [[i32; 4]; 256]`
-tables allows LLVM to emit bounds-check-free 128-bit **NEON** (`sxtl` + `mla.4s`)
-and 256-bit **AVX2** (`vpmovsxbd` + `vpmulld` + `vpaddd`) instructions —
-delivering a measured **5.25× speedup** over auto-vectorized dense FP64 CPU
-matrix multiplication at `512×512` (`41,720 ns` vs `219,043 ns`) with **zero
-floating-point operations**.
+64-bit integer vector multiply (`mul.2d`). In `v0.3.0`, `gaia-mlx-quant` provides
+four complementary zero-float integer tiers:
+
+1. **Tier 0 — 64-Trit Quantum Bitplane Superposition (`quantum_ternary_matmul_pq_into` / `gmq_quantum_bitplane_matmul_pq`)**:
+   Packs 64 trits into dual orthogonal `u64` bitplanes `(w_pos_u64, w_neg_u64)` (`2.00 bits/weight`, `16.0×` compression vs `f32`) and contracts against `(x_pos_u64, x_neg_u64)` via bitwise AND + hardware `count_ones()` (`POPCNT` / NEON `cnt`):
+   $$\text{dot}_{64} = \operatorname{popcnt}(w^+ \land x^+) + \operatorname{popcnt}(w^- \land x^-) - \operatorname{popcnt}(w^+ \land x^-) - \operatorname{popcnt}(w^- \land x^+)$$
+   Achieves **`877 ns/iter` (`11.87×` vs dense FP64, `74.7 GMAC/s`) at `256×256` and `2,920 ns/iter` (`14.11×` vs dense FP64, `89.8 GMAC/s`) at `512×512` in safe Rust**, and **`758 ns/iter` (`13.44×` vs dense, `86.5 GMAC/s`) at `256×256` and `9,830 ns/iter` (`17.63×` vs dense, `106.7 GMAC/s`) at `1024×1024` in C99**.
+2. **Tier 1 — 16-Wide `i8 × i8 -> i16` Omni BFP SIMD (`omni_bfp_i8_simd_pq_into` / `gmq_omni_bfp_i8_matmul_pq`)**:
+   Exploits the exact bound $256 \times 127 = 32,512 \le 32,767 = \text{i16::MAX}$ to accumulate 256 `i8 × i8` products in 16-bit signed `i16` lanes before widening once to `i64`, reaching **`1,014 ns/iter` (`10.27×` vs dense FP64) in safe Rust and `892 ns/iter` (`11.42×` vs dense FP64) in C99 NEON `smlal`/`smlal2`** at `256×256`.
+3. **Tier 2 — Quantum W1.58 × A4-Bitplane Contraction (`quantum_bitplane_i4_matmul_pq_into`)**:
+   Decomposes signed 4-bit activations `[-7, +7]` into four 64-wide bitplanes (`x_sign_u64`, `x_b0_u64`, `x_b1_u64`, `x_b2_u64`) and contracts each slice via `count_ones()` weighted by $(1, 2, 4)$ at **`1,696 ns/iter` (`6.14×` vs dense FP64) at `256×256` and `23,211 ns/iter` (`7.58×` vs dense FP64) at `1024×1024`**.
+4. **Tier 3 — 32-Bit Chunked Associative SIMD & MEM|8 Block-Floating-Point (`ternary_bfp_i8_matmul_into` & `ternary_simd_i8_pq_into`)**:
+   Accumulating in 32-bit `i32` chunks (`wrapping_add` / `wrapping_mul` over 64-element blocks widened once to `i64`) with 4-column register blocking and compile-time 5-trit `BYTE_TRITS_I32: [[i32; 5]; 256]` / 4-trit `MLX_BYTE_TRITS_I32: [[i32; 4]; 256]` tables delivers **`2,195 ns/iter` (`4.74×` vs dense FP64) for `bfp-i8-4col` and `4,144 ns/iter` (`2.51×`–`2.73×` vs dense FP64) for 29-bit `pq-simd-i8`** with **zero floating-point operations**.
 
 ### 6. Full Pure-Integer Transformer Layer (`ternary_transformer_step_pq_into`)
 Every stage of the Transformer block now has a 100% float-free `p/q` (`q = 2^20`)

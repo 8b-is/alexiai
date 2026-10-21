@@ -319,11 +319,14 @@ fn pq_rational_and_integer_numerator_kernels_match_float_to_1e6() {
 #[test]
 fn pure_integer_pq_mlx_and_transformer_primitives_operate_with_zero_floats() {
     use gaia_mlx_quant::{
-        exp_pq, gather_qmm_pq_into, maybe_matmul_pq_into, mergeq_matmul_pq_into,
-        mlx_dequantize_group64_pq_into, mlx_matmul_pq_group64_i64_into,
-        mlx_quantize_group64_pq_into, quantize_pq_adaptive_into, relative_error_pq_ppm,
-        rms_norm_pq_into, rope_pq_into, sdpa_pq_single_query_into, sin_cos_pq,
-        ste_linear_backward_pq_into, swiglu_pq_into, ternary_transformer_step_pq_into,
+        MLX_GROUP_SIZE, exp_pq, gather_qmm_pq_i64_into, gather_qmm_pq_into, maybe_matmul_pq_into,
+        mergeq_matmul_pq_into, mlx_dequantize_group64_pq_into, mlx_matmul_pq_group64_i64_into,
+        mlx_quantize_group64_pq_into, quantize_bfp_i8_group64_into,
+        quantize_bfp_i8_pq_group64_into, quantize_bfp_i16_group64_into, quantize_pq_adaptive_into,
+        relative_error_pq_ppm, rms_norm_pq_into, rope_pq_into, sdpa_pq_i32_single_query_into,
+        sdpa_pq_single_query_into, sin_cos_pq, ste_linear_backward_pq_into, swiglu_pq_into,
+        ternary_bfp_adaptive_mem8_matmul_into, ternary_bfp_i8_matmul_into,
+        ternary_bfp_i16_matmul_into, ternary_transformer_step_pq_into,
     };
 
     let rows = 16usize;
@@ -336,7 +339,7 @@ fn pure_integer_pq_mlx_and_transformer_primitives_operate_with_zero_floats() {
 
     let mut p_w = vec![0i32; rows * cols];
     let mut p_x = vec![0i32; cols];
-    let q_w = quantize_pq_adaptive_into(&w_f64, &mut p_w);
+    let q_w = quantize_pq_adaptive_into(&w_f64, 22, &mut p_w);
     assert!(q_w >= PQ_DEFAULT_Q);
     quantize_pq_into(&w_f64, PQ_DEFAULT_Q, &mut p_w);
     quantize_pq_into(&x_f64, PQ_DEFAULT_Q, &mut p_x);
@@ -362,7 +365,7 @@ fn pure_integer_pq_mlx_and_transformer_primitives_operate_with_zero_floats() {
 
     let mut moe_scratch = vec![0i64; rows];
     let mut p_y_moe = vec![0i64; rows];
-    gather_qmm_pq_into(
+    gather_qmm_pq_i64_into(
         &p_x,
         &codes,
         &p_scales,
@@ -376,6 +379,24 @@ fn pure_integer_pq_mlx_and_transformer_primitives_operate_with_zero_floats() {
         &mut p_y_moe,
     );
     assert_eq!(p_y_moe, p_y_g64);
+
+    let mut f64_moe_scratch = vec![0.0f64; rows];
+    let mut f64_y_moe = vec![0.0f64; rows];
+    gather_qmm_pq_into(
+        &p_x,
+        PQ_DEFAULT_Q,
+        &codes,
+        &p_scales,
+        PQ_DEFAULT_Q,
+        1,
+        rows,
+        cols,
+        &[0],
+        &[1.0],
+        &mut f64_moe_scratch,
+        &mut f64_y_moe,
+    );
+    assert!(f64_y_moe.iter().any(|&v| v != 0.0));
 
     // Pure-integer sin/cos, exp, RMSNorm, RoPE, SwiGLU, SDPA, STE backward, and Transformer step
     let (s0, c0) = sin_cos_pq(0);
@@ -395,7 +416,7 @@ fn pure_integer_pq_mlx_and_transformer_primitives_operate_with_zero_floats() {
 
     let mut p_scores = vec![0i64; 2];
     let mut p_attn = vec![0i32; dim];
-    sdpa_pq_single_query_into(
+    sdpa_pq_i32_single_query_into(
         &p_rot,
         &p_w[..2 * dim],
         &p_w[2 * dim..4 * dim],
@@ -406,6 +427,56 @@ fn pure_integer_pq_mlx_and_transformer_primitives_operate_with_zero_floats() {
         &mut p_attn,
     );
     assert!(p_scores.iter().all(|&s| s > 0));
+
+    let mut f64_scores = vec![0.0f64; 2];
+    let mut f64_attn = vec![0.0f64; dim];
+    sdpa_pq_single_query_into(
+        &p_rot,
+        &p_w[..2 * dim],
+        &p_w[2 * dim..4 * dim],
+        PQ_DEFAULT_Q,
+        2,
+        dim,
+        &mut f64_scores,
+        &mut f64_attn,
+    );
+    assert!(f64_scores.iter().all(|&s| s > 0.0));
+
+    // Verify BFP-64 (i8, i16, adaptive MEM|8, and pure-integer pq i8)
+    let num_groups = cols.div_ceil(MLX_GROUP_SIZE);
+    let mut m_i8 = vec![0i8; cols];
+    let mut s_i8 = vec![0.0f64; num_groups];
+    let mut m_i16 = vec![0i16; cols];
+    let mut s_i16 = vec![0.0f64; num_groups];
+    let mut m_pq_i8 = vec![0i8; cols];
+    let mut s_pq_i8 = vec![0i32; num_groups];
+    quantize_bfp_i8_group64_into(&x_f64, &mut m_i8, &mut s_i8);
+    quantize_bfp_i16_group64_into(&x_f64, &mut m_i16, &mut s_i16);
+    quantize_bfp_i8_pq_group64_into(&p_x, &mut m_pq_i8, &mut s_pq_i8);
+    assert!(s_pq_i8[0] > 0);
+
+    let trits_bfp: Vec<i8> = (0..cols * rows).map(|i| [-1, 0, 1][(i * 3 + 1) % 3]).collect();
+    let mut y_bfp8 = vec![0.0f64; rows];
+    let mut y_bfp16 = vec![0.0f64; rows];
+    let mut y_bfp_mem8 = vec![0.0f64; rows];
+    let salience: Vec<f64> = (0..rows).map(|j| if j % 2 == 0 { 0.9 } else { 0.1 }).collect();
+    ternary_bfp_i8_matmul_into(&trits_bfp, cols, rows, &m_i8, &s_i8, None, 1.0, &mut y_bfp8);
+    ternary_bfp_i16_matmul_into(&trits_bfp, cols, rows, &m_i16, &s_i16, None, 1.0, &mut y_bfp16);
+    ternary_bfp_adaptive_mem8_matmul_into(
+        &trits_bfp,
+        cols,
+        rows,
+        &m_i8,
+        &s_i8,
+        &m_i16,
+        &s_i16,
+        &salience,
+        0.5,
+        1.0,
+        &mut y_bfp_mem8,
+    );
+    assert!(relative_error(&y_bfp8, &y_bfp16) < 0.02);
+    assert!(relative_error(&y_bfp_mem8, &y_bfp16) < 0.02);
 
     let mut p_grad_x = vec![0i64; cols];
     let mut p_grad_w = vec![0i64; rows * cols];

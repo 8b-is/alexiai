@@ -423,4 +423,105 @@ public enum GaiaMLXQuant {
             coherencePq: coherencePq
         )
     }
+
+    /// Pack j-major trits ([rows, cols]) into column-major 64-trit quantum bitplanes (wPosU64, wNegU64).
+    public static func packQuantumBitplanesIMajor(
+        _ trits: [Int8],
+        rows: Int,
+        cols: Int,
+        wPosU64: inout [UInt64],
+        wNegU64: inout [UInt64]
+    ) {
+        let words = (rows + 63) / 64
+        for i in 0..<cols {
+            for w in 0..<words {
+                var pMask: UInt64 = 0
+                var nMask: UInt64 = 0
+                let jBase = w * 64
+                let jEnd = min(jBase + 64, rows)
+                for b in 0..<(jEnd - jBase) {
+                    let t = trits[(jBase + b) * cols + i]
+                    if t > 0 {
+                        pMask |= (1 << UInt64(b))
+                    } else if t < 0 {
+                        nMask |= (1 << UInt64(b))
+                    }
+                }
+                wPosU64[i * words + w] = pMask
+                wNegU64[i * words + w] = nMask
+            }
+        }
+    }
+
+    /// Quantize integer activations pX into 64-trit quantum bitplanes (xPosU64, xNegU64) + absmean scale (0 floats).
+    public static func quantizeQuantumActPq(
+        _ pX: [Int32],
+        xPosU64: inout [UInt64],
+        xNegU64: inout [UInt64]
+    ) -> Int32 {
+        let n = pX.count
+        let words = (n + 63) / 64
+        for w in 0..<words {
+            xPosU64[w] = 0
+            xNegU64[w] = 0
+        }
+        if n == 0 { return 0 }
+        var sumAbs: Int64 = 0
+        for v in pX {
+            let v64 = Int64(v)
+            sumAbs += v64 < 0 ? -v64 : v64
+        }
+        if sumAbs == 0 { return 0 }
+        let n64 = Int64(n)
+        let twoN = n64 * 2
+        for w in 0..<words {
+            var pm: UInt64 = 0
+            var nm: UInt64 = 0
+            let jBase = w * 64
+            let jEnd = min(jBase + 64, n)
+            for b in 0..<(jEnd - jBase) {
+                let v = Int64(pX[jBase + b])
+                let av = v < 0 ? -v : v
+                if av * twoN >= sumAbs {
+                    if v > 0 {
+                        pm |= (1 << UInt64(b))
+                    } else if v < 0 {
+                        nm |= (1 << UInt64(b))
+                    }
+                }
+            }
+            xPosU64[w] = pm
+            xNegU64[w] = nm
+        }
+        return Int32(clamping: (sumAbs + (n64 >> 1)) / n64)
+    }
+
+    /// 64-trit quantum bitplane POPCNT matmul using hardware `.nonzeroBitCount` (0 floats).
+    public static func quantumBitplaneMatMulPq(
+        wPosU64: [UInt64],
+        wNegU64: [UInt64],
+        rows: Int,
+        cols: Int,
+        xPosU64: [UInt64],
+        xNegU64: [UInt64],
+        pScaleX: Int32,
+        into pOut: inout [Int64]
+    ) {
+        let words = (rows + 63) / 64
+        let sx = Int64(pScaleX)
+        for i in 0..<cols {
+            let base = i * words
+            var acc: Int64 = 0
+            for w in 0..<words {
+                let wp = wPosU64[base + w]
+                let wn = wNegU64[base + w]
+                let xp = xPosU64[w]
+                let xn = xNegU64[w]
+                let posCount = ((wp & xp) | (wn & xn)).nonzeroBitCount
+                let negCount = ((wp & xn) | (wn & xp)).nonzeroBitCount
+                acc += Int64(posCount - negCount)
+            }
+            pOut[i] = acc * sx
+        }
+    }
 }

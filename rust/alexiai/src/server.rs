@@ -27,12 +27,17 @@ const HERO_SVG: &str = include_str!("../../../web/hero-alexandra.svg");
 pub fn run_bench(dim: usize) -> String {
     use std::time::Instant;
     use gaia_mlx_quant::{
-        KERNEL_PQ_Q, MLX_GROUP64_COMPRESSION, MlxQuantizedMatrix, PQ_DEFAULT_Q,
+        KERNEL_PQ_Q, MLX_GROUP_SIZE, MLX_GROUP64_COMPRESSION, MlxQuantizedMatrix, PQ_DEFAULT_Q,
         b158_matmul_pq_i_major_into, dense_matmul, dense_matmul_pq_into, gather_qmm_into,
         maybe_matmul_into, mergeq_matmul_into, mergeq_matmul_pq_into,
-        mlx_matmul_pq_group64_i64_into, mlx_matmul_pq_group64_into, pack_ternary,
-        pack_ternary_i_major_into, pack_ternary_planes_i_into, quantize_pq_into, quantize_ternary,
-        relative_error, relative_error_pq_ppm, ternary_matmul, ternary_matmul_i_major,
+        mlx_matmul_pq_group64_i64_into, mlx_matmul_pq_group64_into, omni_bfp_i8_simd_pq_into,
+        pack_quantum_bitplanes_i_major_into, pack_ternary, pack_ternary_i_major_into,
+        pack_ternary_planes_i_into, quantize_bfp_i8_group64_into, quantize_bfp_i8_pq_group64_into,
+        quantize_bfp_i16_group64_into, quantize_pq_into, quantize_quantum_bitplane_i4_pq_into,
+        quantize_quantum_ternary_act_pq_into, quantize_ternary, quantum_bitplane_i4_matmul_pq_into,
+        quantum_ternary_matmul_pq_into, relative_error, relative_error_pq_ppm,
+        ternary_bfp_adaptive_mem8_matmul_into, ternary_bfp_i8_matmul_into,
+        ternary_bfp_i16_matmul_into, ternary_matmul, ternary_matmul_i_major,
         ternary_matmul_pq_planes_i_into, ternary_simd_i8_pq_into, ternary_simd_pq_matmul_into,
         ternary_transformer_step_into, ternary_transformer_step_pq_into,
     };
@@ -218,6 +223,102 @@ pub fn run_bench(dim: usize) -> String {
     let pq_simd_i8_us = t_pq_simd_i8.elapsed().as_nanos() as f64 / 1000.0;
     let pq_err_ppm = relative_error_pq_ppm(&p_y_simd_i8, &p_y_planes);
 
+    // ULTRA-SUPER-OMNI-Quantum Ternary (64-trit bitplane POPCNT & 4-bit bitplane POPCNT) + Omni BFP-64
+    let words_per_col = aligned_dim.div_ceil(64);
+    let num_groups = aligned_dim.div_ceil(MLX_GROUP_SIZE);
+    let mut w_pos_u64 = vec![0u64; aligned_dim * words_per_col];
+    let mut w_neg_u64 = vec![0u64; aligned_dim * words_per_col];
+    pack_quantum_bitplanes_i_major_into(&trits_dd, aligned_dim, aligned_dim, &mut w_pos_u64, &mut w_neg_u64);
+    let mut x_pos_u64 = vec![0u64; words_per_col];
+    let mut x_neg_u64 = vec![0u64; words_per_col];
+    let scale_x_qt = quantize_quantum_ternary_act_pq_into(&p_x, &mut x_pos_u64, &mut x_neg_u64);
+    let mut p_y_quantum_u64 = vec![0i64; aligned_dim];
+    let t_qt_u64 = Instant::now();
+    quantum_ternary_matmul_pq_into(
+        &w_pos_u64,
+        &w_neg_u64,
+        aligned_dim,
+        aligned_dim,
+        &x_pos_u64,
+        &x_neg_u64,
+        scale_x_qt,
+        None,
+        KERNEL_PQ_Q,
+        &mut p_y_quantum_u64,
+    );
+    let quantum_u64_us = t_qt_u64.elapsed().as_nanos() as f64 / 1000.0;
+
+    let mut x_sign_u64 = vec![0u64; words_per_col];
+    let mut x_b0_u64 = vec![0u64; words_per_col];
+    let mut x_b1_u64 = vec![0u64; words_per_col];
+    let mut x_b2_u64 = vec![0u64; words_per_col];
+    let mut scale_x_i4 = vec![0i32; words_per_col];
+    quantize_quantum_bitplane_i4_pq_into(
+        &p_x,
+        &mut x_sign_u64,
+        &mut x_b0_u64,
+        &mut x_b1_u64,
+        &mut x_b2_u64,
+        &mut scale_x_i4,
+    );
+    let mut p_y_quantum_i4 = vec![0i64; aligned_dim];
+    let t_qt_i4 = Instant::now();
+    quantum_bitplane_i4_matmul_pq_into(
+        &w_pos_u64,
+        &w_neg_u64,
+        aligned_dim,
+        aligned_dim,
+        &x_sign_u64,
+        &x_b0_u64,
+        &x_b1_u64,
+        &x_b2_u64,
+        &scale_x_i4,
+        &mut p_y_quantum_i4,
+    );
+    let quantum_i4_us = t_qt_i4.elapsed().as_nanos() as f64 / 1000.0;
+
+    let mut m_x_pq_i8 = vec![0i8; aligned_dim];
+    let mut scale_x_pq_i8 = vec![0i32; num_groups];
+    quantize_bfp_i8_pq_group64_into(&p_x, &mut m_x_pq_i8, &mut scale_x_pq_i8);
+    let mut p_y_omni_bfp = vec![0i64; aligned_dim];
+    let t_omni_bfp = Instant::now();
+    omni_bfp_i8_simd_pq_into(&trits_dd_i, aligned_dim, aligned_dim, &m_x_pq_i8, None, &mut p_y_omni_bfp);
+    let omni_bfp_i8_pq_us = t_omni_bfp.elapsed().as_nanos() as f64 / 1000.0;
+
+    let mut m_x_i8 = vec![0i8; aligned_dim];
+    let mut scale_x_i8 = vec![0.0f64; num_groups];
+    let mut m_x_i16 = vec![0i16; aligned_dim];
+    let mut scale_x_i16 = vec![0.0f64; num_groups];
+    quantize_bfp_i8_group64_into(&x_al, &mut m_x_i8, &mut scale_x_i8);
+    quantize_bfp_i16_group64_into(&x_al, &mut m_x_i16, &mut scale_x_i16);
+    let mut y_bfp_i8 = vec![0.0f64; aligned_dim];
+    let t_bfp8 = Instant::now();
+    ternary_bfp_i8_matmul_into(&trits_dd_i, aligned_dim, aligned_dim, &m_x_i8, &scale_x_i8, None, 1.0, &mut y_bfp_i8);
+    let bfp_i8_us = t_bfp8.elapsed().as_nanos() as f64 / 1000.0;
+
+    let mut y_bfp_i16 = vec![0.0f64; aligned_dim];
+    let t_bfp16 = Instant::now();
+    ternary_bfp_i16_matmul_into(&trits_dd_i, aligned_dim, aligned_dim, &m_x_i16, &scale_x_i16, None, 1.0, &mut y_bfp_i16);
+    let bfp_i16_us = t_bfp16.elapsed().as_nanos() as f64 / 1000.0;
+
+    let salience: Vec<f64> = (0..aligned_dim).map(|j| if j % 4 == 0 { 0.9 } else { 0.2 }).collect();
+    let mut y_bfp_mem8 = vec![0.0f64; aligned_dim];
+    let t_bfp_mem8 = Instant::now();
+    ternary_bfp_adaptive_mem8_matmul_into(
+        &trits_dd_i,
+        aligned_dim,
+        aligned_dim,
+        &m_x_i8,
+        &scale_x_i8,
+        &m_x_i16,
+        &scale_x_i16,
+        &salience,
+        0.75,
+        1.0,
+        &mut y_bfp_mem8,
+    );
+    let bfp_mem8_us = t_bfp_mem8.elapsed().as_nanos() as f64 / 1000.0;
+
     let ones_d = vec![1.0f64; aligned_dim];
     let mut k_cache = vec![0.0f64; 8 * aligned_dim];
     let mut v_cache = vec![0.0f64; 8 * aligned_dim];
@@ -307,7 +408,7 @@ pub fn run_bench(dim: usize) -> String {
     let tf_pq_us = t_tf_pq.elapsed().as_nanos() as f64 / 1000.0;
 
     format!(
-        r#"{{"dim":{dim},"version":"0.3.0","bitsPerWeight":1.585,"bytesPacked":{},"bytesFloat64":{},"compression":{:.2},"relativeError":{:.4},"relativeErrorPpm":{},"mlxRust":{{"engine":"gaia-mlx-quant v0.3.0 (100% safe no_std Rust · zero heap allocs · pure-integer p/q zero-float substrate)","denseMicros":{:.2},"b158JMajorMicros":{:.2},"b158IMajorMicros":{:.2},"pqB158IMajorMicros":{:.2},"pqWideSimdMicros":{:.2},"pqPlanesI64Micros":{:.2},"pqSimdI8ZeroFloatMicros":{:.2},"group64":{{"compressionVsF32":{:.2},"packedBytes":{},"micros":{:.2},"pqMicros":{:.2},"pqI64ZeroFloatMicros":{:.2},"relativeError":{:.4}}},"mergeQ":{{"intermediateBytes":0,"micros":{:.2},"pqZeroFloatMicros":{:.2},"relativeError":{:.4}}},"maybeStochastic":{{"micros":{:.2}}},"gatherQmmMoE":{{"experts":4,"topK":2,"micros":{:.2}}},"ternaryTransformerBlock":{{"dim":{aligned_dim},"hiddenDim":{hidden_dim},"layerMicros":{:.2},"pqZeroFloatLayerMicros":{:.2},"estTokPerSec16Layer":{:.1}}}}}}}"#,
+        r#"{{"dim":{dim},"version":"0.3.0","bitsPerWeight":1.585,"bytesPacked":{},"bytesFloat64":{},"compression":{:.2},"relativeError":{:.4},"relativeErrorPpm":{},"mlxRust":{{"engine":"gaia-mlx-quant v0.3.0 (100% safe no_std Rust · zero heap allocs · ULTRA-SUPER-OMNI-Quantum Ternary & p/q zero-float substrate)","denseMicros":{:.2},"b158JMajorMicros":{:.2},"b158IMajorMicros":{:.2},"pqB158IMajorMicros":{:.2},"pqWideSimdMicros":{:.2},"pqPlanesI64Micros":{:.2},"pqSimdI8ZeroFloatMicros":{:.2},"quantumB158U64Micros":{:.2},"quantumBitplaneI4Micros":{:.2},"omniBfpI8PqMicros":{:.2},"bfpI8Group64Micros":{:.2},"bfpI16Group64Micros":{:.2},"bfpAdaptiveMem8Micros":{:.2},"group64":{{"compressionVsF32":{:.2},"packedBytes":{},"micros":{:.2},"pqMicros":{:.2},"pqI64ZeroFloatMicros":{:.2},"relativeError":{:.4}}},"mergeQ":{{"intermediateBytes":0,"micros":{:.2},"pqZeroFloatMicros":{:.2},"relativeError":{:.4}}},"maybeStochastic":{{"micros":{:.2}}},"gatherQmmMoE":{{"experts":4,"topK":2,"micros":{:.2}}},"ternaryTransformerBlock":{{"dim":{aligned_dim},"hiddenDim":{hidden_dim},"layerMicros":{:.2},"pqZeroFloatLayerMicros":{:.2},"estTokPerSec16Layer":{:.1}}}}}}}"#,
         packed.len(),
         w.len() * 8,
         compression,
@@ -320,6 +421,12 @@ pub fn run_bench(dim: usize) -> String {
         pq_simd_us,
         pq_planes_us,
         pq_simd_i8_us,
+        quantum_u64_us,
+        quantum_i4_us,
+        omni_bfp_i8_pq_us,
+        bfp_i8_us,
+        bfp_i16_us,
+        bfp_mem8_us,
         MLX_GROUP64_COMPRESSION,
         mlx_q.packed_bytes(),
         g64_us,

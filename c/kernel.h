@@ -45,6 +45,27 @@ void gmq_ternary_matmul_pq(const uint8_t *packed, size_t rows, size_t cols,
 void gmq_simd_matmul_pq(const int8_t *trits_i_major, size_t rows, size_t cols,
                         const int32_t *p_x, int64_t *p_out);
 
+/* Pure-integer i8×i8->i16 NEON/SSE4.1 16-lane BFP-i8 dot product (0 floats). */
+int64_t gmq_trit_dot_bfp_i8(const int8_t *trits, const int8_t *m_x, size_t n);
+
+/* Pure-integer Omni BFP-i8 i-major matmul in p/q (0 floats). */
+void gmq_omni_bfp_i8_matmul_pq(const int8_t *trits_i_major, size_t rows, size_t cols,
+                               const int8_t *m_x, int64_t *p_out);
+
+/* Pack j-major trits into i-major 64-trit quantum bitplanes (w_pos_u64, w_neg_u64). */
+void gmq_pack_quantum_bitplanes_i_major(const int8_t *trits, size_t rows, size_t cols,
+                                        uint64_t *w_pos_u64, uint64_t *w_neg_u64);
+
+/* Quantize p_x into 64-trit quantum bitplanes (x_pos_u64, x_neg_u64) + return p_scale_x (0 floats). */
+int32_t gmq_quantize_quantum_act_pq(const int32_t *p_x, size_t n,
+                                    uint64_t *x_pos_u64, uint64_t *x_neg_u64);
+
+/* 8-column register-blocked 64-trit quantum POPCNT matmul in p/q (512 MACs/step, 0 floats). */
+void gmq_quantum_bitplane_matmul_pq(const uint64_t *w_pos_u64, const uint64_t *w_neg_u64,
+                                    size_t rows, size_t cols,
+                                    const uint64_t *x_pos_u64, const uint64_t *x_neg_u64,
+                                    int32_t p_scale_x, int64_t *p_out);
+
 /* The masked kernel, j-major: out[i] = gamma * sum_j trit[j][i] * scale[j] * x[j]. */
 void gmq_ternary_matmul(const uint8_t *packed, size_t rows, size_t cols,
                         const double *x, const double *scales, double gamma,

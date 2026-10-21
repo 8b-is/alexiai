@@ -186,6 +186,57 @@ static void test_pq_integer_kernels(void) {
         }
     }
     CHECK(1, "p/q integer kernels match exact integer reference");
+
+    /* Verify Omni BFP-i8 NEON/SSE4.1 16-lane smlal kernel and Quantum 64-trit POPCNT kernel */
+    {
+        enum { QROWS = 68, QCOLS = 11 };
+        int8_t qtrits[QROWS * QCOLS];
+        int8_t qtrits_i[QROWS * QCOLS];
+        int8_t m_x[QROWS];
+        int32_t q_px[QROWS];
+        uint64_t w_pos[QCOLS * 2], w_neg[QCOLS * 2];
+        uint64_t x_pos[2], x_neg[2];
+        int64_t out_bfp[QCOLS], out_qbit[QCOLS];
+        int32_t scale_qx;
+
+        for (r = 0; r < QROWS; r++) {
+            m_x[r] = (int8_t)((int)(r * 7) % 251 - 125);
+            q_px[r] = (r % 3 == 0) ? 1048576 : (r % 3 == 1) ? -1048576 : 0;
+            for (c = 0; c < QCOLS; c++) {
+                int8_t t = (int8_t)(((r * QCOLS + c) % 3) - 1);
+                qtrits[r * QCOLS + c] = t;
+                qtrits_i[c * QROWS + r] = t;
+            }
+        }
+        gmq_omni_bfp_i8_matmul_pq(qtrits_i, QROWS, QCOLS, m_x, out_bfp);
+        for (c = 0; c < QCOLS; c++) {
+            int64_t expected = 0;
+            for (r = 0; r < QROWS; r++) {
+                expected += (int64_t)qtrits[r * QCOLS + c] * (int64_t)m_x[r];
+            }
+            if (out_bfp[c] != expected) {
+                CHECK(0, "omni BFP-i8 NEON/SSE4.1 kernel disagrees with exact reference");
+                return;
+            }
+        }
+        CHECK(1, "omni BFP-i8 NEON/SSE4.1 16-lane smlal kernel matches exact reference");
+
+        gmq_pack_quantum_bitplanes_i_major(qtrits, QROWS, QCOLS, w_pos, w_neg);
+        scale_qx = gmq_quantize_quantum_act_pq(q_px, QROWS, x_pos, x_neg);
+        gmq_quantum_bitplane_matmul_pq(w_pos, w_neg, QROWS, QCOLS, x_pos, x_neg, scale_qx, out_qbit);
+        for (c = 0; c < QCOLS; c++) {
+            int64_t trits_dot = 0;
+            for (r = 0; r < QROWS; r++) {
+                int64_t xt = q_px[r] > 0 ? 1 : (q_px[r] < 0 ? -1 : 0);
+                trits_dot += (int64_t)qtrits[r * QCOLS + c] * xt;
+            }
+            if (out_qbit[c] != trits_dot * (int64_t)scale_qx) {
+                CHECK(0, "quantum 64-trit bitplane POPCNT kernel disagrees with exact reference");
+                return;
+            }
+        }
+        CHECK(1, "quantum 64-trit bitplane POPCNT kernel matches exact reference");
+    }
 }
 
 #ifdef GMQ_CUDA

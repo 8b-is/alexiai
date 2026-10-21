@@ -261,3 +261,99 @@ fn pure_integer_pq_kernels_match_dense_pq_and_zero_floats() {
     ternary_simd_i8_pq_into(&trits_i, rows, cols, &p_x, None, KERNEL_PQ_Q, &mut out_unscaled);
     assert_eq!(out_unscaled, out_dense);
 }
+
+#[test]
+fn quantum_bitplane_and_omni_bfp_i8_pq_kernels_match_reference() {
+    use gaia_mlx_quant::{
+        KERNEL_PQ_Q, omni_bfp_i8_simd_pq_into, pack_quantum_bitplanes_i_major_into,
+        quantize_quantum_bitplane_i4_pq_into, quantize_quantum_ternary_act_pq_into,
+        quantum_bitplane_i4_matmul_pq_into, quantum_ternary_matmul_pq_into,
+        ternary_simd_i8_pq_into,
+    };
+
+    let rows = 68usize;
+    let cols = 11usize;
+    let words = rows.div_ceil(64);
+    let trits: Vec<i8> = (0..rows * cols).map(|k| [-1, 0, 1][(k * 7 + 1) % 3]).collect();
+    let mut trits_i = vec![0i8; rows * cols];
+    for j in 0..rows {
+        for i in 0..cols {
+            trits_i[i * rows + j] = trits[j * cols + i];
+        }
+    }
+
+    let mut w_pos_u64 = vec![0u64; cols * words];
+    let mut w_neg_u64 = vec![0u64; cols * words];
+    pack_quantum_bitplanes_i_major_into(&trits, rows, cols, &mut w_pos_u64, &mut w_neg_u64);
+
+    // 1. Quantum 64-trit bitplane POPCNT exact match on ternary activations
+    let p_x_trit: Vec<i32> = (0..rows)
+        .map(|j| [-KERNEL_PQ_Q, 0, KERNEL_PQ_Q][(j * 5 + 2) % 3])
+        .collect();
+    let mut x_pos_u64 = vec![0u64; words];
+    let mut x_neg_u64 = vec![0u64; words];
+    let scale_x = quantize_quantum_ternary_act_pq_into(&p_x_trit, &mut x_pos_u64, &mut x_neg_u64);
+
+    let mut out_q_u64 = vec![0i64; cols];
+    quantum_ternary_matmul_pq_into(
+        &w_pos_u64,
+        &w_neg_u64,
+        rows,
+        cols,
+        &x_pos_u64,
+        &x_neg_u64,
+        scale_x,
+        None,
+        KERNEL_PQ_Q,
+        &mut out_q_u64,
+    );
+
+    let x_trits_only: Vec<i32> = p_x_trit.iter().map(|&v| v.signum()).collect();
+    let mut out_trit_ref = vec![0i64; cols];
+    ternary_simd_i8_pq_into(&trits_i, rows, cols, &x_trits_only, None, KERNEL_PQ_Q, &mut out_trit_ref);
+    for i in 0..cols {
+        assert_eq!(out_q_u64[i], out_trit_ref[i] * (scale_x as i64));
+    }
+
+    // 2. Quantum 4-bit bitplane POPCNT exact match on integer magnitudes in [-7, +7]
+    let mut p_x_i4: Vec<i32> = (0..rows).map(|j| ((j as i32 % 15) - 7) * 700).collect();
+    p_x_i4[64] = 7 * 700; // ensure tail group also has max_abs = 7 * 700 so step == 700 exact
+    let mut x_sign_u64 = vec![0u64; words];
+    let mut x_b0_u64 = vec![0u64; words];
+    let mut x_b1_u64 = vec![0u64; words];
+    let mut x_b2_u64 = vec![0u64; words];
+    let mut block_scales_i4 = vec![0i32; words];
+    quantize_quantum_bitplane_i4_pq_into(
+        &p_x_i4,
+        &mut x_sign_u64,
+        &mut x_b0_u64,
+        &mut x_b1_u64,
+        &mut x_b2_u64,
+        &mut block_scales_i4,
+    );
+    let mut out_q_i4 = vec![0i64; cols];
+    quantum_bitplane_i4_matmul_pq_into(
+        &w_pos_u64,
+        &w_neg_u64,
+        rows,
+        cols,
+        &x_sign_u64,
+        &x_b0_u64,
+        &x_b1_u64,
+        &x_b2_u64,
+        &block_scales_i4,
+        &mut out_q_i4,
+    );
+    let mut out_i4_ref = vec![0i64; cols];
+    ternary_simd_i8_pq_into(&trits_i, rows, cols, &p_x_i4, None, KERNEL_PQ_Q, &mut out_i4_ref);
+    assert_eq!(out_q_i4, out_i4_ref);
+
+    // 3. Omni BFP-i8 16-wide i16 SIMD exact match
+    let m_x: Vec<i8> = (0..rows).map(|j| ((j as i32 * 13) % 251 - 125) as i8).collect();
+    let m_x_i32: Vec<i32> = m_x.iter().map(|&v| v as i32).collect();
+    let mut out_omni = vec![0i64; cols];
+    let mut out_omni_ref = vec![0i64; cols];
+    omni_bfp_i8_simd_pq_into(&trits_i, rows, cols, &m_x, None, &mut out_omni);
+    ternary_simd_i8_pq_into(&trits_i, rows, cols, &m_x_i32, None, KERNEL_PQ_Q, &mut out_omni_ref);
+    assert_eq!(out_omni, out_omni_ref);
+}

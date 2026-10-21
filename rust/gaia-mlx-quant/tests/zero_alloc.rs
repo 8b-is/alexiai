@@ -42,18 +42,24 @@ static ALLOCATOR: Counting = Counting;
 fn hot_paths_perform_zero_allocations() {
     use gaia_mlx_quant::{
         KERNEL_PQ_Q, PQ_DEFAULT_Q, b158_matmul_pq_i_major_into, fold, fold_pq, fold_spectrum,
-        fold_spectrum_pq, gather_qmm_into, gather_qmm_pq_into, maybe_matmul_into,
+        fold_spectrum_pq, gather_qmm_into, gather_qmm_pq_i64_into, maybe_matmul_into,
         maybe_matmul_pq_into, mergeq_matmul_into, mergeq_matmul_pq_into,
         mlx_dequantize_group64_into, mlx_dequantize_group64_pq_into,
         mlx_matmul_pq_group64_i64_into, mlx_matmul_pq_group64_into, mlx_quantize_group64_into,
-        mlx_quantize_group64_pq_into, mlx_quantized_matmul_into, pack_ternary_i_major_into,
-        pack_ternary_into, pack_ternary_planes_i_into, quantize_pq_into, quantize_ternary_pq_into,
-        rms_norm_into, rms_norm_pq_into, rope_into, rope_pq_into, sampling, sampling_pq,
-        sdpa_pq_single_query_into, sdpa_single_query_into, ste_linear_backward_into,
-        ste_linear_backward_pq_into, swiglu_into, swiglu_pq_into, ternary_matmul,
-        ternary_matmul_pq_i_major_into, ternary_matmul_pq_j_major_into,
-        ternary_matmul_pq_planes_i_into, ternary_simd_i8_pq_into, ternary_simd_pq_matmul_into,
-        ternary_transformer_step_into, ternary_transformer_step_pq_into, unpack_ternary_into,
+        mlx_quantize_group64_pq_into, mlx_quantized_matmul_into, omni_bfp_i8_simd_pq_into,
+        pack_quantum_bitplanes_i_major_into, pack_ternary_i_major_into, pack_ternary_into,
+        pack_ternary_planes_i_into, quantize_bfp_i8_group64_into, quantize_bfp_i8_pq_group64_into,
+        quantize_bfp_i16_group64_into, quantize_pq_into, quantize_quantum_bitplane_i4_pq_into,
+        quantize_quantum_ternary_act_pq_into, quantize_ternary_pq_into,
+        quantum_bitplane_i4_matmul_pq_into, quantum_ternary_matmul_pq_into, rms_norm_into,
+        rms_norm_pq_into, rope_into, rope_pq_into, sampling, sampling_pq,
+        sdpa_pq_i32_single_query_into, sdpa_single_query_into, ste_linear_backward_into,
+        ste_linear_backward_pq_into, swiglu_into, swiglu_pq_into,
+        ternary_bfp_adaptive_mem8_matmul_into, ternary_bfp_i8_matmul_into,
+        ternary_bfp_i16_matmul_into, ternary_matmul, ternary_matmul_pq_i_major_into,
+        ternary_matmul_pq_j_major_into, ternary_matmul_pq_planes_i_into, ternary_simd_i8_pq_into,
+        ternary_simd_pq_matmul_into, ternary_transformer_step_into,
+        ternary_transformer_step_pq_into, unpack_ternary_into,
     };
 
     const ROWS: usize = 64;
@@ -110,6 +116,20 @@ fn hot_paths_perform_zero_allocations() {
     let mut ps_up = vec![0i32; COLS];
     let mut ps_i64 = vec![0i64; COLS];
     let mut p_tf_out = vec![0i32; COLS];
+    let mut w_pos_u64 = vec![0u64; COLS];
+    let mut w_neg_u64 = vec![0u64; COLS];
+    let mut x_pos_u64 = vec![0u64; 1];
+    let mut x_neg_u64 = vec![0u64; 1];
+    let mut x_sign_u64 = vec![0u64; 1];
+    let mut x_b0_u64 = vec![0u64; 1];
+    let mut x_b1_u64 = vec![0u64; 1];
+    let mut x_b2_u64 = vec![0u64; 1];
+    let mut q_scales_i4 = vec![0i32; 1];
+    let mut m_x_i8 = vec![0i8; ROWS];
+    let mut s_x_i8 = vec![0f64; 1];
+    let mut m_x_i16 = vec![0i16; ROWS];
+    let mut s_x_i16 = vec![0f64; 1];
+    let mut s_x_pq_i8 = vec![0i32; 1];
 
     // Warm the paths (first-call branches and tables are settled).
     pack_ternary_into(&trits, &mut packed);
@@ -198,12 +218,24 @@ fn hot_paths_perform_zero_allocations() {
         mlx_matmul_pq_group64_i64_into(&p_x, &mlx_codes, &p_scales, ROWS, COLS, &mut p_out_i64);
         mergeq_matmul_pq_into(&p_x, &p_w, ROWS, COLS, 64, &mut p_out_i64);
         maybe_matmul_pq_into(&p_x, &p_w, ROWS, COLS, 64, 42, &mut p_out_i64);
-        gather_qmm_pq_into(&p_x, &mlx_codes, &p_scales, 1, ROWS, COLS, &[0], &[1_048_576], PQ_DEFAULT_Q, &mut ps_i64, &mut p_out_i64);
+        gather_qmm_pq_i64_into(&p_x, &mlx_codes, &p_scales, 1, ROWS, COLS, &[0], &[1_048_576], PQ_DEFAULT_Q, &mut ps_i64, &mut p_out_i64);
         rms_norm_pq_into(&p_x, Some(&p_row_scales), PQ_DEFAULT_Q, 10, &mut ps_norm);
         rope_pq_into(&ps_norm, 1, &mut ps_q);
         swiglu_pq_into(&ps_norm, &ps_q, PQ_DEFAULT_Q, &mut ps_gate);
-        sdpa_pq_single_query_into(&ps_q, &p_k_cache, &p_v_cache, 2, COLS, PQ_DEFAULT_Q, &mut ps_scores, &mut ps_attn);
+        sdpa_pq_i32_single_query_into(&ps_q, &p_k_cache, &p_v_cache, 2, COLS, PQ_DEFAULT_Q, &mut ps_scores, &mut ps_attn);
         ste_linear_backward_pq_into(&p_x, &p_w, &p_row_scales, ROWS, COLS, PQ_DEFAULT_Q, &mut p_grad_x, &mut p_grad_w);
+        pack_quantum_bitplanes_i_major_into(&trits, ROWS, COLS, &mut w_pos_u64, &mut w_neg_u64);
+        let q_sx = quantize_quantum_ternary_act_pq_into(&p_x, &mut x_pos_u64, &mut x_neg_u64);
+        quantum_ternary_matmul_pq_into(&w_pos_u64, &w_neg_u64, ROWS, COLS, &x_pos_u64, &x_neg_u64, q_sx, None, KERNEL_PQ_Q, &mut p_out_i64);
+        quantize_quantum_bitplane_i4_pq_into(&p_x, &mut x_sign_u64, &mut x_b0_u64, &mut x_b1_u64, &mut x_b2_u64, &mut q_scales_i4);
+        quantum_bitplane_i4_matmul_pq_into(&w_pos_u64, &w_neg_u64, ROWS, COLS, &x_sign_u64, &x_b0_u64, &x_b1_u64, &x_b2_u64, &q_scales_i4, &mut p_out_i64);
+        quantize_bfp_i8_pq_group64_into(&p_x, &mut m_x_i8, &mut s_x_pq_i8);
+        omni_bfp_i8_simd_pq_into(&trits, ROWS, COLS, &m_x_i8, None, &mut p_out_i64);
+        quantize_bfp_i8_group64_into(&x, &mut m_x_i8, &mut s_x_i8);
+        quantize_bfp_i16_group64_into(&x, &mut m_x_i16, &mut s_x_i16);
+        ternary_bfp_i8_matmul_into(&trits, ROWS, COLS, &m_x_i8, &s_x_i8, None, 1.0, &mut out);
+        ternary_bfp_i16_matmul_into(&trits, ROWS, COLS, &m_x_i16, &s_x_i16, None, 1.0, &mut out);
+        ternary_bfp_adaptive_mem8_matmul_into(&trits, ROWS, COLS, &m_x_i8, &s_x_i8, &m_x_i16, &s_x_i16, &scales, 0.7, 1.0, &mut out);
         ternary_transformer_step_pq_into(
             &p_x,
             &p_row_scales,

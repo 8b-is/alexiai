@@ -4,7 +4,10 @@
 // slices and static LUTs, allocate nothing, and read like a sentence.
 package gaiaquant
 
-import "math"
+import (
+	"math"
+	"math/bits"
+)
 
 // TritPerByte is the packing density: five base-3 digits per byte.
 const TritPerByte = 5
@@ -469,5 +472,112 @@ func TernaryMatMulPq(packed []uint8, rows, cols int, pX, pScales []int32, qScale
 				}
 			}
 		}
+	}
+}
+
+// PackQuantumBitplanesIMajor packs j-major trits ([rows, cols]) into column-major
+// 64-trit quantum bitplane words (wPosU64, wNegU64), each of length cols * ceil(rows/64).
+func PackQuantumBitplanesIMajor(trits []int8, rows, cols int, wPosU64, wNegU64 []uint64) {
+	words := (rows + 63) / 64
+	for i := 0; i < cols; i++ {
+		for w := 0; w < words; w++ {
+			var pMask, nMask uint64
+			jBase := w * 64
+			jEnd := jBase + 64
+			if jEnd > rows {
+				jEnd = rows
+			}
+			for b := 0; b < jEnd-jBase; b++ {
+				t := trits[(jBase+b)*cols+i]
+				if t > 0 {
+					pMask |= 1 << uint(b)
+				} else if t < 0 {
+					nMask |= 1 << uint(b)
+				}
+			}
+			wPosU64[i*words+w] = pMask
+			wNegU64[i*words+w] = nMask
+		}
+	}
+}
+
+// QuantizeQuantumActPq quantizes integer activation numerators pX into 64-trit
+// quantum bitplanes (xPosU64, xNegU64) and returns the absmean integer scale pScaleX (zero floats).
+func QuantizeQuantumActPq(pX []int32, xPosU64, xNegU64 []uint64) int32 {
+	n := len(pX)
+	words := (n + 63) / 64
+	for w := 0; w < words; w++ {
+		xPosU64[w] = 0
+		xNegU64[w] = 0
+	}
+	if n == 0 {
+		return 0
+	}
+	var sumAbs int64
+	for _, v := range pX {
+		sumAbs += absI64(int64(v))
+	}
+	if sumAbs == 0 {
+		return 0
+	}
+	n64 := int64(n)
+	twoN := n64 * 2
+	for w := 0; w < words; w++ {
+		var pm, nm uint64
+		jBase := w * 64
+		jEnd := jBase + 64
+		if jEnd > n {
+			jEnd = n
+		}
+		for b := 0; b < jEnd-jBase; b++ {
+			v := int64(pX[jBase+b])
+			if absI64(v)*twoN >= sumAbs {
+				if v > 0 {
+					pm |= 1 << uint(b)
+				} else if v < 0 {
+					nm |= 1 << uint(b)
+				}
+			}
+		}
+		xPosU64[w] = pm
+		xNegU64[w] = nm
+	}
+	return int32((sumAbs + (n64 >> 1)) / n64)
+}
+
+// QuantumBitplaneMatMulPq contracts 64-trit quantum bitplanes (wPosU64, wNegU64)
+// against (xPosU64, xNegU64) using hardware bits.OnesCount64 (POPCNT / NEON CNT)
+// with 4-column register blocking and zero floating-point operations.
+func QuantumBitplaneMatMulPq(wPosU64, wNegU64 []uint64, rows, cols int, xPosU64, xNegU64 []uint64, pScaleX int32, pOut []int64) {
+	words := (rows + 63) / 64
+	sx := int64(pScaleX)
+	i := 0
+	for i+4 <= cols {
+		wp0, wn0 := wPosU64[(i+0)*words:(i+1)*words], wNegU64[(i+0)*words:(i+1)*words]
+		wp1, wn1 := wPosU64[(i+1)*words:(i+2)*words], wNegU64[(i+1)*words:(i+2)*words]
+		wp2, wn2 := wPosU64[(i+2)*words:(i+3)*words], wNegU64[(i+2)*words:(i+3)*words]
+		wp3, wn3 := wPosU64[(i+3)*words:(i+4)*words], wNegU64[(i+3)*words:(i+4)*words]
+		var a0, a1, a2, a3 int64
+		for w := 0; w < words; w++ {
+			xp, xn := xPosU64[w], xNegU64[w]
+			a0 += int64(bits.OnesCount64((wp0[w]&xp)|(wn0[w]&xn)) - bits.OnesCount64((wp0[w]&xn)|(wn0[w]&xp)))
+			a1 += int64(bits.OnesCount64((wp1[w]&xp)|(wn1[w]&xn)) - bits.OnesCount64((wp1[w]&xn)|(wn1[w]&xp)))
+			a2 += int64(bits.OnesCount64((wp2[w]&xp)|(wn2[w]&xn)) - bits.OnesCount64((wp2[w]&xn)|(wn2[w]&xp)))
+			a3 += int64(bits.OnesCount64((wp3[w]&xp)|(wn3[w]&xn)) - bits.OnesCount64((wp3[w]&xn)|(wn3[w]&xp)))
+		}
+		pOut[i+0] = a0 * sx
+		pOut[i+1] = a1 * sx
+		pOut[i+2] = a2 * sx
+		pOut[i+3] = a3 * sx
+		i += 4
+	}
+	for ; i < cols; i++ {
+		wp, wn := wPosU64[i*words:(i+1)*words], wNegU64[i*words:(i+1)*words]
+		var a0 int64
+		for w := 0; w < words; w++ {
+			xp, xn := xPosU64[w], xNegU64[w]
+			a0 += int64(bits.OnesCount64((wp[w]&xp)|(wn[w]&xn)) - bits.OnesCount64((wp[w]&xn)|(wn[w]&xp)))
+		}
+		pOut[i] = a0 * sx
 	}
 }

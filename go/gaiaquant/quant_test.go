@@ -205,4 +205,40 @@ func TestTernaryMatMulPqMatchesExactInteger(t *testing.T) {
 			t.Fatalf("col %d: got %d want %d", c, pOut[c], want)
 		}
 	}
+
+	// Verify 64-trit Quantum Bitplane POPCNT kernel matches exact integer reference
+	qRows, qCols := 68, 9
+	words := (qRows + 63) / 64
+	qTrits := make([]int8, qRows*qCols)
+	for i := range qTrits {
+		qTrits[i] = []int8{-1, 0, 1}[(i*5+1)%3]
+	}
+	qPx := make([]int32, qRows)
+	for r := 0; r < qRows; r++ {
+		qPx[r] = []int32{-int32(PqDefaultQ), 0, int32(PqDefaultQ)}[(r*3+2)%3]
+	}
+	wPos := make([]uint64, qCols*words)
+	wNeg := make([]uint64, qCols*words)
+	xPos := make([]uint64, words)
+	xNeg := make([]uint64, words)
+	PackQuantumBitplanesIMajor(qTrits, qRows, qCols, wPos, wNeg)
+	scaleQx := QuantizeQuantumActPq(qPx, xPos, xNeg)
+	qOut := make([]int64, qCols)
+	QuantumBitplaneMatMulPq(wPos, wNeg, qRows, qCols, xPos, xNeg, scaleQx, qOut)
+	for c := 0; c < qCols; c++ {
+		var tritDot int64
+		for r := 0; r < qRows; r++ {
+			var xt int64
+			if qPx[r] > 0 {
+				xt = 1
+			} else if qPx[r] < 0 {
+				xt = -1
+			}
+			tritDot += int64(qTrits[r*qCols+c]) * xt
+		}
+		want := tritDot * int64(scaleQx)
+		if qOut[c] != want {
+			t.Fatalf("quantum bitplane col %d: got %d want %d", c, qOut[c], want)
+		}
+	}
 }
