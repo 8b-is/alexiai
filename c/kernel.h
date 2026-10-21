@@ -111,6 +111,18 @@ gmq_fold_t gmq_fold_spectrum(const char *prompt, size_t len, double rf_entropy_b
 /* Fold a prompt together with passive RF Shannon entropy numerator (in q = 2^20, 0 floats). */
 gmq_fold_pq_t gmq_fold_spectrum_pq(const char *prompt, size_t len, int64_t rf_entropy_p);
 
+/* wupz C ABI v1 seam: XOR integrity fold over little-endian u64 words + trailing bytes. */
+uint64_t gmq_wupz_xor_fold(const uint8_t *ptr, size_t len);
+
+/* wupz C ABI v1 seam: number of differing bytes between two spans. */
+uint64_t gmq_wupz_byte_diff(const uint8_t *a, const uint8_t *b, size_t len);
+
+/* wupz C ABI v1 seam: population count over a byte span. */
+uint64_t gmq_wupz_popcount(const uint8_t *ptr, size_t len);
+
+/* wupz QuantTern (qt:<hex>) 3-axis emotional ternary encoding in pure p/q (|x| >= 0.33, 0 floats). */
+uint8_t gmq_quant_tern_encode_pq(int64_t p_valence, int64_t p_arousal, int64_t p_dominance, int64_t q);
+
 #ifdef __cplusplus
 }
 #endif

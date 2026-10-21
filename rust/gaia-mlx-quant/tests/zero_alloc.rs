@@ -41,8 +41,9 @@ static ALLOCATOR: Counting = Counting;
 #[test]
 fn hot_paths_perform_zero_allocations() {
     use gaia_mlx_quant::{
-        KERNEL_PQ_Q, PQ_DEFAULT_Q, b158_matmul_pq_i_major_into, fold, fold_pq, fold_spectrum,
-        fold_spectrum_pq, gather_qmm_into, gather_qmm_pq_i64_into, maybe_matmul_into,
+        KERNEL_PQ_Q, PQ_DEFAULT_Q, WUPZ_DEFAULT_WINDOW_SIZE, WupzBlockDesc, WupzSectionDesc,
+        b158_matmul_pq_i_major_into, fold, fold_pq, fold_spectrum, fold_spectrum_pq,
+        fold_to_quant_tern_pq, gather_qmm_into, gather_qmm_pq_i64_into, maybe_matmul_into,
         maybe_matmul_pq_into, mergeq_matmul_into, mergeq_matmul_pq_into,
         mlx_dequantize_group64_into, mlx_dequantize_group64_pq_into,
         mlx_matmul_pq_group64_i64_into, mlx_matmul_pq_group64_into, mlx_quantize_group64_into,
@@ -59,7 +60,9 @@ fn hot_paths_perform_zero_allocations() {
         ternary_bfp_i16_matmul_into, ternary_matmul, ternary_matmul_pq_i_major_into,
         ternary_matmul_pq_j_major_into, ternary_matmul_pq_planes_i_into, ternary_simd_i8_pq_into,
         ternary_simd_pq_matmul_into, ternary_transformer_step_into,
-        ternary_transformer_step_pq_into, unpack_ternary_into,
+        ternary_transformer_step_pq_into, unpack_ternary_into, wupz_bitplane_diff_u64,
+        wupz_bitplane_popcount_u64, wupz_byte_diff, wupz_pack_plan_into, wupz_plan_digest,
+        wupz_popcount, wupz_xor_fold, wupz_xor_fold_u64,
     };
 
     const ROWS: usize = 64;
@@ -263,6 +266,26 @@ fn hot_paths_perform_zero_allocations() {
             &mut ps_i64,
             &mut p_tf_out,
         );
+        let mut wupz_plan_buf = [0u8; 128];
+        let wupz_secs = [WupzSectionDesc {
+            id: 0,
+            name: b".rodata.b158",
+            addr: 0x1000,
+            len: packed.len() as u64,
+            hash: wupz_xor_fold(&packed),
+        }];
+        let wupz_blks = [WupzBlockDesc {
+            index: 0,
+            covers: &[0],
+        }];
+        let _ = wupz_pack_plan_into(&wupz_secs, &wupz_blks, &mut wupz_plan_buf);
+        let _ = wupz_plan_digest(WUPZ_DEFAULT_WINDOW_SIZE, &wupz_secs, &wupz_blks);
+        let _ = wupz_byte_diff(&packed, &packed_i);
+        let _ = wupz_popcount(&packed);
+        let _ = wupz_xor_fold_u64(&w_pos_u64);
+        let _ = wupz_bitplane_popcount_u64(&w_pos_u64, &w_neg_u64);
+        let _ = wupz_bitplane_diff_u64(&w_pos_u64, &w_neg_u64, &w_pos_u64, &w_neg_u64);
+        let _ = fold_to_quant_tern_pq(&fpq1);
         std::hint::black_box((sampling(&f1), sampling(&f2), sampling_pq(&fpq1), sampling_pq(&fpq2)));
     }
     let after = ALLOCS.load(Ordering::Relaxed);

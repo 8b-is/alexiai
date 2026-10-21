@@ -22,7 +22,8 @@
 git clone https://github.com/8b-is/alexiai.git && cd alexiai
 
 cargo run --release -p alexiai -- serve    # the app → http://127.0.0.1:8787
-cargo run --release -p alexiai -- doctor   # field readout + sovereignty check
+cargo run --release -p alexiai -- doctor   # field readout + sovereignty + wupz check
+cargo run --release -p alexiai -- wupz     # wupz pack-in-pass & QuantTern (qt:<hex>) receipt
 cargo run --release -p alexiai -- bench    # ternary vs dense, measured honestly
 
 # or through the Go glue:
@@ -136,7 +137,7 @@ cargo run --release --example bench -- --dim 1024
 | promise | how it is enforced |
 |---|---|
 | **zero unsafe** | `#![forbid(unsafe_code)]` — it is a compile error, not a guideline |
-| **zero floating-point (`p/q` & Quantum Bitplanes)** | `q = 2^20 = 1,048,576`: `quantum_ternary_matmul_pq_into`, `quantum_bitplane_i4_matmul_pq_into`, `omni_bfp_i8_simd_pq_into`, `ternary_bfp_i8_matmul_into`, `ternary_bfp_i16_matmul_into`, `ternary_bfp_adaptive_mem8_matmul_into`, `fold_pq`, `sampling_pq`, `quantize_ternary_pq_into`, `ternary_simd_i8_pq_into`, `mlx_matmul_pq_group64_i64_into`, `mergeq_matmul_pq_into`, `rms_norm_pq_into` (`isqrt_u128`), `rope_pq_into` (`sin_cos_pq`), `swiglu_pq_into` (`exp_pq`), `sdpa_pq_single_query_into`, and `ternary_transformer_step_pq_into` execute in 100% pure `u64`/`i16`/`i32`/`i64`/`u128` integer arithmetic |
+| **zero floating-point (`p/q` & Quantum Bitplanes & `wupz`)** | `q = 2^20 = 1,048,576`: `quantum_ternary_matmul_pq_into`, `quantum_bitplane_i4_matmul_pq_into`, `omni_bfp_i8_simd_pq_into`, `wupz_xor_fold`, `wupz_byte_diff`, `wupz_popcount`, `wupz_bitplane_diff_u64`, `fold_to_quant_tern_pq`, `wupz_pack_plan_into`, `fold_pq`, `sampling_pq`, `quantize_ternary_pq_into`, `ternary_simd_i8_pq_into`, `mlx_matmul_pq_group64_i64_into`, `mergeq_matmul_pq_into`, `rms_norm_pq_into` (`isqrt_u128`), `rope_pq_into` (`sin_cos_pq`), `swiglu_pq_into` (`exp_pq`), `sdpa_pq_single_query_into`, and `ternary_transformer_step_pq_into` execute in 100% pure `u64`/`i16`/`i32`/`i64`/`u128` integer arithmetic |
 | **zero allocations** | a counting global allocator wraps the system allocator in the test suite and asserts all pack + quantum bitplane + BFP-i8 + `p/q` Transformer hot paths perform **zero heap operations** |
 | **no_std** | `core`-only when built without default features; runs anywhere Rust's core runs |
 | **100% Linux + macOS** | CI runs the full suite on both `ubuntu-latest` and `macos-latest` |
@@ -220,10 +221,11 @@ second is the stairs.
   `https://api.openai.com` cannot appear in a request from this app. Not
   configurable. Not today, not after an update.
 
-## 🌐 Constellation Integrations (`wigle-triad` × `esp32.vaked.dev`)
+## 🌐 Constellation Integrations (`wupz` × `wigle-triad` × `esp32.vaked.dev`)
 
-`GAIA-MLX-QUANT` (`b1.58` ternary packing, `fold_spectrum`, and **D+++ 432Hz** harmonic synthesis) is embedded across the offline-first MEDUSA triad fleet:
+`GAIA-MLX-QUANT` (`b1.58` ternary packing, 64-trit quantum bitplanes, `wupz` pack-in-pass, `fold_spectrum`, and **D+++ 432Hz** harmonic synthesis) is embedded across the offline-first MEDUSA triad fleet:
 
+- **[`8b-is/wupz` (`v0.4.0`)](https://github.com/8b-is/wupz) × [`wupz.vaked.dev`](https://wupz.vaked.dev/)** — Incremental ultra-fast linker + compressor (`w(ild) + UPX + z(ig)`) wired into `gaia_mlx_quant::wupz` across all 4 native lanes (Rust, C99, Go, Swift): C ABI v1 `wupz_xor_fold` (`#Commit = #ValidWitness`), `wupz_byte_diff`, `wupz_popcount`, `wupz_bitplane_diff_u64` (incremental QAT bitplane delta in $O(N/64)$), deterministic `"WUPZ"` v1 layout plan images (`wupz_pack_plan_into`), and pure-integer `p/q` `QuantTern` emotional ternary codes (`qt:<hex>`, threshold $|x| \ge 0.33$ with `0` floats).
 - **[`8b-is/wigle-triad` (`v2.0.0`)](https://github.com/8b-is/wigle-triad)** — macOS (`WigleMac.app`), Android (`WigleTriad-v2.0.0-android-universal.apk`), iPadOS/iOS, and local Python bridge (`host/wiglewww.py` `/api/alexai`) fold passive 2.4/5 GHz Wi-Fi, BLE/BT, and AirPlay Shannon entropy $H(X)$ into the 4-layer GAIA field (`Ananke`, `Chaos`, `Zephyrus`, `Aphrodite`) and pack endpoint RSSI trits (`{-1, 0, +1}`) at 5 trits/byte (`1.585 bits/weight`).
 - **[`esp32.vaked.dev`](https://esp32.vaked.dev/)** ([`/api/alexai`](https://esp32.vaked.dev/api/alexai) · Tab 6 `🧠 AlexAI × Kompress-Ultra`) — Live offline-first PWA & WebSerial workstation pairing `AlexAIEngine` (`GAIA-MLX-QUANT b1.58`) with [`kompress-ultra` (`v16.2.0`)](https://github.com/peterlodri-sec/kompress-ultra).
 

@@ -10,15 +10,16 @@ use std::time::Instant;
 
 use gaia_mlx_quant::{
     BITS_PER_WEIGHT, GAIA_PQ_Q, KERNEL_PQ_Q, MLX_GROUP_SIZE, MLX_GROUP64_COMPRESSION, PQ_DEFAULT_Q,
-    dense_matmul, dense_matmul_pq_into, fold, fold_pq, mlx_matmul_pq_group64_i64_into,
-    mlx_quantize_group64_pq_into, omni_bfp_i8_simd_pq_into, pack_quantum_bitplanes_i_major_into,
-    pack_ternary, pack_ternary_i_major_into, pack_ternary_planes_i_into,
-    quantize_bfp_i8_group64_into, quantize_bfp_i8_pq_group64_into,
+    WUPZ_ABI_VERSION, dense_matmul, dense_matmul_pq_into, fold, fold_pq, fold_to_quant_tern_pq,
+    mlx_matmul_pq_group64_i64_into, mlx_quantize_group64_pq_into, omni_bfp_i8_simd_pq_into,
+    pack_quantum_bitplanes_i_major_into, pack_ternary, pack_ternary_i_major_into,
+    pack_ternary_planes_i_into, quantize_bfp_i8_group64_into, quantize_bfp_i8_pq_group64_into,
     quantize_quantum_bitplane_i4_pq_into, quantize_quantum_ternary_act_pq_into,
     quantize_ternary_pq_into, quantum_bitplane_i4_matmul_pq_into, quantum_ternary_matmul_pq_into,
     relative_error, relative_error_pq_ppm, sampling_pq, ternary_bfp_i8_matmul_into, ternary_matmul,
     ternary_matmul_i_major, ternary_matmul_planes_i, ternary_matmul_pq_i_major_into,
     ternary_matmul_pq_j_major_into, ternary_matmul_pq_planes_i_into, ternary_simd_i8_pq_into,
+    wupz_bitplane_popcount_u64, wupz_popcount, wupz_xor_fold,
 };
 
 /// Deterministic pure-integer uniform-ish generator in `[-q, +q]` (`q = 2^20`), zero floats.
@@ -361,6 +362,10 @@ fn main() {
     let field = fold("bench", None);
     let field_pq = fold_pq("bench", None);
     let samp_pq = sampling_pq(&field_pq);
+    let qt = fold_to_quant_tern_pq(&field_pq);
+    let wupz_fold = wupz_xor_fold(&packed_i);
+    let wupz_pop = wupz_popcount(&packed_i);
+    let wupz_qt_active = wupz_bitplane_popcount_u64(&w_pos_u64, &w_neg_u64);
     let pq_b158_scaled: Vec<i64> = pq_b158_i
         .iter()
         .map(|&v| v * (KERNEL_PQ_Q as i64))
@@ -372,7 +377,7 @@ fn main() {
     let speedup_bfp_i8 = (dense_ns as f64) / (bfp_i8_ns.max(1) as f64);
     let speedup_simd = (dense_ns as f64) / (pq_simd_ns.max(1) as f64);
 
-    println!("GAIA-MLX-QUANT v0.3.0 bench — ULTRA-SUPER-OMNI-Quantum Ternary & p/q pure-integer");
+    println!("GAIA-MLX-QUANT v0.3.0 bench — ULTRA-SUPER-OMNI-Quantum Ternary, wupz & p/q pure-integer");
     println!(
         "  field             seed {} · dominant {:?} · coherence {:.4}",
         field.seed, field.dominant, field.coherence
@@ -380,6 +385,11 @@ fn main() {
     println!(
         "  field-pq          q={} · coherence_p={} · T_p={} · top_k={} (0 floats)",
         GAIA_PQ_Q, field_pq.coherence_p, samp_pq.temperature_p, samp_pq.top_k
+    );
+    println!(
+        "  wupz-seam         ABI v{WUPZ_ABI_VERSION} · {} (byte 0x{:02x}) · xor_fold 0x{wupz_fold:016x} · popcount {wupz_pop}b · active_trits {wupz_qt_active}",
+        qt.as_str(),
+        qt.byte
     );
     println!("  shape             {rows}x{cols}");
     println!(

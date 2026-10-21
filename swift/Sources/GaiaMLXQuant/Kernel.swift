@@ -524,4 +524,64 @@ public enum GaiaMLXQuant {
             pOut[i] = acc * sx
         }
     }
+
+    /// wupz C ABI v1 integrity fold (XOR of little-endian u64 words + trailing bytes).
+    public static func wupzXorFold(_ bytes: [UInt8]) -> UInt64 {
+        var acc: UInt64 = 0
+        var i = 0
+        while i + 8 <= bytes.count {
+            var w: UInt64 = 0
+            for b in 0..<8 {
+                w |= UInt64(bytes[i + b]) << UInt64(b * 8)
+            }
+            acc ^= w
+            i += 8
+        }
+        while i < bytes.count {
+            acc ^= UInt64(bytes[i])
+            i += 1
+        }
+        return acc
+    }
+
+    /// wupz C ABI v1 byte diff count between two spans.
+    public static func wupzByteDiff(_ a: [UInt8], _ b: [UInt8]) -> UInt64 {
+        let n = min(a.count, b.count)
+        var count: UInt64 = 0
+        for i in 0..<n where a[i] != b[i] {
+            count += 1
+        }
+        return count
+    }
+
+    /// wupz C ABI v1 population count over a byte span.
+    public static func wupzPopcount(_ bytes: [UInt8]) -> UInt64 {
+        var count: UInt64 = 0
+        for byte in bytes {
+            count += UInt64(byte.nonzeroBitCount)
+        }
+        return count
+    }
+
+    /// wupz QuantTern (qt:<hex>) 3-axis emotional ternary encoding in pure p/q (0 floats).
+    public static func quantTernEncodePq(
+        pValence: Int64,
+        pArousal: Int64,
+        pDominance: Int64,
+        q: Int64 = pqDefaultQ
+    ) -> UInt8 {
+        func trit(_ p: Int64) -> Int8 {
+            let qAbs = q < 0 ? -q : q
+            let lhs = p * 100
+            let rhs = 33 * qAbs
+            if lhs >= rhs { return 1 }
+            if lhs <= -rhs { return -1 }
+            return 0
+        }
+        let t0 = UInt8((Int(trit(pValence)) + 1) & 3)
+        let t1 = UInt8(((Int(trit(pArousal)) + 1) & 3) << 2)
+        let t2 = UInt8(((Int(trit(pDominance)) + 1) & 3) << 4)
+        let t3 = UInt8(1 << 6)
+        return t0 | t1 | t2 | t3
+    }
 }

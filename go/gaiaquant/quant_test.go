@@ -241,4 +241,20 @@ func TestTernaryMatMulPqMatchesExactInteger(t *testing.T) {
 			t.Fatalf("quantum bitplane col %d: got %d want %d", c, qOut[c], want)
 		}
 	}
+
+	// Verify wupz C ABI v1 seam & QuantTern (qt:56)
+	a := []byte{1, 2, 3, 4, 5, 6, 7, 8, 9}
+	b := []byte{1, 2, 0, 4, 5, 6, 7, 8, 0}
+	if diff := WupzByteDiff(a, b); diff != 2 {
+		t.Fatalf("WupzByteDiff: got %d want 2", diff)
+	}
+	if WupzXorFold(a) == WupzXorFold(b) {
+		t.Fatalf("WupzXorFold failed to detect byte mutation")
+	}
+	if WupzPopcount(a) == 0 {
+		t.Fatalf("WupzPopcount returned 0")
+	}
+	if qt := QuantTernEncodePq((PqDefaultQ*8)/10, PqDefaultQ/10, 0, PqDefaultQ); qt != 0x56 {
+		t.Fatalf("QuantTernEncodePq: got 0x%02x want 0x56", qt)
+	}
 }

@@ -159,6 +159,13 @@ final class KernelTests: XCTestCase {
         let highPq = GaiaMLXQuant.foldSpectrumPq(prompt, rfEntropyBitsPq: Int32(q * 4))
         XCTAssertEqual(lowPq.seed, highPq.seed)
         XCTAssertGreaterThan(highPq.entropyPq, lowPq.entropyPq)
+
+        let a: [UInt8] = [1, 2, 3, 4, 5, 6, 7, 8, 9]
+        let b: [UInt8] = [1, 2, 0, 4, 5, 6, 7, 8, 0]
+        XCTAssertEqual(GaiaMLXQuant.wupzByteDiff(a, b), 2)
+        XCTAssertNotEqual(GaiaMLXQuant.wupzXorFold(a), GaiaMLXQuant.wupzXorFold(b))
+        XCTAssertGreaterThan(GaiaMLXQuant.wupzPopcount(a), 0)
+        XCTAssertEqual(GaiaMLXQuant.quantTernEncodePq(pValence: (q * 8) / 10, pArousal: q / 10, pDominance: 0, q: q), 0x56)
     }
 }
 #elseif canImport(Testing)
@@ -331,6 +338,13 @@ struct KernelTests {
         var qOut = [Int64](repeating: 0, count: cols)
         GaiaMLXQuant.quantumBitplaneMatMulPq(wPosU64: wPos, wNegU64: wNeg, rows: rows, cols: cols, xPosU64: xPos, xNegU64: xNeg, pScaleX: sx, into: &qOut)
         #expect(qOut.contains { $0 != 0 })
+
+        let a: [UInt8] = [1, 2, 3, 4, 5, 6, 7, 8, 9]
+        let b: [UInt8] = [1, 2, 0, 4, 5, 6, 7, 8, 0]
+        #expect(GaiaMLXQuant.wupzByteDiff(a, b) == 2)
+        #expect(GaiaMLXQuant.wupzXorFold(a) != GaiaMLXQuant.wupzXorFold(b))
+        #expect(GaiaMLXQuant.wupzPopcount(a) > 0)
+        #expect(GaiaMLXQuant.quantTernEncodePq(pValence: (q * 8) / 10, pArousal: q / 10, pDominance: 0, q: q) == 0x56)
     }
 }
 #endif

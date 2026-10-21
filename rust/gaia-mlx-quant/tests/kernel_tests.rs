@@ -357,3 +357,130 @@ fn quantum_bitplane_and_omni_bfp_i8_pq_kernels_match_reference() {
     ternary_simd_i8_pq_into(&trits_i, rows, cols, &m_x_i32, None, KERNEL_PQ_Q, &mut out_omni_ref);
     assert_eq!(out_omni, out_omni_ref);
 }
+
+#[test]
+fn wupz_seam_quant_tern_and_plan_image_exact() {
+    use gaia_mlx_quant::{
+        GAIA_PQ_Q, WUPZ_ABI_VERSION, WUPZ_DEFAULT_WINDOW_SIZE, WUPZ_MAGIC, WUPZ_PLAN_VERSION,
+        WupzBlockDesc, WupzSectionDesc, fold_pq, fold_to_quant_tern_pq, quant_tern_encode_vad_pq,
+        quant_tern_pack_into, quant_tern_unpack_into, wupz_bitplane_diff_u64,
+        wupz_bitplane_popcount_u64, wupz_byte_diff, wupz_changed_sections_into,
+        wupz_pack_plan_into, wupz_plan_digest, wupz_plan_image_len, wupz_popcount,
+        wupz_seal_frame_into, wupz_verify_frame_seal, wupz_xor_fold, wupz_xor_fold_u64,
+    };
+
+    // 1. xor_fold parity across every length 0..=260 + seal witness
+    let mut buf = [0u8; 260];
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    for b in &mut buf {
+        x = x
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        *b = (x >> 33) as u8;
+    }
+    for len in 0..=buf.len() {
+        let slice = &buf[..len];
+        let full_words_len = len & !7usize;
+        let mut scalar_acc = 0u64;
+        for (i, &byte) in slice[..full_words_len].iter().enumerate() {
+            scalar_acc ^= (byte as u64) << ((i & 7) * 8);
+        }
+        for &byte in &slice[full_words_len..] {
+            scalar_acc ^= byte as u64;
+        }
+        assert_eq!(wupz_xor_fold(slice), scalar_acc, "mismatch at len={len}");
+    }
+
+    let mut sealed = [0u8; 32];
+    assert!(wupz_seal_frame_into(&buf[..24], &mut sealed).is_some());
+    assert!(wupz_verify_frame_seal(&sealed));
+    sealed[10] ^= 0x01;
+    assert!(!wupz_verify_frame_seal(&sealed));
+
+    // 2. byte_diff and popcount parity
+    let mut buf2 = buf;
+    assert_eq!(wupz_byte_diff(&buf, &buf2), 0);
+    buf2[0] ^= 1;
+    buf2[127] ^= 1;
+    buf2[259] ^= 1;
+    assert_eq!(wupz_byte_diff(&buf, &buf2), 3);
+
+    let expected_pop: u64 = buf.iter().map(|b| b.count_ones() as u64).sum();
+    assert_eq!(wupz_popcount(&buf), expected_pop);
+
+    // 3. Quantum bitplane u64 fold, popcount & diff
+    let wp_a = [0x0F0F_0F0F_0F0F_0F0Fu64, 0xAAAA_AAAA_AAAA_AAAAu64];
+    let wn_a = [0xF0F0_F0F0_F0F0_F0F0u64, 0x5555_5555_5555_5555u64];
+    let mut wp_b = wp_a;
+    wp_b[0] ^= 0x03; // flip 2 positive trits
+    assert_eq!(wupz_bitplane_popcount_u64(&wp_a, &wn_a), 128);
+    assert_eq!(wupz_bitplane_diff_u64(&wp_a, &wn_a, &wp_b, &wn_a), 2);
+    assert_eq!(wupz_xor_fold_u64(&wp_a), wp_a[0] ^ wp_a[1]);
+
+    // 4. QuantTern (valence=0.8, arousal=0.1, dominance=0.0 -> [+1, 0, 0] -> byte 0x56 = "qt:56")
+    let qt = quant_tern_encode_vad_pq((GAIA_PQ_Q * 8) / 10, GAIA_PQ_Q / 10, 0, GAIA_PQ_Q);
+    assert_eq!(qt.trits, [1, 0, 0]);
+    assert_eq!(qt.byte, 0x56);
+    assert_eq!(qt.as_str(), "qt:56");
+    assert_eq!(qt.magnitude, 1);
+    assert_eq!(qt.glyphs(), ['+', '0', '0']);
+
+    let mut unpacked_qt = [0i8; 4];
+    quant_tern_unpack_into(&[qt.byte], 4, &mut unpacked_qt);
+    assert_eq!(unpacked_qt, [1, 0, 0, 0]);
+
+    let mut packed_qt = [0u8; 2];
+    assert_eq!(quant_tern_pack_into(&[1, -1, 0, 1, -1], &mut packed_qt), 2);
+    let mut roundtrip_qt = [0i8; 5];
+    quant_tern_unpack_into(&packed_qt, 5, &mut roundtrip_qt);
+    assert_eq!(roundtrip_qt, [1, -1, 0, 1, -1]);
+
+    let fpq = fold_pq("wupz quanttern test", None);
+    let f_qt = fold_to_quant_tern_pq(&fpq);
+    assert!(f_qt.as_str().starts_with("qt:"));
+
+    // 5. WUPZ v1 plan image wire parity with `wupz-rs/src/pack.rs`
+    let sections = [
+        WupzSectionDesc {
+            id: 0,
+            name: b".text",
+            addr: 0x1000,
+            len: 0x200,
+            hash: 0xaa,
+        },
+        WupzSectionDesc {
+            id: 1,
+            name: b".data",
+            addr: 0x3000,
+            len: 0x40,
+            hash: 0xbb,
+        },
+    ];
+    let blocks = [
+        WupzBlockDesc {
+            index: 0,
+            covers: &[0],
+        },
+        WupzBlockDesc {
+            index: 1,
+            covers: &[0, 1],
+        },
+    ];
+    let expected_len = 4 + 1 + 4 + 4 + (4 + 8 + 8 + 8 + 2 + 5) * 2 + (4 + 4 + 4) + (4 + 4 + 8);
+    assert_eq!(wupz_plan_image_len(&sections, &blocks), expected_len);
+    let mut plan_buf = [0u8; 256];
+    let img = wupz_pack_plan_into(&sections, &blocks, &mut plan_buf).unwrap();
+    assert_eq!(&img[..4], &WUPZ_MAGIC);
+    assert_eq!(img[4], WUPZ_PLAN_VERSION);
+    assert_eq!(WUPZ_ABI_VERSION, 1);
+
+    let d1 = wupz_plan_digest(WUPZ_DEFAULT_WINDOW_SIZE, &sections, &blocks);
+    let mut sections_after = sections;
+    sections_after[0].hash ^= 0xff;
+    let d2 = wupz_plan_digest(WUPZ_DEFAULT_WINDOW_SIZE, &sections_after, &blocks);
+    assert_ne!(d1, d2);
+
+    let mut changed = [0u32; 4];
+    assert_eq!(wupz_changed_sections_into(&sections, &sections_after, &mut changed), 1);
+    assert_eq!(changed[0], 0);
+}

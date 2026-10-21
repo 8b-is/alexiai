@@ -8,7 +8,12 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 
-use gaia_mlx_quant::{Fold, fold, sampling};
+use gaia_mlx_quant::{
+    Fold, WUPZ_ABI_VERSION, WUPZ_DEFAULT_WINDOW_SIZE, WupzBlockDesc, WupzSectionDesc, fold,
+    fold_pq, fold_to_quant_tern_pq, sampling, wupz_bitplane_diff_u64, wupz_bitplane_popcount_u64,
+    wupz_pack_plan_into, wupz_plan_digest, wupz_plan_image_len, wupz_popcount, wupz_xor_fold,
+    wupz_xor_fold_u64,
+};
 
 use crate::mcp;
 use crate::osarous::{Osarous, SamplingParams};
@@ -407,13 +412,47 @@ pub fn run_bench(dim: usize) -> String {
     );
     let tf_pq_us = t_tf_pq.elapsed().as_nanos() as f64 / 1000.0;
 
+    // wupz (wild + UPX + zig) Pack-in-Pass & QuantTern receipts on the quantized sections
+    let wupz_b158_fold = wupz_xor_fold(&w_dd);
+    let wupz_b158_pop = wupz_popcount(&w_dd);
+    let wupz_qt_fold = wupz_xor_fold_u64(&w_pos_u64) ^ wupz_xor_fold_u64(&w_neg_u64);
+    let wupz_qt_active = wupz_bitplane_popcount_u64(&w_pos_u64, &w_neg_u64);
+    let wupz_sections = [
+        WupzSectionDesc {
+            id: 0,
+            name: b".rodata.gaia.b158",
+            addr: 0x1000,
+            len: w_dd.len() as u64,
+            hash: wupz_b158_fold,
+        },
+        WupzSectionDesc {
+            id: 1,
+            name: b".rodata.gaia.quantum_u64",
+            addr: 0x5000,
+            len: ((w_pos_u64.len() + w_neg_u64.len()) * 8) as u64,
+            hash: wupz_qt_fold,
+        },
+    ];
+    let wupz_blocks = [
+        WupzBlockDesc { index: 0, covers: &[0] },
+        WupzBlockDesc { index: 1, covers: &[1] },
+    ];
+    let wupz_plan_len = wupz_plan_image_len(&wupz_sections, &wupz_blocks);
+    let mut wupz_plan_buf = vec![0u8; wupz_plan_len];
+    let _ = wupz_pack_plan_into(&wupz_sections, &wupz_blocks, &mut wupz_plan_buf);
+    let wupz_digest = wupz_plan_digest(WUPZ_DEFAULT_WINDOW_SIZE, &wupz_sections, &wupz_blocks);
+    let f_pq_bench = fold_pq("alexiai · wupz · gaia-mlx-quant", None);
+    let qt_bench = fold_to_quant_tern_pq(&f_pq_bench);
+    let _ = wupz_bitplane_diff_u64(&w_pos_u64, &w_neg_u64, &w_pos_u64, &w_neg_u64);
+
     format!(
-        r#"{{"dim":{dim},"version":"0.3.0","bitsPerWeight":1.585,"bytesPacked":{},"bytesFloat64":{},"compression":{:.2},"relativeError":{:.4},"relativeErrorPpm":{},"mlxRust":{{"engine":"gaia-mlx-quant v0.3.0 (100% safe no_std Rust · zero heap allocs · ULTRA-SUPER-OMNI-Quantum Ternary & p/q zero-float substrate)","denseMicros":{:.2},"b158JMajorMicros":{:.2},"b158IMajorMicros":{:.2},"pqB158IMajorMicros":{:.2},"pqWideSimdMicros":{:.2},"pqPlanesI64Micros":{:.2},"pqSimdI8ZeroFloatMicros":{:.2},"quantumB158U64Micros":{:.2},"quantumBitplaneI4Micros":{:.2},"omniBfpI8PqMicros":{:.2},"bfpI8Group64Micros":{:.2},"bfpI16Group64Micros":{:.2},"bfpAdaptiveMem8Micros":{:.2},"group64":{{"compressionVsF32":{:.2},"packedBytes":{},"micros":{:.2},"pqMicros":{:.2},"pqI64ZeroFloatMicros":{:.2},"relativeError":{:.4}}},"mergeQ":{{"intermediateBytes":0,"micros":{:.2},"pqZeroFloatMicros":{:.2},"relativeError":{:.4}}},"maybeStochastic":{{"micros":{:.2}}},"gatherQmmMoE":{{"experts":4,"topK":2,"micros":{:.2}}},"ternaryTransformerBlock":{{"dim":{aligned_dim},"hiddenDim":{hidden_dim},"layerMicros":{:.2},"pqZeroFloatLayerMicros":{:.2},"estTokPerSec16Layer":{:.1}}}}}}}"#,
+        r#"{{"dim":{dim},"version":"0.3.0","bitsPerWeight":1.585,"bytesPacked":{},"bytesFloat64":{},"compression":{:.2},"relativeError":{:.4},"relativeErrorPpm":{},"wupz":{{"abiVersion":{WUPZ_ABI_VERSION},"magic":"WUPZ","planBytes":{wupz_plan_len},"planDigest":"0x{wupz_digest:016x}","b158XorFold":"0x{wupz_b158_fold:016x}","b158PopcountBits":{wupz_b158_pop},"quantumActiveTrits":{wupz_qt_active},"quantTern":"{}"}},"mlxRust":{{"engine":"gaia-mlx-quant v0.3.0 (100% safe no_std Rust · zero heap allocs · ULTRA-SUPER-OMNI-Quantum Ternary, wupz & p/q zero-float substrate)","denseMicros":{:.2},"b158JMajorMicros":{:.2},"b158IMajorMicros":{:.2},"pqB158IMajorMicros":{:.2},"pqWideSimdMicros":{:.2},"pqPlanesI64Micros":{:.2},"pqSimdI8ZeroFloatMicros":{:.2},"quantumB158U64Micros":{:.2},"quantumBitplaneI4Micros":{:.2},"omniBfpI8PqMicros":{:.2},"bfpI8Group64Micros":{:.2},"bfpI16Group64Micros":{:.2},"bfpAdaptiveMem8Micros":{:.2},"group64":{{"compressionVsF32":{:.2},"packedBytes":{},"micros":{:.2},"pqMicros":{:.2},"pqI64ZeroFloatMicros":{:.2},"relativeError":{:.4}}},"mergeQ":{{"intermediateBytes":0,"micros":{:.2},"pqZeroFloatMicros":{:.2},"relativeError":{:.4}}},"maybeStochastic":{{"micros":{:.2}}},"gatherQmmMoE":{{"experts":4,"topK":2,"micros":{:.2}}},"ternaryTransformerBlock":{{"dim":{aligned_dim},"hiddenDim":{hidden_dim},"layerMicros":{:.2},"pqZeroFloatLayerMicros":{:.2},"estTokPerSec16Layer":{:.1}}}}}}}"#,
         packed.len(),
         w.len() * 8,
         compression,
         err,
         pq_err_ppm,
+        qt_bench.as_str(),
         dense_us,
         b158_us,
         imajor_us,
@@ -627,10 +666,13 @@ fn handle_connection(mut stream: std::net::TcpStream, adapter: &Osarous) -> Resu
                 Some(rf) => gaia_mlx_quant::fold_spectrum(&prompt, rf, seed),
                 None => fold(&prompt, seed),
             };
+            let f_pq = fold_pq(&prompt, seed);
+            let qt = fold_to_quant_tern_pq(&f_pq);
+            let wupz_fold = wupz_xor_fold(prompt.as_bytes());
             let s = sampling(&f);
             let a = affect(&f, &prompt);
             let json = format!(
-                r#"{{"seed":{},"layers":{{"gravity":{},"entropy":{},"weather":{},"resonance":{}}},"dominant":"{}","coherence":{},"affect":{{"mood":"{}","valence":{:.4},"arousal":{:.4}}},"sampling":{{"temperature":{},"top_p":{},"top_k":{},"seed":{}}}}}"#,
+                r#"{{"seed":{},"layers":{{"gravity":{},"entropy":{},"weather":{},"resonance":{}}},"dominant":"{}","coherence":{},"affect":{{"mood":"{}","valence":{:.4},"arousal":{:.4}}},"quantTern":{{"tag":"{}","byte":{},"trits":[{},{},{}],"magnitude":{}}},"wupz":{{"abiVersion":{WUPZ_ABI_VERSION},"xorFold":"0x{wupz_fold:016x}"}},"sampling":{{"temperature":{},"top_p":{},"top_k":{},"seed":{}}}}}"#,
                 f.seed,
                 f.gravity,
                 f.entropy,
@@ -641,10 +683,33 @@ fn handle_connection(mut stream: std::net::TcpStream, adapter: &Osarous) -> Resu
                 json_escape(a.mood),
                 a.valence,
                 a.arousal,
+                qt.as_str(),
+                qt.byte,
+                qt.trits[0],
+                qt.trits[1],
+                qt.trits[2],
+                qt.magnitude,
                 s.temperature,
                 s.top_p,
                 s.top_k,
                 s.seed
+            );
+            write_response(&mut stream, 200, "application/json", json.as_bytes())
+        }
+        ("GET", "/api/wupz") => {
+            let target = query_param(&query, "prompt").unwrap_or_default();
+            let report = mcp::run_wupz_tool(&target);
+            let f_pq = fold_pq(&target, None);
+            let qt = fold_to_quant_tern_pq(&f_pq);
+            let fold_hex = wupz_xor_fold(target.as_bytes());
+            let json = format!(
+                r#"{{"ok":true,"abiVersion":{WUPZ_ABI_VERSION},"magic":"WUPZ","quantTern":"{}","byte":{},"trits":[{},{},{}],"xorFold":"0x{fold_hex:016x}","report":{}}}"#,
+                qt.as_str(),
+                qt.byte,
+                qt.trits[0],
+                qt.trits[1],
+                qt.trits[2],
+                json_escape_text(&report),
             );
             write_response(&mut stream, 200, "application/json", json.as_bytes())
         }
@@ -710,13 +775,14 @@ fn handle_connection(mut stream: std::net::TcpStream, adapter: &Osarous) -> Resu
                 .collect::<Vec<_>>()
                 .join(",");
             let json = format!(
-                r#"{{"stDaemonUp":{},"stDaemonLatencyMs":{},"stEndpoint":"{}","stBinary":{},"crabccBinary":{},"ontologyReady":{},"tools":[{tools}]}}"#,
+                r#"{{"stDaemonUp":{},"stDaemonLatencyMs":{},"stEndpoint":"{}","stBinary":{},"crabccBinary":{},"ontologyReady":{},"wupzReady":{},"wupzAbiVersion":{WUPZ_ABI_VERSION},"tools":[{tools}]}}"#,
                 st.st_daemon_up,
                 st.st_daemon_latency_ms,
                 mcp::ST_DAEMON_URL,
                 st.st_binary.map(|s| json_escape_text(&s)).unwrap_or_else(|| "null".to_string()),
                 st.crabcc_binary.map(|s| json_escape_text(&s)).unwrap_or_else(|| "null".to_string()),
                 st.ontology_ready,
+                st.wupz_ready,
             );
             write_response(&mut stream, 200, "application/json", json.as_bytes())
         }
@@ -791,8 +857,11 @@ fn handle_chat(stream: &mut std::net::TcpStream, adapter: &Osarous, body: &str) 
         )
         .map_err(|e| e.to_string())?;
 
+    let f_pq = fold_pq(&prompt, None);
+    let qt = fold_to_quant_tern_pq(&f_pq);
+    let wupz_fold = wupz_xor_fold(prompt.as_bytes());
     let gaia_frame = format!(
-        "event: gaia\ndata: {{\"field\":{{\"seed\":{},\"layers\":{{\"gravity\":{},\"entropy\":{},\"weather\":{},\"resonance\":{}}},\"dominant\":\"{}\",\"coherence\":{},\"affect\":{{\"mood\":\"{}\",\"valence\":{:.4},\"arousal\":{:.4}}}}},\"sampling\":{{\"temperature\":{},\"top_p\":{},\"top_k\":{},\"seed\":{}}}}}\n\n",
+        "event: gaia\ndata: {{\"field\":{{\"seed\":{},\"layers\":{{\"gravity\":{},\"entropy\":{},\"weather\":{},\"resonance\":{}}},\"dominant\":\"{}\",\"coherence\":{},\"affect\":{{\"mood\":\"{}\",\"valence\":{:.4},\"arousal\":{:.4}}},\"quantTern\":{{\"tag\":\"{}\",\"byte\":{},\"trits\":[{},{},{}],\"magnitude\":{}}},\"wupz\":{{\"abiVersion\":{WUPZ_ABI_VERSION},\"xorFold\":\"0x{wupz_fold:016x}\"}}}},\"sampling\":{{\"temperature\":{},\"top_p\":{},\"top_k\":{},\"seed\":{}}}}}\n\n",
         f.seed,
         f.gravity,
         f.entropy,
@@ -803,6 +872,12 @@ fn handle_chat(stream: &mut std::net::TcpStream, adapter: &Osarous, body: &str) 
         json_escape(a.mood),
         a.valence,
         a.arousal,
+        qt.as_str(),
+        qt.byte,
+        qt.trits[0],
+        qt.trits[1],
+        qt.trits[2],
+        qt.magnitude,
         s.temperature,
         s.top_p,
         s.top_k,

@@ -236,6 +236,16 @@ static void test_pq_integer_kernels(void) {
             }
         }
         CHECK(1, "quantum 64-trit bitplane POPCNT kernel matches exact reference");
+
+        {
+            uint8_t wbuf[16] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+            uint8_t wbuf2[16] = {1, 2, 3, 4, 5, 0, 7, 8, 9, 10, 11, 12, 13, 14, 15, 0};
+            uint8_t qt_byte = gmq_quant_tern_encode_pq((GMQ_PQ_DEFAULT_Q * 8) / 10, GMQ_PQ_DEFAULT_Q / 10, 0, GMQ_PQ_DEFAULT_Q);
+            CHECK(gmq_wupz_byte_diff(wbuf, wbuf2, 16) == 2, "gmq_wupz_byte_diff counts 2 differing bytes");
+            CHECK(gmq_wupz_popcount(wbuf, 16) > 0, "gmq_wupz_popcount > 0");
+            CHECK(gmq_wupz_xor_fold(wbuf, 16) != gmq_wupz_xor_fold(wbuf2, 16), "gmq_wupz_xor_fold detects byte mutation");
+            CHECK(qt_byte == 0x56, "gmq_quant_tern_encode_pq matches qt:56");
+        }
     }
 }
 

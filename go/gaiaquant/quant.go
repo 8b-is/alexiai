@@ -581,3 +581,67 @@ func QuantumBitplaneMatMulPq(wPosU64, wNegU64 []uint64, rows, cols int, xPosU64,
 		pOut[i] = a0 * sx
 	}
 }
+
+// WupzXorFold computes the wupz C ABI v1 integrity fold (XOR of little-endian u64 words + trailing bytes).
+func WupzXorFold(b []byte) uint64 {
+	var acc uint64
+	i := 0
+	for i+8 <= len(b) {
+		w := uint64(b[i+0]) |
+			(uint64(b[i+1]) << 8) |
+			(uint64(b[i+2]) << 16) |
+			(uint64(b[i+3]) << 24) |
+			(uint64(b[i+4]) << 32) |
+			(uint64(b[i+5]) << 40) |
+			(uint64(b[i+6]) << 48) |
+			(uint64(b[i+7]) << 56)
+		acc ^= w
+		i += 8
+	}
+	for ; i < len(b); i++ {
+		acc ^= uint64(b[i])
+	}
+	return acc
+}
+
+// WupzByteDiff returns the number of differing bytes between two spans.
+func WupzByteDiff(a, b []byte) uint64 {
+	n := len(a)
+	if len(b) < n {
+		n = len(b)
+	}
+	var count uint64
+	for i := 0; i < n; i++ {
+		if a[i] != b[i] {
+			count++
+		}
+	}
+	return count
+}
+
+// WupzPopcount returns the population count over a byte span.
+func WupzPopcount(b []byte) uint64 {
+	var count uint64
+	for _, v := range b {
+		count += uint64(bits.OnesCount8(v))
+	}
+	return count
+}
+
+// QuantTernEncodePq encodes 3 rational p/q axes (valence, arousal, dominance) into a wupz QuantTern byte (0 floats).
+func QuantTernEncodePq(pValence, pArousal, pDominance, q int64) uint8 {
+	trit := func(p int64) int8 {
+		qAbs := absI64(q)
+		lhs := p * 100
+		rhs := 33 * qAbs
+		if lhs >= rhs {
+			return 1
+		}
+		if lhs <= -rhs {
+			return -1
+		}
+		return 0
+	}
+	t0, t1, t2 := trit(pValence), trit(pArousal), trit(pDominance)
+	return uint8(((t0+1)&3) | (((t1+1)&3) << 2) | (((t2+1)&3) << 4) | (1 << 6))
+}

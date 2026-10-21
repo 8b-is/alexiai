@@ -10,17 +10,20 @@ mod server;
 mod sovereign;
 mod transport;
 
-use gaia_mlx_quant::{fold, sampling};
+use gaia_mlx_quant::{
+    WUPZ_ABI_VERSION, fold, fold_pq, fold_to_quant_tern_pq, sampling, wupz_xor_fold,
+};
 
 const USAGE: &str = "\
 alexiai <3 — Omni edition (Rust everywhere)
 
   alexiai serve [--port 8787] [--endpoint URL]   start the offline app
-  alexiai doctor [--endpoint URL]                field + sovereignty + health + mcp
+  alexiai doctor [--endpoint URL]                field + sovereignty + health + mcp + wupz
   alexiai models [--endpoint URL]                list local models
   alexiai chat \"<prompt>\" [--endpoint URL]       one turn, streamed (with local MCP)
   alexiai mcp [list | <tool> [arg]]              list or run local MCP tools
-  alexiai gaia [\"<text>\"]                        fold the field
+  alexiai gaia [\"<text>\"]                        fold the field (+ QuantTern qt:<hex>)
+  alexiai wupz [\"<text>\"]                        wupz pack-in-pass & QuantTern receipt
   alexiai bench [--dim 256]                      ternary vs dense
 
   --endpoint must be loopback. That is not a bug, it is the product.
@@ -43,6 +46,7 @@ fn main() {
         "chat" => cmd_chat(rest),
         "mcp" => cmd_mcp(rest),
         "gaia" => cmd_gaia(rest),
+        "wupz" => cmd_wupz(rest),
         "bench" => cmd_bench(rest),
         _ => {
             print!("{USAGE}");
@@ -80,8 +84,16 @@ fn cmd_serve(rest: &[String]) -> Result<(), String> {
 fn cmd_doctor(rest: &[String]) -> Result<(), String> {
     let adapter = osarous::Osarous::new(&endpoint(rest))?;
     let f = fold("", None);
+    let f_pq = fold_pq("", None);
+    let qt = fold_to_quant_tern_pq(&f_pq);
     println!("\n  GAIA field");
-    println!("    seed {} · dominant {} · coherence {:.4}", f.seed, f.dominant.name(), f.coherence);
+    println!(
+        "    seed {} · dominant {} · coherence {:.4} · {}",
+        f.seed,
+        f.dominant.name(),
+        f.coherence,
+        qt.as_str()
+    );
     for layer in gaia_mlx_quant::Layer::ALL {
         println!("    {:<10} {}", layer.name(), f.get(layer));
     }
@@ -106,8 +118,13 @@ fn cmd_doctor(rest: &[String]) -> Result<(), String> {
         .ok()
         .and_then(|v| v.get("compression").map(|c| c.to_json_string()))
         .unwrap_or_default();
-    println!("\n  gaia-mlx-quant");
+    println!("\n  gaia-mlx-quant × wupz");
     println!("    ternary    1.5850 bits/weight · {compression}× vs f64");
+    println!(
+        "    wupz       ABI v{WUPZ_ABI_VERSION} · magic WUPZ · {} · xor_fold 0x{:016x}",
+        qt.as_str(),
+        wupz_xor_fold(b"alexiai-doctor-wupz")
+    );
     let m = mcp::status();
     println!("\n  mcp & root services");
     println!(
@@ -210,11 +227,22 @@ fn cmd_chat(rest: &[String]) -> Result<(), String> {
 fn cmd_gaia(rest: &[String]) -> Result<(), String> {
     let text = rest.join(" ");
     let f = fold(&text, None);
+    let f_pq = fold_pq(&text, None);
+    let qt = fold_to_quant_tern_pq(&f_pq);
+    let glyphs = qt.glyphs();
     let s = sampling(&f);
     let a = server::affect(&f, &text);
     println!("\n  GAIA field");
     println!("    seed {} · dominant {} · coherence {:.4}", f.seed, f.dominant.name(), f.coherence);
     println!("    heart      {} (warmth {:.2})", a.mood, a.valence);
+    println!(
+        "    quanttern  {} ({} {} {}) · wupz xor_fold 0x{:016x}",
+        qt.as_str(),
+        glyphs[0],
+        glyphs[1],
+        glyphs[2],
+        wupz_xor_fold(text.as_bytes())
+    );
     for layer in gaia_mlx_quant::Layer::ALL {
         println!("    {:<10} {}  ({})", layer.name(), f.get(layer), layer.inhabitant());
     }
@@ -222,6 +250,12 @@ fn cmd_gaia(rest: &[String]) -> Result<(), String> {
         "    sampling   T={} top_p={} top_k={} seed={}\n",
         s.temperature, s.top_p, s.top_k, s.seed
     );
+    Ok(())
+}
+
+fn cmd_wupz(rest: &[String]) -> Result<(), String> {
+    let text = rest.join(" ");
+    println!("\n{}\n", mcp::run_wupz_tool(&text));
     Ok(())
 }
 

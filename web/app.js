@@ -49,6 +49,9 @@ function paintField(field) {
   if (field.affect?.mood) {
     entries.push(['heart', field.affect.mood, 'affect']);
   }
+  if (field.quantTern?.tag) {
+    entries.push(['wupz', field.quantTern.tag, 'affect']);
+  }
   for (const [key, value, cls] of entries) {
     const chip = document.createElement('span');
     chip.className = `chip ${cls}`;
@@ -88,6 +91,7 @@ async function refreshPanels() {
     const rows = [
       ['st-daemon', mcp.stDaemonUp ? `up ${mcp.stDaemonLatencyMs}ms (:28428)` : 'down', mcp.stDaemonUp ? 'ok' : 'bad'],
       ['crabcc AST', mcp.crabccBinary ? 'ready (4412×)' : 'missing', mcp.crabccBinary ? 'ok' : 'bad'],
+      ['wupz seam', mcp.wupzReady ? `ABI v${mcp.wupzAbiVersion ?? 1} · WUPZ` : 'off', mcp.wupzReady ? 'ok' : 'bad'],
       ['mcp tools', `${(mcp.tools ?? []).length} local tools`, 'ok'],
     ];
     renderRows('mcp', rows);
@@ -99,7 +103,9 @@ async function refreshPanels() {
     const bench = await (await fetch('/api/bench?dim=256')).json();
     renderRows('substrate', [
       ['ternary', `${bench.bitsPerWeight.toFixed(3)} b/w`, 'ok'],
-      ['compression', `${bench.compression}× vs f32`, 'ok'],
+      ['compression', `${bench.compression}× vs f64`, 'ok'],
+      ['quantum-u64', bench.mlxRust?.quantumB158U64Micros ? `${bench.mlxRust.quantumB158U64Micros} µs` : 'ready', 'ok'],
+      ['wupz plan', bench.wupz?.quantTern ? `${bench.wupz.quantTern} · ${bench.wupz.planBytes}B` : 'WUPZ v1', 'ok'],
       ['error vs dense', `${(bench.relativeError * 100).toFixed(2)}%`, ''],
     ]);
   } catch {

@@ -42,6 +42,7 @@ pub struct McpStatus {
     pub st_binary: Option<String>,
     pub crabcc_binary: Option<String>,
     pub ontology_ready: bool,
+    pub wupz_ready: bool,
 }
 
 pub const TOOLS: &[McpToolDescriptor] = &[
@@ -103,7 +104,12 @@ pub const TOOLS: &[McpToolDescriptor] = &[
     McpToolDescriptor {
         name: "mlx_quant",
         provider: "gaia-mlx-quant::mlx (100% Pure-Rust MLX Engine · zero-alloc)",
-        description: "Pure-Rust MLX & MLX-QUANT tensor engine: Group-64 12.80x, b1.58 20.19x, mergeq, maybe, gather_qmm MoE, STE autodiff, and Ternary Transformer",
+        description: "Pure-Rust MLX & MLX-QUANT tensor engine: Quantum-b158-u64 (0.88µs), Omni-BFP-i8 (1.01µs), Group-64, b1.58, mergeq, maybe, gather_qmm, STE, and Ternary Transformer",
+    },
+    McpToolDescriptor {
+        name: "wupz",
+        provider: "wupz v0.4.0 (wild + UPX + zig) × gaia-mlx-quant::wupz (ABI v1)",
+        description: "Incremental pack-in-pass linker+compressor (8b-is/wupz · wupz.vaked.dev), xor_fold/byte_diff/popcount seam, QuantTern (qt:<hex>), and WUPZ plan receipts",
     },
 ];
 
@@ -145,7 +151,10 @@ pub fn status() -> McpStatus {
         st_daemon_latency_ms,
         st_binary: find_binary("st"),
         crabcc_binary: find_binary("crabcc"),
-        ontology_ready: Path::new("/home/hue/8b-is/fandom-mcp/fandom-mcp.mjs").exists(),
+        ontology_ready: Path::new("/home/hue/8b-is/fandom-mcp/fandom-mcp.mjs").exists()
+            || Path::new("/Users/lodripeter/workspace/peterlodri-sec/fandom-mcp/fandom-mcp.mjs")
+                .exists(),
+        wupz_ready: true,
     }
 }
 
@@ -346,6 +355,9 @@ pub fn call_tool(tool: &str, arg: &str) -> Result<McpToolRun, String> {
         }
         "mlx_quant" | "mlx" | "mlx-rs" => {
             run_mlx_quant_tool(&target)
+        }
+        "wupz" | "quanttern" | "pack-in-pass" => {
+            run_wupz_tool(&target)
         }
         "mcp_status" | "status" | "tools" => {
             let st = status();
@@ -555,6 +567,141 @@ fn run_mlx_quant_tool(target: &str) -> String {
            7. `STE Autodiff` (`ste_linear_backward_pq_into` / `ste_linear_backward_into`): Straight-Through Estimator reverse-mode gradients for BitNet b1.58 QAT\n\
            8. `TernaryTransformerBlock` (`ternary_transformer_step_pq_into` / `ternary_transformer_step_into`): full layer (`rms_norm_pq_into` + Ternary QKV + `rope_pq_into` + causal `sdpa_pq_single_query_into` + Ternary O-Proj + `swiglu_pq_into` MLP)\n\n\
          Live Measured Benchmark (`dim = {dim}`):\n```json\n{bench_json}\n```"
+    )
+}
+
+pub fn run_wupz_tool(target: &str) -> String {
+    use gaia_mlx_quant::{
+        WUPZ_ABI_VERSION, WUPZ_DEFAULT_WINDOW_SIZE, WUPZ_PLAN_VERSION, WupzBlockDesc,
+        WupzSectionDesc, fold_pq, fold_to_quant_tern_pq, pack_quantum_bitplanes_i_major_into,
+        pack_ternary_into, wupz_bitplane_diff_u64, wupz_bitplane_popcount_u64, wupz_byte_diff,
+        wupz_changed_sections_into, wupz_pack_plan_into, wupz_plan_digest, wupz_plan_image_len,
+        wupz_popcount, wupz_seal_frame_into, wupz_verify_frame_seal, wupz_xor_fold,
+        wupz_xor_fold_u64,
+    };
+
+    let prompt_seed = if target.trim().is_empty() {
+        "wupz · kompress the link · wild + UPX + zig · Heart +1 <3"
+    } else {
+        target.trim()
+    };
+
+    let f_pq = fold_pq(prompt_seed, None);
+    let qt = fold_to_quant_tern_pq(&f_pq);
+    let glyphs = qt.glyphs();
+
+    // Synthesize a 256×256 ternary matrix and pack into both b1.58 (5 trits/byte) and 64-trit quantum bitplanes
+    let rows = 256usize;
+    let cols = 256usize;
+    let words_per_col = rows.div_ceil(64);
+    let trits: Vec<i8> = (0..rows * cols)
+        .map(|i| [-1i8, 0, 1][(i.wrapping_mul(7).wrapping_add(1)) % 3])
+        .collect();
+    let mut b158_packed = vec![0u8; (rows * cols).div_ceil(5)];
+    pack_ternary_into(&trits, &mut b158_packed);
+
+    let mut w_pos = vec![0u64; cols * words_per_col];
+    let mut w_neg = vec![0u64; cols * words_per_col];
+    pack_quantum_bitplanes_i_major_into(&trits, rows, cols, &mut w_pos, &mut w_neg);
+
+    let b158_fold = wupz_xor_fold(&b158_packed);
+    let b158_pop = wupz_popcount(&b158_packed);
+    let qt_pos_fold = wupz_xor_fold_u64(&w_pos);
+    let qt_neg_fold = wupz_xor_fold_u64(&w_neg);
+    let qt_active_trits = wupz_bitplane_popcount_u64(&w_pos, &w_neg);
+
+    // Mutate 1 column in QAT to measure incremental diff
+    let mut w_pos_mut = w_pos.clone();
+    w_pos_mut[0] ^= 0x0000_0000_0000_000F;
+    let mutated_trits = wupz_bitplane_diff_u64(&w_pos, &w_neg, &w_pos_mut, &w_neg);
+
+    let sections_before = [
+        WupzSectionDesc {
+            id: 0,
+            name: b".rodata.gaia.b158",
+            addr: 0x1000,
+            len: b158_packed.len() as u64,
+            hash: b158_fold,
+        },
+        WupzSectionDesc {
+            id: 1,
+            name: b".rodata.gaia.quantum_u64",
+            addr: 0x5000,
+            len: ((w_pos.len() + w_neg.len()) * 8) as u64,
+            hash: qt_pos_fold ^ qt_neg_fold,
+        },
+    ];
+    let sections_after = [
+        sections_before[0],
+        WupzSectionDesc {
+            id: 1,
+            name: b".rodata.gaia.quantum_u64",
+            addr: 0x5000,
+            len: ((w_pos.len() + w_neg.len()) * 8) as u64,
+            hash: wupz_xor_fold_u64(&w_pos_mut) ^ qt_neg_fold,
+        },
+    ];
+    let blocks = [
+        WupzBlockDesc {
+            index: 0,
+            covers: &[0],
+        },
+        WupzBlockDesc {
+            index: 1,
+            covers: &[1],
+        },
+    ];
+
+    let plan_len = wupz_plan_image_len(&sections_before, &blocks);
+    let mut plan_buf = vec![0u8; plan_len];
+    let _ = wupz_pack_plan_into(&sections_before, &blocks, &mut plan_buf);
+    let digest = wupz_plan_digest(WUPZ_DEFAULT_WINDOW_SIZE, &sections_before, &blocks);
+
+    let mut changed_ids = [0u32; 4];
+    let changed_count = wupz_changed_sections_into(&sections_before, &sections_after, &mut changed_ids);
+
+    // 32B Dynamic Environment Equalizer + QuantTern sealed frame check
+    let mut eq_payload = [0u8; 24];
+    eq_payload[0..4].copy_from_slice(&f_pq.seed.to_le_bytes());
+    eq_payload[8] = qt.byte;
+    eq_payload[9] = WUPZ_ABI_VERSION as u8;
+    let mut sealed_frame = [0u8; 32];
+    let seal_witness = wupz_seal_frame_into(&eq_payload, &mut sealed_frame).unwrap_or(0);
+    let seal_valid = wupz_verify_frame_seal(&sealed_frame);
+    let self_diff = wupz_byte_diff(&sealed_frame, &sealed_frame);
+
+    let wupz_repo_path = [
+        "/Users/lodripeter/workspace/peterlodri-sec/wupz",
+        "/home/hue/8b-is/wupz",
+    ]
+    .into_iter()
+    .find(|p| Path::new(p).exists())
+    .unwrap_or("https://github.com/8b-is/wupz");
+
+    format!(
+        "wupz × GAIA-MLX-QUANT Pack-in-Pass & QuantTern Seam (`gaia_mlx_quant::wupz` · `{wupz_repo_path}`)\n\
+         • Lineage: `w(ild) + UPX + z(ig)` — Incremental linker + compressor (`https://github.com/8b-is/wupz` · `https://wupz.vaked.dev`)\n\
+         • Contract: `WUPZ` magic, `WUPZ_ABI_VERSION = {WUPZ_ABI_VERSION}`, `WUPZ_PLAN_VERSION = {WUPZ_PLAN_VERSION}`, `#![no_std]`, `#![forbid(unsafe_code)]`, 0 floats, 0 heap allocations\n\
+         • QuantTern Emotional Ternary Code (`|x| >= 0.33` in pure `p/q`):\n\
+           - Tag: `{}` (byte `0x{:02x}`, trits `[{}, {}, {}]` / `{} {} {}`, magnitude `{}/3`)\n\
+         • WUPZ Plan Image & Section Receipts (`256×256` ternary substrate):\n\
+           - `.rodata.gaia.b158` (`{}` B): `xor_fold = 0x{b158_fold:016x}`, `popcount = {b158_pop}` bits\n\
+           - `.rodata.gaia.quantum_u64` (`{}` B): `xor_fold = 0x{:016x}`, `active_trits = {qt_active_trits}/65536`\n\
+           - Plan image size: `{plan_len}` B (`magic = \"WUPZ\"`), FNV-1a digest `0x{digest:016x}`\n\
+           - Incremental QAT diff: `{mutated_trits}` trits mutated -> `{changed_count}/2` sections invalidated (`reuse = 50.0%`)\n\
+           - 32B Sealed Witness Frame (`#Commit = #ValidWitness`): `seal = 0x{seal_witness:016x}`, `verified = {seal_valid}`, `self_byte_diff = {self_diff}`",
+        qt.as_str(),
+        qt.byte,
+        qt.trits[0],
+        qt.trits[1],
+        qt.trits[2],
+        glyphs[0],
+        glyphs[1],
+        glyphs[2],
+        qt.magnitude,
+        b158_packed.len(),
+        (w_pos.len() + w_neg.len()) * 8,
+        qt_pos_fold ^ qt_neg_fold,
     )
 }
 
@@ -800,6 +947,18 @@ pub fn auto_ground_prompt(prompt: &str) -> Vec<McpToolRun> {
         || lower.contains("b1.58")
         || (lower.contains("rust") && (lower.contains("quant") || lower.contains("tensor"))))
         && let Ok(run) = call_tool("mlx_quant", "256")
+    {
+        runs.push(run);
+    }
+
+    // 10. wupz (wild + UPX + zig) Pack-in-Pass Linker+Compressor & QuantTern (qt:<hex>)
+    if (lower.contains("wupz")
+        || lower.contains("pack-in-pass")
+        || lower.contains("xor_fold")
+        || lower.contains("byte_diff")
+        || lower.contains("quanttern")
+        || lower.contains("qt:"))
+        && let Ok(run) = call_tool("wupz", trimmed)
     {
         runs.push(run);
     }

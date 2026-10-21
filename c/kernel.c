@@ -852,3 +852,79 @@ gmq_fold_pq_t gmq_fold_spectrum_pq(const char *prompt, size_t len, int64_t rf_en
     f.coherence_p = gmq_clamp_i64(GMQ_PQ_DEFAULT_Q - spread_p, 0, GMQ_PQ_DEFAULT_Q);
     return f;
 }
+
+uint64_t gmq_wupz_xor_fold(const uint8_t *ptr, size_t len) {
+    uint64_t acc = 0;
+    size_t i = 0;
+    if (!ptr || len == 0) return 0;
+    while (i + 8 <= len) {
+        uint64_t w = (uint64_t)ptr[i + 0]
+                   | ((uint64_t)ptr[i + 1] << 8)
+                   | ((uint64_t)ptr[i + 2] << 16)
+                   | ((uint64_t)ptr[i + 3] << 24)
+                   | ((uint64_t)ptr[i + 4] << 32)
+                   | ((uint64_t)ptr[i + 5] << 40)
+                   | ((uint64_t)ptr[i + 6] << 48)
+                   | ((uint64_t)ptr[i + 7] << 56);
+        acc ^= w;
+        i += 8;
+    }
+    while (i < len) {
+        acc ^= (uint64_t)ptr[i];
+        i += 1;
+    }
+    return acc;
+}
+
+uint64_t gmq_wupz_byte_diff(const uint8_t *a, const uint8_t *b, size_t len) {
+    uint64_t count = 0;
+    size_t i;
+    if (!a || !b || len == 0) return 0;
+    for (i = 0; i < len; i++) {
+        if (a[i] != b[i]) count += 1;
+    }
+    return count;
+}
+
+uint64_t gmq_wupz_popcount(const uint8_t *ptr, size_t len) {
+    uint64_t count = 0;
+    size_t i = 0;
+    if (!ptr || len == 0) return 0;
+    while (i + 8 <= len) {
+        uint64_t w = (uint64_t)ptr[i + 0]
+                   | ((uint64_t)ptr[i + 1] << 8)
+                   | ((uint64_t)ptr[i + 2] << 16)
+                   | ((uint64_t)ptr[i + 3] << 24)
+                   | ((uint64_t)ptr[i + 4] << 32)
+                   | ((uint64_t)ptr[i + 5] << 40)
+                   | ((uint64_t)ptr[i + 6] << 48)
+                   | ((uint64_t)ptr[i + 7] << 56);
+        count += (uint64_t)__builtin_popcountll(w);
+        i += 8;
+    }
+    while (i < len) {
+        count += (uint64_t)__builtin_popcount((unsigned int)ptr[i]);
+        i += 1;
+    }
+    return count;
+}
+
+static int8_t gmq_quant_tern_trit_pq(int64_t p_x, int64_t q) {
+    int64_t q_abs = q < 0 ? -q : q;
+    int64_t lhs = p_x * 100;
+    int64_t rhs = 33 * q_abs;
+    if (lhs >= rhs) return 1;
+    if (lhs <= -rhs) return -1;
+    return 0;
+}
+
+uint8_t gmq_quant_tern_encode_pq(int64_t p_valence, int64_t p_arousal, int64_t p_dominance, int64_t q) {
+    int8_t t0 = gmq_quant_tern_trit_pq(p_valence, q);
+    int8_t t1 = gmq_quant_tern_trit_pq(p_arousal, q);
+    int8_t t2 = gmq_quant_tern_trit_pq(p_dominance, q);
+    uint8_t b0 = (uint8_t)((t0 + 1) & 3);
+    uint8_t b1 = (uint8_t)(((t1 + 1) & 3) << 2);
+    uint8_t b2 = (uint8_t)(((t2 + 1) & 3) << 4);
+    uint8_t b3 = (uint8_t)(1u << 6); /* 4th slot is 0 -> (0 + 1) << 6 */
+    return (uint8_t)(b0 | b1 | b2 | b3);
+}
