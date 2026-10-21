@@ -128,6 +128,35 @@ final class KernelTests: XCTestCase {
         XCTAssertTrue((0.05...1.2).contains(s.temperature))
         XCTAssertTrue((20...80).contains(s.topK))
     }
+
+    func testTernaryMatMulPqMatchesFloatTo1e5() {
+        let rows = 32, cols = 32
+        let w: [Double] = (0..<rows * cols).map { Double(($0 * 17 + 3) % 23) / 11.0 - 1.0 }
+        let x: [Double] = (0..<rows).map { Double(($0 * 11 + 5) % 19) / 9.0 - 1.0 }
+        let (trits, scales) = GaiaMLXQuant.quantizePerRow(w, rows: rows, cols: cols)
+        var packed = [UInt8](repeating: 0, count: (rows * cols + 4) / 5)
+        GaiaMLXQuant.packTrits(trits, into: &packed)
+
+        var outFloat = [Double](repeating: 0, count: cols)
+        GaiaMLXQuant.ternaryMatMul(packed: packed, rows: rows, cols: cols, x: x, scales: scales, gamma: 1.0, into: &outFloat)
+
+        var pX = [Int32](repeating: 0, count: rows)
+        GaiaMLXQuant.quantizePqInto(x, q: GaiaMLXQuant.pqDefaultQ, into: &pX)
+        var acc = [Int64](repeating: 0, count: cols)
+        var outPq = [Double](repeating: 0, count: cols)
+        GaiaMLXQuant.ternaryMatMulPq(
+            packed: packed,
+            rows: rows,
+            cols: cols,
+            pX: pX,
+            qX: GaiaMLXQuant.pqDefaultQ,
+            scales: scales,
+            gamma: 1.0,
+            accScratch: &acc,
+            into: &outPq
+        )
+        XCTAssertLessThan(GaiaMLXQuant.relativeError(outPq, outFloat), 1e-5)
+    }
 }
 #elseif canImport(Testing)
 import Testing
@@ -257,6 +286,35 @@ struct KernelTests {
         let s = GaiaMLXQuant.sampling(high)
         #expect((0.05...1.2).contains(s.temperature))
         #expect((20...80).contains(s.topK))
+    }
+
+    @Test func ternaryMatMulPqMatchesFloatTo1e5() {
+        let rows = 32, cols = 32
+        let w: [Double] = (0..<rows * cols).map { Double(($0 * 17 + 3) % 23) / 11.0 - 1.0 }
+        let x: [Double] = (0..<rows).map { Double(($0 * 11 + 5) % 19) / 9.0 - 1.0 }
+        let (trits, scales) = GaiaMLXQuant.quantizePerRow(w, rows: rows, cols: cols)
+        var packed = [UInt8](repeating: 0, count: (rows * cols + 4) / 5)
+        GaiaMLXQuant.packTrits(trits, into: &packed)
+
+        var outFloat = [Double](repeating: 0, count: cols)
+        GaiaMLXQuant.ternaryMatMul(packed: packed, rows: rows, cols: cols, x: x, scales: scales, gamma: 1.0, into: &outFloat)
+
+        var pX = [Int32](repeating: 0, count: rows)
+        GaiaMLXQuant.quantizePqInto(x, q: GaiaMLXQuant.pqDefaultQ, into: &pX)
+        var acc = [Int64](repeating: 0, count: cols)
+        var outPq = [Double](repeating: 0, count: cols)
+        GaiaMLXQuant.ternaryMatMulPq(
+            packed: packed,
+            rows: rows,
+            cols: cols,
+            pX: pX,
+            qX: GaiaMLXQuant.pqDefaultQ,
+            scales: scales,
+            gamma: 1.0,
+            accScratch: &acc,
+            into: &outPq
+        )
+        #expect(GaiaMLXQuant.relativeError(outPq, outFloat) < 1e-5)
     }
 }
 #endif

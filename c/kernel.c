@@ -210,6 +210,109 @@ int gmq_uses_asm(void) { return 0; }
 
 /* ── the kernels ─────────────────────────────────────────────────────────── */
 
+void gmq_quantize_pq(const double *x, size_t n, int64_t q, int32_t *p_out) {
+    size_t i;
+    double qf = (double)q;
+    for (i = 0; i < n; i++) {
+        double v = x[i] * qf;
+        p_out[i] = (int32_t)(v >= 0.0 ? floor(v + 0.5) : ceil(v - 0.5));
+    }
+}
+
+#if defined(__x86_64__) && defined(__SSE4_1__)
+/* SSE4.1 pure integer-numerator SIMD dot product: zero cvtdq2pd float conversions!
+ * Processes 4 trits per iteration in 32-bit integer lanes (pmovsxbd + pmulld + paddd),
+ * flushing into 64-bit acc every 64 elements so i32 overflow is impossible. */
+int64_t gmq_trit_dot_pq(const int8_t *trits, const int32_t *p_x, size_t n) {
+    int64_t total = 0;
+    size_t offset = 0;
+    while (offset + 64 <= n) {
+        const int8_t *t_ptr = trits + offset;
+        const int32_t *p_ptr = p_x + offset;
+        size_t k = 64;
+        int32_t block_sum = 0;
+        __asm__ volatile(
+            "pxor %%xmm0, %%xmm0\n\t"
+            "1:\n\t"
+            "movd (%[t]), %%xmm1\n\t"
+            "pmovsxbd %%xmm1, %%xmm1\n\t"
+            "movdqu (%[p]), %%xmm2\n\t"
+            "pmulld %%xmm2, %%xmm1\n\t"
+            "paddd %%xmm1, %%xmm0\n\t"
+            "add $4, %[t]\n\t"
+            "add $16, %[p]\n\t"
+            "sub $4, %[k]\n\t"
+            "jnz 1b\n\t"
+            "pshufd $0x0E, %%xmm0, %%xmm1\n\t"
+            "paddd %%xmm1, %%xmm0\n\t"
+            "pshufd $0x01, %%xmm0, %%xmm1\n\t"
+            "paddd %%xmm1, %%xmm0\n\t"
+            "movd %%xmm0, %[out]\n\t"
+            : [out] "=r"(block_sum), [t] "+r"(t_ptr), [p] "+r"(p_ptr), [k] "+r"(k)
+            :
+            : "memory", "xmm0", "xmm1", "xmm2");
+        total += (int64_t)block_sum;
+        offset += 64;
+    }
+    for (; offset < n; offset++) {
+        total += (int64_t)trits[offset] * (int64_t)p_x[offset];
+    }
+    return total;
+}
+#else
+int64_t gmq_trit_dot_pq(const int8_t *trits, const int32_t *p_x, size_t n) {
+    int64_t total = 0;
+    size_t i;
+    for (i = 0; i < n; i++) {
+        total += (int64_t)trits[i] * (int64_t)p_x[i];
+    }
+    return total;
+}
+#endif
+
+void gmq_ternary_matmul_pq(const uint8_t *packed, size_t rows, size_t cols,
+                           const int32_t *p_x, int64_t q_x,
+                           const double *scales, double gamma,
+                           int64_t *acc_scratch, double *out) {
+    size_t i, j;
+    double inv_q = gamma / (double)q_x;
+    gmq_build_luts();
+    for (i = 0; i < cols; i++) acc_scratch[i] = 0;
+    for (j = 0; j < rows; j++) {
+        int64_t pxj = (int64_t)p_x[j];
+        size_t start_t, end_t, start_b, end_b, b;
+        if (pxj == 0) continue;
+        if (scales) {
+            double sv = (double)pxj * scales[j];
+            pxj = (int64_t)(sv >= 0.0 ? floor(sv + 0.5) : ceil(sv - 0.5));
+            if (pxj == 0) continue;
+        }
+        start_t = j * cols;
+        end_t = start_t + cols;
+        start_b = start_t / GMQ_TRITS_PER_BYTE;
+        end_b = (end_t + GMQ_TRITS_PER_BYTE - 1) / GMQ_TRITS_PER_BYTE;
+        for (b = start_b; b < end_b; b++) {
+            uint8_t byte = packed[b];
+            size_t base, t;
+            if (byte == 0) continue;
+            base = b * GMQ_TRITS_PER_BYTE;
+            t = base;
+            if (t >= start_t && t < end_t) acc_scratch[t - start_t] += (int64_t)gmq_t0[byte] * pxj;
+            t = base + 1;
+            if (t >= start_t && t < end_t) acc_scratch[t - start_t] += (int64_t)gmq_t1[byte] * pxj;
+            t = base + 2;
+            if (t >= start_t && t < end_t) acc_scratch[t - start_t] += (int64_t)gmq_t2[byte] * pxj;
+            t = base + 3;
+            if (t >= start_t && t < end_t) acc_scratch[t - start_t] += (int64_t)gmq_t3[byte] * pxj;
+            t = base + 4;
+            if (t >= start_t && t < end_t) acc_scratch[t - start_t] += (int64_t)gmq_t4[byte] * pxj;
+        }
+    }
+    for (i = 0; i < cols; i++) {
+        out[i] = (double)acc_scratch[i] * inv_q;
+    }
+}
+
 void gmq_ternary_matmul(const uint8_t *packed, size_t rows, size_t cols,
                         const double *x, const double *scales, double gamma,
                         double *out) {

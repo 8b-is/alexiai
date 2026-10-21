@@ -42,10 +42,13 @@ static ALLOCATOR: Counting = Counting;
 fn hot_paths_perform_zero_allocations() {
     use gaia_mlx_quant::{
         PQ_DEFAULT_Q, b158_matmul_pq_i_major_into, fold, fold_spectrum, gather_qmm_into,
-        maybe_matmul_into, mergeq_matmul_into, mlx_dequantize_group64_into,
+        gather_qmm_pq_into, maybe_matmul_into, mergeq_matmul_into, mlx_dequantize_group64_into,
         mlx_matmul_pq_group64_into, mlx_quantize_group64_into, mlx_quantized_matmul_into,
-        pack_ternary_i_major_into, pack_ternary_into, quantize_pq_into, rms_norm_into, rope_into,
-        sampling, sdpa_single_query_into, ste_linear_backward_into, swiglu_into, ternary_matmul,
+        pack_ternary_i_major_into, pack_ternary_into, quantize_bfp_i8_group64_into,
+        quantize_bfp_i16_group64_into, quantize_pq_adaptive_into, quantize_pq_into, rms_norm_into,
+        rope_into, sampling, sdpa_pq_single_query_into, sdpa_single_query_into,
+        ste_linear_backward_into, swiglu_into, ternary_bfp_adaptive_mem8_matmul_into,
+        ternary_bfp_i8_matmul_into, ternary_bfp_i16_matmul_into, ternary_matmul,
         ternary_simd_pq_matmul_into, ternary_transformer_step_into, unpack_ternary_into,
     };
 
@@ -83,6 +86,11 @@ fn hot_paths_perform_zero_allocations() {
     let mut s_scores = vec![0f64; 4];
     let mut s_gate = vec![0f64; COLS];
     let mut s_up = vec![0f64; COLS];
+    let mut m_i8 = vec![0i8; ROWS];
+    let mut m_i16 = vec![0i16; ROWS];
+    let mut exp_x = vec![0i8; ROWS / 64];
+    let mut scale_x = vec![0f64; ROWS / 64];
+    let mut promoted_mask = vec![false; ROWS / 64];
 
     // Warm the paths (first-call branches and tables are settled).
     pack_ternary_into(&trits, &mut packed);
@@ -116,17 +124,38 @@ fn hot_paths_perform_zero_allocations() {
         mlx_dequantize_group64_into(&mlx_codes, &mlx_scales, ROWS, COLS, &mut dequant_w);
         mlx_quantized_matmul_into(&x, &mlx_codes, &mlx_scales, ROWS, COLS, &mut out);
         quantize_pq_into(&x, PQ_DEFAULT_Q, &mut p_x);
+        let q_adapt = quantize_pq_adaptive_into(&x, 22, &mut p_x);
         quantize_pq_into(&mlx_scales, PQ_DEFAULT_Q, &mut p_scales);
-        mlx_matmul_pq_group64_into(&p_x, PQ_DEFAULT_Q, &mlx_codes, &p_scales, PQ_DEFAULT_Q, ROWS, COLS, &mut out);
-        b158_matmul_pq_i_major_into(&packed_i, ROWS, COLS, &p_x, PQ_DEFAULT_Q, 1.0, &mut out);
-        ternary_simd_pq_matmul_into(&trits, ROWS, COLS, &p_x, PQ_DEFAULT_Q, None, 1.0, &mut out);
+        mlx_matmul_pq_group64_into(&p_x, q_adapt, &mlx_codes, &p_scales, PQ_DEFAULT_Q, ROWS, COLS, &mut out);
+        b158_matmul_pq_i_major_into(&packed_i, ROWS, COLS, &p_x, q_adapt, 1.0, &mut out);
+        ternary_simd_pq_matmul_into(&trits, ROWS, COLS, &p_x, q_adapt, None, 1.0, &mut out);
+        quantize_bfp_i8_group64_into(&x, &mut m_i8, &mut exp_x, &mut scale_x);
+        ternary_bfp_i8_matmul_into(&trits, ROWS, COLS, &m_i8, &scale_x, 1.0, &mut out);
+        quantize_bfp_i16_group64_into(&x, &mut m_i16, &mut exp_x, &mut scale_x);
+        ternary_bfp_i16_matmul_into(&trits, ROWS, COLS, &m_i16, &scale_x, 1.0, &mut out);
+        let _ = ternary_bfp_adaptive_mem8_matmul_into(
+            &trits,
+            ROWS,
+            COLS,
+            &x,
+            0.005,
+            1.0,
+            &mut m_i8,
+            &mut m_i16,
+            &mut exp_x,
+            &mut scale_x,
+            &mut promoted_mask,
+            &mut out,
+        );
         mergeq_matmul_into(&x, &weights, ROWS, COLS, 64, &mut out);
         maybe_matmul_into(&x, &weights, ROWS, COLS, 64, 42, &mut out);
         gather_qmm_into(&x, &mlx_codes, &mlx_scales, 1, ROWS, COLS, &[0], &[1.0], &mut s_norm, &mut out);
+        gather_qmm_pq_into(&p_x, q_adapt, &mlx_codes, &p_scales, PQ_DEFAULT_Q, 1, ROWS, COLS, &[0], &[1.0], &mut s_norm, &mut out);
         rms_norm_into(&x, Some(&scales), 1e-5, &mut out);
         rope_into(&x, 1, 10000.0, &mut out);
         swiglu_into(&x, &scales, &mut out);
         sdpa_single_query_into(&x, &k_cache, &v_cache, 2, COLS, &mut s_scores, &mut out);
+        sdpa_pq_single_query_into(&p_x, &p_x, &p_x, 1 << 14, 1, COLS, &mut s_scores, &mut out);
         ste_linear_backward_into(&x, &weights, &scales, ROWS, COLS, &mut grad_x, &mut grad_w);
         ternary_transformer_step_into(
             &x,

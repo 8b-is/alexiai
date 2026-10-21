@@ -44,13 +44,15 @@ static void quantize_per_row(const double *w, size_t rows, size_t cols,
     size_t r, c;
     for (r = 0; r < rows; r++) {
         const double *row = &w[r * cols];
-        double sum = 0.0, scale;
+        double sum = 0.0, scale, pos_thresh, neg_thresh;
         for (c = 0; c < cols; c++) sum += fabs(row[c]);
         scale = (sum == 0.0) ? 1.0 : (sum / (double)cols);
         scales[r] = scale;
+        pos_thresh = 0.5 * scale;
+        neg_thresh = -pos_thresh;
         for (c = 0; c < cols; c++) {
-            double q = floor((row[c] / scale) + 0.5);
-            trits[r * cols + c] = (q > 0.0) ? 1 : (q < 0.0) ? -1 : 0;
+            double v = row[c];
+            trits[r * cols + c] = (v >= pos_thresh) ? 1 : (v <= neg_thresh) ? -1 : 0;
         }
     }
 }
@@ -67,19 +69,27 @@ int main(int argc, char **argv) {
     uint8_t *packed = (uint8_t *)calloc(packed_len, sizeof(uint8_t));
     double *dense_out = (double *)calloc(cols, sizeof(double));
     double *ternary_out = (double *)calloc(cols, sizeof(double));
+    double *pq_out = (double *)calloc(cols, sizeof(double));
+    double *simd_pq_out = (double *)calloc(cols, sizeof(double));
+    int32_t *p_x = (int32_t *)calloc(rows, sizeof(int32_t));
+    int64_t *acc_scratch = (int64_t *)calloc(cols, sizeof(int64_t));
 
     int iters = 200;
     int k;
-    uint64_t t0, dense_ns, ternary_ns;
+    size_t c_idx;
+    uint64_t t0, dense_ns, ternary_ns, pq_packed_ns, pq_simd_ns;
+    double inv_q = 1.0 / (double)GMQ_PQ_DEFAULT_Q;
 
     fill_weights(w, rows * cols, 0x5eedu);
     fill_weights(x, rows, 0xc0ffeeu);
     quantize_per_row(w, rows, cols, trits, scales);
     gmq_pack_ternary(trits, rows * cols, packed);
+    gmq_quantize_pq(x, rows, GMQ_PQ_DEFAULT_Q, p_x);
 
     /* Warm-up */
     gmq_dense_matmul(w, rows, cols, x, dense_out);
     gmq_ternary_matmul(packed, rows, cols, x, scales, 1.0, ternary_out);
+    gmq_ternary_matmul_pq(packed, rows, cols, p_x, GMQ_PQ_DEFAULT_Q, scales, 1.0, acc_scratch, pq_out);
 
     t0 = now_ns();
     for (k = 0; k < iters; k++) {
@@ -93,6 +103,21 @@ int main(int argc, char **argv) {
     }
     ternary_ns = (now_ns() - t0) / (uint64_t)iters;
 
+    t0 = now_ns();
+    for (k = 0; k < iters; k++) {
+        gmq_ternary_matmul_pq(packed, rows, cols, p_x, GMQ_PQ_DEFAULT_Q, scales, 1.0, acc_scratch, pq_out);
+    }
+    pq_packed_ns = (now_ns() - t0) / (uint64_t)iters;
+
+    t0 = now_ns();
+    for (k = 0; k < iters; k++) {
+        for (c_idx = 0; c_idx < cols; c_idx++) {
+            int64_t dot = gmq_trit_dot_pq(&trits[c_idx * rows], p_x, rows);
+            simd_pq_out[c_idx] = (double)dot * inv_q * scales[c_idx];
+        }
+    }
+    pq_simd_ns = (now_ns() - t0) / (uint64_t)iters;
+
     printf("GAIA-MLX-QUANT C99 bench — honest numbers\n");
     printf("  asm        %s\n", gmq_uses_asm() ? "SSE4.1 / NEON compiled in" : "portable C99");
     printf("  shape      %zux%zu\n", rows, cols);
@@ -101,6 +126,10 @@ int main(int argc, char **argv) {
            (double)(rows * cols * sizeof(double)) / (double)packed_len);
     printf("  cpu dense  %llu ns/iter\n", (unsigned long long)dense_ns);
     printf("  cpu packed %llu ns/iter\n", (unsigned long long)ternary_ns);
+    printf("  cpu p/q pk %llu ns/iter (vs float packed: %.2e diff)\n",
+           (unsigned long long)pq_packed_ns, gmq_relative_error(pq_out, ternary_out, cols));
+    printf("  cpu p/q sm %llu ns/iter (SSE4.1/NEON int SIMD: %.2fx vs dense)\n",
+           (unsigned long long)pq_simd_ns, (double)dense_ns / (double)(pq_simd_ns ? pq_simd_ns : 1));
     printf("  error      %.4f relative L2 vs dense (random weights — the worst case)\n",
            gmq_relative_error(ternary_out, dense_out, cols));
 
@@ -133,5 +162,9 @@ int main(int argc, char **argv) {
     free(packed);
     free(dense_out);
     free(ternary_out);
+    free(pq_out);
+    free(simd_pq_out);
+    free(p_x);
+    free(acc_scratch);
     return 0;
 }

@@ -149,12 +149,86 @@ public enum GaiaMLXQuant {
             var scale = sum / Double(cols)
             if scale == 0 { scale = 1 }
             scales[r] = scale
+            let posThresh = 0.5 * scale
+            let negThresh = -posThresh
             for c in 0..<cols {
-                let q = (w[r * cols + c] / scale).rounded()
-                trits[r * cols + c] = q > 0 ? 1 : (q < 0 ? -1 : 0)
+                let v = w[r * cols + c]
+                trits[r * cols + c] = v >= posThresh ? 1 : (v <= negThresh ? -1 : 0)
             }
         }
         return (trits, scales)
+    }
+
+    // MARK: p/q ("Counting Divided" — integer-numerator engine)
+
+    /// Default dyadic denominator q = 2^20 = 1,048,576.
+    public static let pqDefaultQ: Int64 = 1 << 20
+
+    /// Project a Double slice onto Int32 numerators pOut[k] = round(x[k] * q) in O(K).
+    public static func quantizePqInto(_ x: [Double], q: Int64, into pOut: inout [Int32]) {
+        let qf = Double(q)
+        for i in x.indices {
+            pOut[i] = Int32((x[i] * qf).rounded())
+        }
+    }
+
+    /// Pure p/q ("Counting Divided") integer-numerator masked kernel:
+    /// accumulates in Z (accScratch) with zero inner-loop Int8->Double conversions,
+    /// dividing by qX only once per output column.
+    public static func ternaryMatMulPq(
+        packed: [UInt8],
+        rows: Int,
+        cols: Int,
+        pX: [Int32],
+        qX: Int64,
+        scales: [Double]?,
+        gamma: Double,
+        accScratch: inout [Int64],
+        into out: inout [Double]
+    ) {
+        for i in 0..<cols { accScratch[i] = 0 }
+        let luts = slotLuts
+        for j in 0..<rows {
+            var pxj = Int64(pX[j])
+            if pxj == 0 { continue }
+            if let scales {
+                pxj = Int64((Double(pxj) * scales[j]).rounded())
+                if pxj == 0 { continue }
+            }
+            let startT = j * cols
+            let endT = startT + cols
+            let startB = startT / tritsPerByte
+            let endB = (endT + tritsPerByte - 1) / tritsPerByte
+            for b in startB..<endB {
+                let byte = packed[b]
+                if byte == 0 { continue }
+                let base = b * tritsPerByte
+                let t0 = base
+                if t0 >= startT && t0 < endT {
+                    accScratch[t0 - startT] &+= Int64(luts[0][Int(byte)]) &* pxj
+                }
+                let t1 = base + 1
+                if t1 >= startT && t1 < endT {
+                    accScratch[t1 - startT] &+= Int64(luts[1][Int(byte)]) &* pxj
+                }
+                let t2 = base + 2
+                if t2 >= startT && t2 < endT {
+                    accScratch[t2 - startT] &+= Int64(luts[2][Int(byte)]) &* pxj
+                }
+                let t3 = base + 3
+                if t3 >= startT && t3 < endT {
+                    accScratch[t3 - startT] &+= Int64(luts[3][Int(byte)]) &* pxj
+                }
+                let t4 = base + 4
+                if t4 >= startT && t4 < endT {
+                    accScratch[t4 - startT] &+= Int64(luts[4][Int(byte)]) &* pxj
+                }
+            }
+        }
+        let invQ = gamma / Double(qX)
+        for i in 0..<cols {
+            out[i] = Double(accScratch[i]) * invQ
+        }
     }
 
     // MARK: honesty

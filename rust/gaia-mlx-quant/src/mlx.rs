@@ -534,6 +534,64 @@ pub fn gather_qmm_into(
     }
 }
 
+/// **`gather_qmm_pq_into`** — Pure $p/q$ Integer-Numerator Switch-MoE Sparse Expert Kernel.
+///
+/// Reuses pre-projected input numerators `p_x` (`x[k] ≈ p_x[k] / q_x`) and pre-projected
+/// expert scale numerators `expert_pscales` across all routed `active_experts`, running every
+/// expert projection in $\mathbb{Z}$ via [`mlx_matmul_pq_group64_into`].
+///
+/// Performs **zero heap allocations**.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub fn gather_qmm_pq_into(
+    p_x: &[i32],
+    q_x: i64,
+    expert_codes: &[u32],
+    expert_pscales: &[i32],
+    q_s: i64,
+    num_experts: usize,
+    n_out: usize,
+    k_in: usize,
+    active_experts: &[usize],
+    router_weights: &[f64],
+    expert_scratch: &mut [f64],
+    y_out: &mut [f64],
+) {
+    debug_assert!(k_in.is_multiple_of(MLX_GROUP_SIZE));
+    debug_assert_eq!(active_experts.len(), router_weights.len());
+    debug_assert!(expert_scratch.len() >= n_out);
+    debug_assert!(y_out.len() >= n_out);
+
+    let words_per_expert = n_out * (k_in / TRITS_PER_U32);
+    let scales_per_expert = n_out * (k_in / MLX_GROUP_SIZE);
+
+    for slot in y_out[..n_out].iter_mut() {
+        *slot = 0.0;
+    }
+
+    for (&expert_idx, &gate) in active_experts.iter().zip(router_weights.iter()) {
+        if expert_idx >= num_experts || gate == 0.0 {
+            continue;
+        }
+        let e_codes = &expert_codes[expert_idx * words_per_expert..(expert_idx + 1) * words_per_expert];
+        let e_pscales = &expert_pscales[expert_idx * scales_per_expert..(expert_idx + 1) * scales_per_expert];
+
+        mlx_matmul_pq_group64_into(
+            p_x,
+            q_x,
+            e_codes,
+            e_pscales,
+            q_s,
+            n_out,
+            k_in,
+            expert_scratch,
+        );
+        for i in 0..n_out {
+            y_out[i] = fma(expert_scratch[i], gate, y_out[i]);
+        }
+    }
+}
+
 /// **Pure-Rust MLX Transformer Primitive 1: `rms_norm_into`** (Root Mean Square LayerNorm).
 ///
 /// $$y_i = \frac{x_i}{\sqrt{\frac{1}{D}\sum_{j=0}^{D-1} x_j^2 + \epsilon}} \cdot w_i$$
@@ -674,16 +732,39 @@ pub fn sdpa_single_query_into(
     let scale = 1.0 / sqrt_f64(head_dim as f64);
     let mut max_score = f64::NEG_INFINITY;
 
-    for t in 0..seq_len {
-        let k_row = &k_cache[t * head_dim..(t + 1) * head_dim];
-        let mut dot = 0.0f64;
-        for d in 0..head_dim {
-            dot = fma(q[d], k_row[d], dot);
+    // Fast p/q integer-SIMD Q·K^T path when head_dim <= 512 (zero heap allocations!)
+    let mut pq_q = [0i32; 512];
+    let mut pq_k = [0i32; 512];
+    if head_dim <= pq_q.len() {
+        const Q_ATTN: i64 = 1 << 14; // 16,384 -> product <= 2^28, zero i32 overflow
+        quantize_pq_into(&q[..head_dim], Q_ATTN, &mut pq_q[..head_dim]);
+        let inv_q2_scale = scale / ((Q_ATTN as f64) * (Q_ATTN as f64));
+        for (t, score_slot) in scores_scratch[..seq_len].iter_mut().enumerate() {
+            let k_row = &k_cache[t * head_dim..(t + 1) * head_dim];
+            quantize_pq_into(k_row, Q_ATTN, &mut pq_k[..head_dim]);
+            let dot_i64: i64 = pq_q[..head_dim]
+                .iter()
+                .zip(pq_k[..head_dim].iter())
+                .map(|(&qv, &kv)| (qv as i64) * (kv as i64))
+                .sum();
+            let s = (dot_i64 as f64) * inv_q2_scale;
+            *score_slot = s;
+            if s > max_score {
+                max_score = s;
+            }
         }
-        let s = dot * scale;
-        scores_scratch[t] = s;
-        if s > max_score {
-            max_score = s;
+    } else {
+        for (t, score_slot) in scores_scratch[..seq_len].iter_mut().enumerate() {
+            let k_row = &k_cache[t * head_dim..(t + 1) * head_dim];
+            let mut dot = 0.0f64;
+            for d in 0..head_dim {
+                dot = fma(q[d], k_row[d], dot);
+            }
+            let s = dot * scale;
+            *score_slot = s;
+            if s > max_score {
+                max_score = s;
+            }
         }
     }
 
@@ -707,6 +788,81 @@ pub fn sdpa_single_query_into(
     }
 }
 
+/// **`sdpa_pq_single_query_into`** — Pure $p/q$ Integer-Numerator KV-Cache Attention.
+///
+/// Takes pre-projected integer query numerators `p_q` (`[head_dim]`), pre-projected integer
+/// KV-cache numerators `p_k_cache` and `p_v_cache` (`[seq_len, head_dim]`), and shared
+/// denominator `q_kv` (e.g. `1 << 14`), computing both $q K^T$ and $\text{prob} \cdot V$
+/// in associative integer arithmetic ($\mathbb{Z}$) with single deferred division at the end.
+///
+/// Performs **zero heap allocations**.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub fn sdpa_pq_single_query_into(
+    p_q: &[i32],
+    p_k_cache: &[i32],
+    p_v_cache: &[i32],
+    q_kv: i64,
+    seq_len: usize,
+    head_dim: usize,
+    scores_scratch: &mut [f64],
+    out: &mut [f64],
+) {
+    debug_assert!(p_q.len() >= head_dim);
+    debug_assert!(p_k_cache.len() >= seq_len * head_dim);
+    debug_assert!(p_v_cache.len() >= seq_len * head_dim);
+    debug_assert!(scores_scratch.len() >= seq_len);
+    debug_assert!(out.len() >= head_dim);
+
+    if seq_len == 0 || head_dim == 0 {
+        return;
+    }
+    let inv_q2_scale = 1.0 / ((q_kv as f64) * (q_kv as f64) * sqrt_f64(head_dim as f64));
+    let mut max_score = f64::NEG_INFINITY;
+    let pq_slice = &p_q[..head_dim];
+
+    for (t, score_slot) in scores_scratch[..seq_len].iter_mut().enumerate() {
+        let pk_row = &p_k_cache[t * head_dim..(t + 1) * head_dim];
+        let dot_i64: i64 = pq_slice
+            .iter()
+            .zip(pk_row.iter())
+            .map(|(&qv, &kv)| (qv as i64) * (kv as i64))
+            .sum();
+        let s = (dot_i64 as f64) * inv_q2_scale;
+        *score_slot = s;
+        if s > max_score {
+            max_score = s;
+        }
+    }
+
+    let mut sum_exp = 0.0f64;
+    for s in scores_scratch[..seq_len].iter_mut() {
+        let e = exp_approx(*s - max_score);
+        *s = e;
+        sum_exp += e;
+    }
+    let inv_sum = if sum_exp > 0.0 { 1.0 / sum_exp } else { 0.0 };
+
+    // Project probabilities onto Q_PROB = 2^20 and accumulate prob * V in i64, dividing ONCE at the end!
+    const Q_PROB: i64 = 1 << 20;
+    let q_prob_f64 = Q_PROB as f64;
+    let inv_total = 1.0 / ((Q_PROB as f64) * (q_kv as f64));
+
+    for slot in out[..head_dim].iter_mut() {
+        *slot = 0.0;
+    }
+    for (t, &unnorm_prob) in scores_scratch[..seq_len].iter().enumerate() {
+        let p_prob = ((unnorm_prob * inv_sum) * q_prob_f64).round() as i64;
+        if p_prob == 0 {
+            continue;
+        }
+        let pv_row = &p_v_cache[t * head_dim..(t + 1) * head_dim];
+        for (slot, &pv) in out[..head_dim].iter_mut().zip(pv_row.iter()) {
+            *slot += ((p_prob * (pv as i64)) as f64) * inv_total;
+        }
+    }
+}
+
 /// **Pure-Rust MLX Autodiff (`value_and_grad`): `ste_linear_backward_into`**
 ///
 /// Straight-Through Estimator (STE) backward pass for BitNet b1.58 Quantization-Aware
@@ -716,7 +872,8 @@ pub fn sdpa_single_query_into(
 ///   - $\nabla_x = \nabla_y \cdot \hat{W}$
 ///   - $\nabla_W = \nabla_y^T \otimes x \cdot \mathbb{1}_{|W / \text{scale}| \le 1.5}$ (clipped straight-through gradient)
 ///
-/// Performs **zero heap allocations**.
+/// Uses algebraic threshold hoisting ($\pm 0.5 \times \text{scale}$ and $\pm 1.5 \times \text{scale}$)
+/// to eliminate per-weight float divisions and multiplications. Performs **zero heap allocations**.
 #[inline]
 #[allow(clippy::too_many_arguments)]
 pub fn ste_linear_backward_into(
@@ -748,22 +905,26 @@ pub fn ste_linear_backward_into(
             abs_sum += v.abs();
         }
         let scale = (abs_sum / (k_in.max(1) as f64)).max(1e-12);
-        let inv_scale = 1.0 / scale;
+        // Hoist thresholds outside the k loop: eliminates 4 float multiplies + 1 division per weight!
+        let pos_thresh = 0.5 * scale;
+        let neg_thresh = -pos_thresh;
+        let ste_pos = 1.5 * scale;
+        let ste_neg = -ste_pos;
+        let gy_scaled = gy * scale;
 
         for k in 0..k_in {
-            let norm = row_w[k] * inv_scale;
-            let trit = if norm >= 0.5 {
-                1.0
-            } else if norm <= -0.5 {
-                -1.0
+            let wk = row_w[k];
+            if wk >= pos_thresh {
+                grad_x_out[k] += gy_scaled;
+            } else if wk <= neg_thresh {
+                grad_x_out[k] -= gy_scaled;
+            }
+            // Clipped STE window: pass gradient straight through inside [-1.5*scale, 1.5*scale]
+            row_gw[k] = if wk >= ste_neg && wk <= ste_pos {
+                gy * x[k]
             } else {
                 0.0
             };
-            let w_hat = trit * scale;
-            grad_x_out[k] = fma(gy, w_hat, grad_x_out[k]);
-            // Clipped STE window: pass gradient straight through inside [-1.5, 1.5]
-            let ste_mask = if norm.abs() <= 1.5 { 1.0 } else { 0.0 };
-            row_gw[k] = gy * x[k] * ste_mask;
         }
     }
 }
@@ -1078,6 +1239,50 @@ pub fn quantize_pq_into(x: &[f64], q: i64, p_out: &mut [i32]) {
     }
 }
 
+/// **Dynamic Block-Exponent Rational Projection (`quantize_pq_adaptive_into`)**:
+///
+/// Computes $\max_k |x_k|$ in a single pass and selects the largest power-of-two denominator
+/// $q = 2^e \in [1, 2^{29}]$ such that $\max_k |p_k| \le 2^{\text{max\_bits}}$ (`max_bits` clamped
+/// to `1..=29`), returning the chosen denominator $q$.
+///
+/// At `max_bits = 29` (for `i64` accumulators like [`b158_matmul_pq_i_major_into`]), this provides
+/// **29 bits of effective mantissa precision** (exceeding IEEE-754 FP32's 24-bit mantissa across
+/// any activation dynamic range!). At `max_bits = 22` (for 64-element `i32` accumulators like
+/// [`mlx_matmul_pq_group64_into`]), it guarantees zero `i32` overflow.
+///
+/// Performs **zero heap allocations**.
+#[inline]
+pub fn quantize_pq_adaptive_into(x: &[f64], max_bits: u32, p_out: &mut [i32]) -> i64 {
+    debug_assert!(p_out.len() >= x.len());
+    let target_bits = max_bits.clamp(1, 29);
+    let max_num = (1i64 << target_bits) as f64;
+
+    let mut max_abs = 0.0f64;
+    for &val in x {
+        let a = val.abs();
+        if a > max_abs {
+            max_abs = a;
+        }
+    }
+    if max_abs <= 1e-30 {
+        for dst in p_out[..x.len()].iter_mut() {
+            *dst = 0;
+        }
+        return PQ_DEFAULT_Q;
+    }
+
+    // Find the largest power-of-two q = 2^e in [1, 2^29] such that max_abs * q <= max_num
+    let ratio = max_num / max_abs;
+    let mut q = 1i64;
+    let mut exp = 0u32;
+    while exp < 29 && ((q << 1) as f64) <= ratio {
+        q <<= 1;
+        exp += 1;
+    }
+    quantize_pq_into(x, q, p_out);
+    q
+}
+
 /// **`mlx_matmul_pq_group64_into`** — Pure $p/q$ Integer-Numerator MLX Group-64 Matmul.
 ///
 /// Given integer activation numerators `p_x` (`x[k] ≈ p_x[k] / q_x`), packed MLX `u32` ternary
@@ -1254,13 +1459,16 @@ pub fn b158_matmul_pq_i_major_into(
     }
 }
 
-/// **`ternary_simd_pq_matmul_into`** — Wide-SIMD Auto-Vectorized $p/q$ Integer Dot Product.
+/// **`ternary_simd_pq_matmul_into`** — Wide-SIMD Auto-Vectorized $p/q$ Integer Dot Product
+/// with Explicit 64-Element Overflow Bounds (`i32` inner SIMD $\to$ `i64` outer accumulator).
 ///
-/// Because integer addition in $\mathbb{Z}$ is associative (unlike IEEE-754 `f64`), LLVM
-/// compiles this contiguous `i8 × i32 -> i32` dot product directly into 256-bit AVX2 / 128-bit NEON
-/// vector instructions (`vpmovsxbd` + `vpmulld` + `vpaddd`) in 100% safe `#![forbid(unsafe_code)]` Rust.
-///
-/// Divides by `q_x` **only once per output column** and performs **zero heap allocations**.
+/// - **Inner 64-element block**: Accumulates in `i32`, which LLVM lowers to 8-wide AVX2 / 4-wide NEON
+///   (`vpmovsxbd` + `vpmulld` + `vpaddd`) in 100% safe `#![forbid(unsafe_code)]` Rust.
+///   For $|p_{x,k}| < 2^{25}$ (guaranteed for $q = 2^{20}$ up to $|x_k| < 32$), the 64-element sum
+///   satisfies $|S_{64}| \le 64 \times 2^{25} = 2^{31}-1$, making `i32` overflow impossible.
+/// - **Outer row sum**: Widens each 64-element `i32` block sum into `i64` so arbitrarily long
+///   dimensions $K$ never overflow.
+/// - Divides by `q_x` **only once per output column** and performs **zero heap allocations**.
 #[inline]
 #[allow(clippy::too_many_arguments)]
 pub fn ternary_simd_pq_matmul_into(
@@ -1282,13 +1490,322 @@ pub fn ternary_simd_pq_matmul_into(
 
     for (i, slot) in y_out[..cols].iter_mut().enumerate() {
         let col_trits = &trits_i_major[i * rows..(i + 1) * rows];
-        let dot_i32: i32 = col_trits
-            .iter()
-            .zip(px_slice.iter())
-            .map(|(&t, &px)| (t as i32).wrapping_mul(px))
-            .fold(0i32, i32::wrapping_add);
+        let mut dot_i64 = 0i64;
+        for (t_chunk, px_chunk) in col_trits.chunks(MLX_GROUP_SIZE).zip(px_slice.chunks(MLX_GROUP_SIZE)) {
+            let block_i32: i32 = t_chunk
+                .iter()
+                .zip(px_chunk.iter())
+                .map(|(&t, &px)| (t as i32).wrapping_mul(px))
+                .fold(0i32, i32::wrapping_add);
+            dot_i64 += block_i32 as i64;
+        }
         let col_scale = scales_col.map(|s| s[i]).unwrap_or(1.0);
-        *slot = (dot_i32 as f64) * inv_q * col_scale;
+        *slot = (dot_i64 as f64) * inv_q * col_scale;
     }
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Omni / MEM|8 Block-Floating-Point (BFP-64) Integer Engine:
+//   Variant 1: `i8` mantissa [-127, 127] + block exponent -> `i16` SIMD accumulator (|S_64| <= 8,128)
+//   Variant 2: `i16` mantissa [-32767, 32767] + block exponent -> `i32` SIMD accumulator (|S_64| <= 2,097,088)
+//   Variant 3: MEM|8 Adaptive Precision (`i8` default, promotes blocks to `i16` when error > threshold)
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// Compute the dyadic power-of-two scale $2^{e_g}$ and inverse $2^{-e_g}$ (`e_g: i8`)
+/// that maps `max_abs` into `[max_int / 2, max_int]`.
+#[inline]
+fn dyadic_block_exponent(max_abs: f64, max_int: f64) -> (i8, f64, f64) {
+    if max_abs <= 1e-30 {
+        return (0, 1.0, 1.0);
+    }
+    // Find power-of-two step 2^e such that max_abs / 2^e <= max_int
+    let target_inv = max_int / max_abs;
+    let mut e: i8 = 0;
+    let mut inv_scale = 1.0f64; // 2^(-e)
+    let mut scale = 1.0f64;     // 2^e
+    if target_inv >= 1.0 {
+        while e > -40 && (inv_scale * 2.0) <= target_inv {
+            inv_scale *= 2.0;
+            scale *= 0.5;
+            e -= 1;
+        }
+    } else {
+        while e < 40 && inv_scale > target_inv {
+            inv_scale *= 0.5;
+            scale *= 2.0;
+            e += 1;
+        }
+    }
+    (e, scale, inv_scale)
+}
+
+/// **Variant 1 Quantizer (`quantize_bfp_i8_group64_into`)**:
+///
+/// Projects `x` (`rows` elements, `rows % 64 == 0`) into **1-byte `i8` mantissas**
+/// $m_k \in [-127, 127]$ with a shared power-of-two block exponent $e_g \in \mathbb{Z}$ (`exp_out[g]`)
+/// per 64-element group:
+/// $$x_k \approx m_k \cdot 2^{e_g}, \qquad |S_g|_{\max} = 64 \times 127 = 8{,}128 < 32{,}767 \text{ (fits in } \texttt{i16}\text{!)}$$
+///
+/// Performs **zero heap allocations**.
+#[inline]
+pub fn quantize_bfp_i8_group64_into(
+    x: &[f64],
+    m_out: &mut [i8],
+    exp_out: &mut [i8],
+    scale_out: &mut [f64],
+) {
+    let n = x.len();
+    debug_assert!(n.is_multiple_of(MLX_GROUP_SIZE));
+    let groups = n / MLX_GROUP_SIZE;
+    debug_assert!(m_out.len() >= n);
+    debug_assert!(exp_out.len() >= groups);
+    debug_assert!(scale_out.len() >= groups);
+
+    for g in 0..groups {
+        let xg = &x[g * MLX_GROUP_SIZE..(g + 1) * MLX_GROUP_SIZE];
+        let mg = &mut m_out[g * MLX_GROUP_SIZE..(g + 1) * MLX_GROUP_SIZE];
+        let mut max_abs = 0.0f64;
+        for &v in xg {
+            let a = v.abs();
+            if a > max_abs {
+                max_abs = a;
+            }
+        }
+        let (e, scale, inv_scale) = dyadic_block_exponent(max_abs, 127.0);
+        exp_out[g] = e;
+        scale_out[g] = scale;
+        for (dst, &v) in mg.iter_mut().zip(xg.iter()) {
+            *dst = (v * inv_scale).round().clamp(-127.0, 127.0) as i8;
+        }
+    }
+}
+
+/// **Variant 1 Kernel (`ternary_bfp_i8_matmul_into`)**:
+///
+/// Multiplies `i8` ternary weights (`trits_i_major`) by `i8` block-floating-point activation
+/// mantissas (`m_x`), accumulating each 64-element block in **`i16`** (`16 lanes per 256-bit AVX2
+/// register` via `vpmovsxbw` + `vpmullw` + `vpaddw`!).
+///
+/// Worst-case 64-element block sum is $|S_g|_{\max} = 64 \times 127 = 8{,}128 \le 32{,}767$,
+/// so **`i16` overflow is mathematically impossible**. Performs **zero heap allocations**.
+#[inline]
+pub fn ternary_bfp_i8_matmul_into(
+    trits_i_major: &[i8],
+    rows: usize,
+    cols: usize,
+    m_x: &[i8],
+    block_scales: &[f64],
+    gamma: f64,
+    y_out: &mut [f64],
+) {
+    debug_assert!(rows.is_multiple_of(MLX_GROUP_SIZE));
+    let groups = rows / MLX_GROUP_SIZE;
+    debug_assert!(trits_i_major.len() >= rows * cols);
+    debug_assert!(m_x.len() >= rows);
+    debug_assert!(block_scales.len() >= groups);
+    debug_assert!(y_out.len() >= cols);
+
+    for (i, slot) in y_out[..cols].iter_mut().enumerate() {
+        let col_trits = &trits_i_major[i * rows..(i + 1) * rows];
+        let mut row_acc = 0.0f64;
+        for g in 0..groups {
+            let t_g = &col_trits[g * MLX_GROUP_SIZE..(g + 1) * MLX_GROUP_SIZE];
+            let m_g = &m_x[g * MLX_GROUP_SIZE..(g + 1) * MLX_GROUP_SIZE];
+            // |S_g| <= 64 * 127 = 8,128 -> guaranteed to fit in i16 without overflow!
+            let s_i16: i16 = t_g
+                .iter()
+                .zip(m_g.iter())
+                .map(|(&t, &m)| (t as i16).wrapping_mul(m as i16))
+                .fold(0i16, i16::wrapping_add);
+            row_acc = fma(s_i16 as f64, block_scales[g], row_acc);
+        }
+        *slot = row_acc * gamma;
+    }
+}
+
+/// **Variant 2 Quantizer (`quantize_bfp_i16_group64_into`)**:
+///
+/// Projects `x` (`rows` elements, `rows % 64 == 0`) into **2-byte `i16` mantissas**
+/// $m_k \in [-32767, 32767]$ with a shared power-of-two block exponent $e_g \in \mathbb{Z}$:
+/// $$x_k \approx m_k \cdot 2^{e_g}, \qquad |S_g|_{\max} = 64 \times 32{,}767 = 2{,}097{,}088 \ll 2^{31}-1 \text{ (fits in } \texttt{i32}\text{!)}$$
+///
+/// Performs **zero heap allocations**.
+#[inline]
+pub fn quantize_bfp_i16_group64_into(
+    x: &[f64],
+    m_out: &mut [i16],
+    exp_out: &mut [i8],
+    scale_out: &mut [f64],
+) {
+    let n = x.len();
+    debug_assert!(n.is_multiple_of(MLX_GROUP_SIZE));
+    let groups = n / MLX_GROUP_SIZE;
+    debug_assert!(m_out.len() >= n);
+    debug_assert!(exp_out.len() >= groups);
+    debug_assert!(scale_out.len() >= groups);
+
+    for g in 0..groups {
+        let xg = &x[g * MLX_GROUP_SIZE..(g + 1) * MLX_GROUP_SIZE];
+        let mg = &mut m_out[g * MLX_GROUP_SIZE..(g + 1) * MLX_GROUP_SIZE];
+        let mut max_abs = 0.0f64;
+        for &v in xg {
+            let a = v.abs();
+            if a > max_abs {
+                max_abs = a;
+            }
+        }
+        let (e, scale, inv_scale) = dyadic_block_exponent(max_abs, 32767.0);
+        exp_out[g] = e;
+        scale_out[g] = scale;
+        for (dst, &v) in mg.iter_mut().zip(xg.iter()) {
+            *dst = (v * inv_scale).round().clamp(-32767.0, 32767.0) as i16;
+        }
+    }
+}
+
+/// **Variant 2 Kernel (`ternary_bfp_i16_matmul_into`)**:
+///
+/// Multiplies `i8` ternary weights (`trits_i_major`) by `i16` block-floating-point activation
+/// mantissas (`m_x`), accumulating each 64-element block in **`i32`** (`|S_g| <= 2,097,088`).
+/// Performs **zero heap allocations**.
+#[inline]
+pub fn ternary_bfp_i16_matmul_into(
+    trits_i_major: &[i8],
+    rows: usize,
+    cols: usize,
+    m_x: &[i16],
+    block_scales: &[f64],
+    gamma: f64,
+    y_out: &mut [f64],
+) {
+    debug_assert!(rows.is_multiple_of(MLX_GROUP_SIZE));
+    let groups = rows / MLX_GROUP_SIZE;
+    debug_assert!(trits_i_major.len() >= rows * cols);
+    debug_assert!(m_x.len() >= rows);
+    debug_assert!(block_scales.len() >= groups);
+    debug_assert!(y_out.len() >= cols);
+
+    for (i, slot) in y_out[..cols].iter_mut().enumerate() {
+        let col_trits = &trits_i_major[i * rows..(i + 1) * rows];
+        let mut row_acc = 0.0f64;
+        for g in 0..groups {
+            let t_g = &col_trits[g * MLX_GROUP_SIZE..(g + 1) * MLX_GROUP_SIZE];
+            let m_g = &m_x[g * MLX_GROUP_SIZE..(g + 1) * MLX_GROUP_SIZE];
+            let s_i32: i32 = t_g
+                .iter()
+                .zip(m_g.iter())
+                .map(|(&t, &m)| (t as i32).wrapping_mul(m as i32))
+                .fold(0i32, i32::wrapping_add);
+            row_acc = fma(s_i32 as f64, block_scales[g], row_acc);
+        }
+        *slot = row_acc * gamma;
+    }
+}
+
+/// **Variant 3: MEM|8 Importance-Adaptive Block Precision (`ternary_bfp_adaptive_mem8_matmul_into`)**:
+///
+/// *"Precision should be a property of the information's requirements, not a fixed tax paid by every operation."*
+///
+/// - Starts every 64-element block in ultra-compact **`i8`** (`m_i8`, 16-wide `i16` SIMD accumulator).
+/// - Measures each block's relative L2 quantization error; when a block's error exceeds
+///   `promote_err_thresh` (e.g. `0.0045`), automatically promotes **only that block** to **`i16`**
+///   (`m_i16`, `i32` SIMD accumulator).
+/// - Returns `(promoted_blocks, total_blocks)` and performs **zero heap allocations**.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub fn ternary_bfp_adaptive_mem8_matmul_into(
+    trits_i_major: &[i8],
+    rows: usize,
+    cols: usize,
+    x: &[f64],
+    promote_err_thresh: f64,
+    gamma: f64,
+    m_i8_scratch: &mut [i8],
+    m_i16_scratch: &mut [i16],
+    exp_scratch: &mut [i8],
+    scale_scratch: &mut [f64],
+    promoted_mask_scratch: &mut [bool],
+    y_out: &mut [f64],
+) -> (usize, usize) {
+    debug_assert!(rows.is_multiple_of(MLX_GROUP_SIZE));
+    let groups = rows / MLX_GROUP_SIZE;
+    debug_assert!(trits_i_major.len() >= rows * cols);
+    debug_assert!(x.len() >= rows);
+    debug_assert!(m_i8_scratch.len() >= rows);
+    debug_assert!(m_i16_scratch.len() >= rows);
+    debug_assert!(exp_scratch.len() >= groups);
+    debug_assert!(scale_scratch.len() >= groups);
+    debug_assert!(promoted_mask_scratch.len() >= groups);
+    debug_assert!(y_out.len() >= cols);
+
+    let thresh_sq = promote_err_thresh * promote_err_thresh;
+    let mut promoted_count = 0usize;
+
+    for g in 0..groups {
+        let xg = &x[g * MLX_GROUP_SIZE..(g + 1) * MLX_GROUP_SIZE];
+        let m8g = &mut m_i8_scratch[g * MLX_GROUP_SIZE..(g + 1) * MLX_GROUP_SIZE];
+        let mut max_abs = 0.0f64;
+        let mut norm_sq = 0.0f64;
+        for &v in xg {
+            let a = v.abs();
+            if a > max_abs {
+                max_abs = a;
+            }
+            norm_sq = fma(v, v, norm_sq);
+        }
+        let (e8, s8, inv8) = dyadic_block_exponent(max_abs, 127.0);
+        let mut err_sq = 0.0f64;
+        for (dst, &v) in m8g.iter_mut().zip(xg.iter()) {
+            let q8 = (v * inv8).round().clamp(-127.0, 127.0) as i8;
+            *dst = q8;
+            let diff = (q8 as f64) * s8 - v;
+            err_sq = fma(diff, diff, err_sq);
+        }
+        if norm_sq > 1e-30 && err_sq > thresh_sq * norm_sq {
+            // Promote this high-importance block to i16!
+            let m16g = &mut m_i16_scratch[g * MLX_GROUP_SIZE..(g + 1) * MLX_GROUP_SIZE];
+            let (e16, s16, inv16) = dyadic_block_exponent(max_abs, 32767.0);
+            exp_scratch[g] = e16;
+            scale_scratch[g] = s16;
+            promoted_mask_scratch[g] = true;
+            promoted_count += 1;
+            for (dst, &v) in m16g.iter_mut().zip(xg.iter()) {
+                *dst = (v * inv16).round().clamp(-32767.0, 32767.0) as i16;
+            }
+        } else {
+            exp_scratch[g] = e8;
+            scale_scratch[g] = s8;
+            promoted_mask_scratch[g] = false;
+        }
+    }
+
+    for (i, slot) in y_out[..cols].iter_mut().enumerate() {
+        let col_trits = &trits_i_major[i * rows..(i + 1) * rows];
+        let mut row_acc = 0.0f64;
+        for g in 0..groups {
+            let t_g = &col_trits[g * MLX_GROUP_SIZE..(g + 1) * MLX_GROUP_SIZE];
+            if promoted_mask_scratch[g] {
+                let m16_g = &m_i16_scratch[g * MLX_GROUP_SIZE..(g + 1) * MLX_GROUP_SIZE];
+                let s_i32: i32 = t_g
+                    .iter()
+                    .zip(m16_g.iter())
+                    .map(|(&t, &m)| (t as i32).wrapping_mul(m as i32))
+                    .fold(0i32, i32::wrapping_add);
+                row_acc = fma(s_i32 as f64, scale_scratch[g], row_acc);
+            } else {
+                let m8_g = &m_i8_scratch[g * MLX_GROUP_SIZE..(g + 1) * MLX_GROUP_SIZE];
+                let s_i16: i16 = t_g
+                    .iter()
+                    .zip(m8_g.iter())
+                    .map(|(&t, &m)| (t as i16).wrapping_mul(m as i16))
+                    .fold(0i16, i16::wrapping_add);
+                row_acc = fma(s_i16 as f64, scale_scratch[g], row_acc);
+            }
+        }
+        *slot = row_acc * gamma;
+    }
+
+    (promoted_count, groups)
+}
+
 

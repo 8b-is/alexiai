@@ -73,11 +73,14 @@ pub use kernel::{
 pub use kernel::{Quantized, quantize_ternary};
 pub use mlx::{
     MLX_GROUP_SIZE, MLX_GROUP64_COMPRESSION, PQ_DEFAULT_Q, Pq, QuantMode, StridedView,
-    TRITS_PER_U32, b158_matmul_pq_i_major_into, gather_qmm_into, maybe_matmul_into,
-    mergeq_matmul_into, mlx_code_of, mlx_dequantize_group64_into, mlx_matmul_pq_group64_into,
-    mlx_quantize_group64_into, mlx_quantized_matmul_into, mlx_trit_of, quantize_pq_into,
-    rms_norm_into, rope_into, sdpa_single_query_into, ste_linear_backward_into, swiglu_into,
-    ternary_simd_pq_matmul_into, ternary_transformer_step_into,
+    TRITS_PER_U32, b158_matmul_pq_i_major_into, gather_qmm_into, gather_qmm_pq_into,
+    maybe_matmul_into, mergeq_matmul_into, mlx_code_of, mlx_dequantize_group64_into,
+    mlx_matmul_pq_group64_into, mlx_quantize_group64_into, mlx_quantized_matmul_into, mlx_trit_of,
+    quantize_bfp_i8_group64_into, quantize_bfp_i16_group64_into, quantize_pq_adaptive_into,
+    quantize_pq_into, rms_norm_into, rope_into, sdpa_pq_single_query_into, sdpa_single_query_into,
+    ste_linear_backward_into, swiglu_into, ternary_bfp_adaptive_mem8_matmul_into,
+    ternary_bfp_i8_matmul_into, ternary_bfp_i16_matmul_into, ternary_simd_pq_matmul_into,
+    ternary_transformer_step_into,
 };
 #[cfg(feature = "std")]
 pub use mlx::MlxQuantizedMatrix;

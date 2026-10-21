@@ -28,10 +28,12 @@ pub fn run_bench(dim: usize) -> String {
     use std::time::Instant;
     use gaia_mlx_quant::{
         MLX_GROUP64_COMPRESSION, MlxQuantizedMatrix, PQ_DEFAULT_Q, b158_matmul_pq_i_major_into,
-        dense_matmul, gather_qmm_into, maybe_matmul_into, mergeq_matmul_into,
-        mlx_matmul_pq_group64_into, pack_ternary, pack_ternary_i_major_into, quantize_pq_into,
-        quantize_ternary, relative_error, ternary_matmul, ternary_matmul_i_major,
-        ternary_simd_pq_matmul_into, ternary_transformer_step_into,
+        dense_matmul, gather_qmm_into, gather_qmm_pq_into, maybe_matmul_into, mergeq_matmul_into,
+        mlx_matmul_pq_group64_into, pack_ternary, pack_ternary_i_major_into,
+        quantize_bfp_i8_group64_into, quantize_bfp_i16_group64_into, quantize_pq_into,
+        quantize_ternary, relative_error, ternary_bfp_adaptive_mem8_matmul_into,
+        ternary_bfp_i8_matmul_into, ternary_bfp_i16_matmul_into, ternary_matmul,
+        ternary_matmul_i_major, ternary_simd_pq_matmul_into, ternary_transformer_step_into,
     };
 
     let aligned_dim = dim.max(64).div_ceil(64) * 64;
@@ -145,15 +147,89 @@ pub fn run_bench(dim: usize) -> String {
     );
     let pq_g64_us = t_pqg64.elapsed().as_nanos() as f64 / 1000.0;
 
+    let mut moe_pscales = Vec::with_capacity(4 * p_scales.len());
+    for _ in 0..4 {
+        moe_pscales.extend_from_slice(&p_scales);
+    }
+    let mut y_moe_pq = vec![0.0f64; aligned_dim];
+    let t_moepq = Instant::now();
+    gather_qmm_pq_into(
+        &p_x,
+        PQ_DEFAULT_Q,
+        &moe_codes,
+        &moe_pscales,
+        PQ_DEFAULT_Q,
+        4,
+        aligned_dim,
+        aligned_dim,
+        &[0, 2],
+        &[0.6, 0.4],
+        &mut moe_scratch,
+        &mut y_moe_pq,
+    );
+    let moe_pq_us = t_moepq.elapsed().as_nanos() as f64 / 1000.0;
+
     let mut y_pq_b158 = vec![0.0f64; aligned_dim];
     let t_pqb158 = Instant::now();
     b158_matmul_pq_i_major_into(&w_dd, aligned_dim, aligned_dim, &p_x, PQ_DEFAULT_Q, 1.0, &mut y_pq_b158);
     let pq_b158_us = t_pqb158.elapsed().as_nanos() as f64 / 1000.0;
 
+    let mut trits_dd_i = vec![0i8; aligned_dim * aligned_dim];
+    for j in 0..aligned_dim {
+        for i in 0..aligned_dim {
+            trits_dd_i[i * aligned_dim + j] = trits_dd[j * aligned_dim + i];
+        }
+    }
+
     let mut y_pq_simd = vec![0.0f64; aligned_dim];
     let t_pqsimd = Instant::now();
-    ternary_simd_pq_matmul_into(&trits_dd, aligned_dim, aligned_dim, &p_x, PQ_DEFAULT_Q, None, 1.0, &mut y_pq_simd);
+    ternary_simd_pq_matmul_into(&trits_dd_i, aligned_dim, aligned_dim, &p_x, PQ_DEFAULT_Q, None, 1.0, &mut y_pq_simd);
     let pq_simd_us = t_pqsimd.elapsed().as_nanos() as f64 / 1000.0;
+    let pq_simd_err_vs_ternary = relative_error(&y_pq_simd, &y_imajor);
+
+    // Omni / MEM|8 3-Variant Block-Floating-Point (BFP-64):
+    //   1. BFP-i8 (i8 mantissa + i16 accumulator)
+    //   2. BFP-i16 (i16 mantissa + i32 accumulator)
+    //   3. MEM|8 Adaptive (i8 default, promotes blocks to i16 when error > threshold)
+    let groups = aligned_dim / 64;
+    let mut m_i8 = vec![0i8; aligned_dim];
+    let mut m_i16 = vec![0i16; aligned_dim];
+    let mut exp_x = vec![0i8; groups];
+    let mut scale_x = vec![0.0f64; groups];
+    let mut promoted_mask = vec![false; groups];
+
+    quantize_bfp_i8_group64_into(&x_al, &mut m_i8, &mut exp_x, &mut scale_x);
+    let mut y_bfp_i8 = vec![0.0f64; aligned_dim];
+    let t_bfp8 = Instant::now();
+    ternary_bfp_i8_matmul_into(&trits_dd_i, aligned_dim, aligned_dim, &m_i8, &scale_x, 1.0, &mut y_bfp_i8);
+    let bfp_i8_us = t_bfp8.elapsed().as_nanos() as f64 / 1000.0;
+    let bfp_i8_err = relative_error(&y_bfp_i8, &y_imajor);
+
+    quantize_bfp_i16_group64_into(&x_al, &mut m_i16, &mut exp_x, &mut scale_x);
+    let mut y_bfp_i16 = vec![0.0f64; aligned_dim];
+    let t_bfp16 = Instant::now();
+    ternary_bfp_i16_matmul_into(&trits_dd_i, aligned_dim, aligned_dim, &m_i16, &scale_x, 1.0, &mut y_bfp_i16);
+    let bfp_i16_us = t_bfp16.elapsed().as_nanos() as f64 / 1000.0;
+    let bfp_i16_err = relative_error(&y_bfp_i16, &y_imajor);
+
+    let mut y_bfp_mem8 = vec![0.0f64; aligned_dim];
+    let t_mem8 = Instant::now();
+    let (promoted_blocks, total_blocks) = ternary_bfp_adaptive_mem8_matmul_into(
+        &trits_dd_i,
+        aligned_dim,
+        aligned_dim,
+        &x_al,
+        0.0045,
+        1.0,
+        &mut m_i8,
+        &mut m_i16,
+        &mut exp_x,
+        &mut scale_x,
+        &mut promoted_mask,
+        &mut y_bfp_mem8,
+    );
+    let bfp_mem8_us = t_mem8.elapsed().as_nanos() as f64 / 1000.0;
+    let bfp_mem8_err = relative_error(&y_bfp_mem8, &y_imajor);
 
     let ones_d = vec![1.0f64; aligned_dim];
     let mut k_cache = vec![0.0f64; 8 * aligned_dim];
@@ -199,7 +275,7 @@ pub fn run_bench(dim: usize) -> String {
     let tok_per_sec_16_layers = if tf_us > 0.0 { 1_000_000.0 / (tf_us * 16.0) } else { 0.0 };
 
     format!(
-        r#"{{"dim":{dim},"bitsPerWeight":1.585,"bytesPacked":{},"bytesFloat64":{},"compression":{:.2},"relativeError":{:.4},"mlxRust":{{"engine":"gaia-mlx-quant (100% safe no_std Rust · zero heap allocs · p/q integer numerator)","denseMicros":{:.2},"b158JMajorMicros":{:.2},"b158IMajorMicros":{:.2},"pqB158IMajorMicros":{:.2},"pqWideSimdMicros":{:.2},"group64":{{"compressionVsF32":{:.2},"packedBytes":{},"micros":{:.2},"pqMicros":{:.2},"relativeError":{:.4}}},"mergeQ":{{"intermediateBytes":0,"micros":{:.2},"relativeError":{:.4}}},"maybeStochastic":{{"micros":{:.2}}},"gatherQmmMoE":{{"experts":4,"topK":2,"micros":{:.2}}},"ternaryTransformerBlock":{{"dim":{aligned_dim},"hiddenDim":{hidden_dim},"layerMicros":{:.2},"estTokPerSec16Layer":{:.1}}}}}}}"#,
+        r#"{{"dim":{dim},"bitsPerWeight":1.585,"bytesPacked":{},"bytesFloat64":{},"compression":{:.2},"relativeError":{:.4},"mlxRust":{{"engine":"gaia-mlx-quant (100% safe no_std Rust · zero heap allocs · p/q + BFP-64 integer engine)","denseMicros":{:.2},"b158JMajorMicros":{:.2},"b158IMajorMicros":{:.2},"pqB158IMajorMicros":{:.2},"pqWideSimdMicros":{:.2},"pqWideSimdErrVsTernary":{:.2e},"bfpVariants":{{"i8MantissaI16AccMicros":{:.2},"i8RelErrVsTernary":{:.2e},"i16MantissaI32AccMicros":{:.2},"i16RelErrVsTernary":{:.2e},"mem8AdaptiveMicros":{:.2},"mem8RelErrVsTernary":{:.2e},"mem8PromotedBlocks":{promoted_blocks},"mem8TotalBlocks":{total_blocks}}},"group64":{{"compressionVsF32":{:.2},"packedBytes":{},"micros":{:.2},"pqMicros":{:.2},"relativeError":{:.4}}},"mergeQ":{{"intermediateBytes":0,"micros":{:.2},"relativeError":{:.4}}},"maybeStochastic":{{"micros":{:.2}}},"gatherQmmMoE":{{"experts":4,"topK":2,"micros":{:.2},"pqMicros":{:.2}}},"ternaryTransformerBlock":{{"dim":{aligned_dim},"hiddenDim":{hidden_dim},"layerMicros":{:.2},"estTokPerSec16Layer":{:.1}}}}}}}"#,
         packed.len(),
         w.len() * 8,
         compression,
@@ -209,6 +285,13 @@ pub fn run_bench(dim: usize) -> String {
         imajor_us,
         pq_b158_us,
         pq_simd_us,
+        pq_simd_err_vs_ternary,
+        bfp_i8_us,
+        bfp_i8_err,
+        bfp_i16_us,
+        bfp_i16_err,
+        bfp_mem8_us,
+        bfp_mem8_err,
         MLX_GROUP64_COMPRESSION,
         mlx_q.packed_bytes(),
         g64_us,
@@ -218,6 +301,7 @@ pub fn run_bench(dim: usize) -> String {
         mergeq_err,
         maybe_us,
         moe_us,
+        moe_pq_us,
         tf_us,
         tok_per_sec_16_layers
     )

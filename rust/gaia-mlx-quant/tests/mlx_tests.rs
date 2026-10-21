@@ -1,9 +1,12 @@
 use gaia_mlx_quant::{
     MLX_GROUP64_COMPRESSION, MlxQuantizedMatrix, PQ_DEFAULT_Q, Pq, StridedView,
-    b158_matmul_pq_i_major_into, gather_qmm_into, maybe_matmul_into, mergeq_matmul_into,
-    mlx_code_of, mlx_matmul_pq_group64_into, mlx_quantized_matmul_into, mlx_trit_of,
-    pack_ternary_i_major_into, quantize_pq_into, relative_error, rms_norm_into, rope_into,
-    sdpa_single_query_into, ste_linear_backward_into, swiglu_into, ternary_matmul_i_major,
+    b158_matmul_pq_i_major_into, gather_qmm_into, gather_qmm_pq_into, maybe_matmul_into,
+    mergeq_matmul_into, mlx_code_of, mlx_matmul_pq_group64_into, mlx_quantized_matmul_into,
+    mlx_trit_of, pack_ternary_i_major_into, quantize_bfp_i8_group64_into,
+    quantize_bfp_i16_group64_into, quantize_pq_adaptive_into, quantize_pq_into, relative_error,
+    rms_norm_into, rope_into, sdpa_pq_single_query_into, sdpa_single_query_into,
+    ste_linear_backward_into, swiglu_into, ternary_bfp_adaptive_mem8_matmul_into,
+    ternary_bfp_i8_matmul_into, ternary_bfp_i16_matmul_into, ternary_matmul_i_major,
     ternary_simd_pq_matmul_into, ternary_transformer_step_into,
 };
 
@@ -314,4 +317,134 @@ fn pq_rational_and_integer_numerator_kernels_match_float_to_1e6() {
 
     assert!(relative_error(&y_b158_pq, &y_b158_float) < 1e-6);
     assert!(relative_error(&y_simd_pq, &y_b158_float) < 1e-6);
+
+    // 4. Adaptive 29-bit dyadic projection (`quantize_pq_adaptive_into`)
+    let mut p_adaptive = vec![0i32; rows];
+    let q_adapt = quantize_pq_adaptive_into(&x_row, 28, &mut p_adaptive);
+    assert!(q_adapt >= (1 << 20));
+    let mut y_b158_adapt = vec![0.0f64; cols];
+    b158_matmul_pq_i_major_into(&packed_i, rows, cols, &p_adaptive, q_adapt, 1.0, &mut y_b158_adapt);
+    assert!(relative_error(&y_b158_adapt, &y_b158_float) < 1e-7);
+
+    // 5. Switch-MoE sparse expert p/q kernel (`gather_qmm_pq_into`)
+    let mut scratch = vec![0.0f64; rows];
+    let mut moe_float = vec![0.0f64; rows];
+    let mut moe_pq = vec![0.0f64; rows];
+    gather_qmm_into(
+        &x,
+        &q.codes,
+        &q.scales,
+        1,
+        rows,
+        cols,
+        &[0],
+        &[0.75],
+        &mut scratch,
+        &mut moe_float,
+    );
+    gather_qmm_pq_into(
+        &p_x,
+        PQ_DEFAULT_Q,
+        &q.codes,
+        &p_scales,
+        PQ_DEFAULT_Q,
+        1,
+        rows,
+        cols,
+        &[0],
+        &[0.75],
+        &mut scratch,
+        &mut moe_pq,
+    );
+    assert!(relative_error(&moe_pq, &moe_float) < 1e-5);
+
+    // 6. Causal KV-Cache Attention in p/q (`sdpa_pq_single_query_into`)
+    let seq_len = 4;
+    let head_dim = 16;
+    let q_vec = &x[..head_dim];
+    let k_cache = &w[..seq_len * head_dim];
+    let v_cache = &w[seq_len * head_dim..2 * seq_len * head_dim];
+    let mut scores_f = [0.0f64; 4];
+    let mut scores_p = [0.0f64; 4];
+    let mut out_f = [0.0f64; 16];
+    let mut out_p = [0.0f64; 16];
+    sdpa_single_query_into(q_vec, k_cache, v_cache, seq_len, head_dim, &mut scores_f, &mut out_f);
+
+    let q_kv = 1i64 << 14;
+    let mut pq_q = [0i32; 16];
+    let mut pq_k = [0i32; 64];
+    let mut pq_v = [0i32; 64];
+    quantize_pq_into(q_vec, q_kv, &mut pq_q);
+    quantize_pq_into(k_cache, q_kv, &mut pq_k);
+    quantize_pq_into(v_cache, q_kv, &mut pq_v);
+    sdpa_pq_single_query_into(&pq_q, &pq_k, &pq_v, q_kv, seq_len, head_dim, &mut scores_p, &mut out_p);
+    assert!(relative_error(&out_p, &out_f) < 1e-4);
+
+    // 7. Omni / MEM|8 3-Variant Block-Floating-Point (`i8`, `i16`, and Adaptive `i8->i16`)
+    let bfp_rows = 128;
+    let bfp_cols = 64;
+    let trits_bfp_j: Vec<i8> = (0..bfp_rows * bfp_cols)
+        .map(|i| [-1, 0, 1][(i * 11 + 3) % 3])
+        .collect();
+    let mut trits_bfp_i = vec![0i8; bfp_rows * bfp_cols];
+    for j in 0..bfp_rows {
+        for i in 0..bfp_cols {
+            trits_bfp_i[i * bfp_rows + j] = trits_bfp_j[j * bfp_cols + i];
+        }
+    }
+    let mut packed_bfp_i = vec![0u8; (bfp_rows * bfp_cols).div_ceil(5)];
+    pack_ternary_i_major_into(&trits_bfp_j, bfp_rows, bfp_cols, &mut packed_bfp_i);
+
+    let mut x_bfp: Vec<f64> = (0..bfp_rows)
+        .map(|j| ((j * 17 + 5) % 31) as f64 / 15.0 - 1.0)
+        .collect();
+    // Make block 1 have a spiky outlier distribution to trigger MEM|8 adaptive promotion
+    x_bfp[64] = 10.0;
+    x_bfp[65] = 0.031;
+
+    let mut y_ref = vec![0.0f64; bfp_cols];
+    ternary_matmul_i_major(&packed_bfp_i, bfp_rows, bfp_cols, &x_bfp, None, 1.0, &mut y_ref);
+
+    let groups = bfp_rows / 64;
+    let mut m_i8 = vec![0i8; bfp_rows];
+    let mut m_i16 = vec![0i16; bfp_rows];
+    let mut exp_x = vec![0i8; groups];
+    let mut scale_x = vec![0.0f64; groups];
+    let mut promoted_mask = vec![false; groups];
+
+    let mut y_bfp_i8 = vec![0.0f64; bfp_cols];
+    quantize_bfp_i8_group64_into(&x_bfp, &mut m_i8, &mut exp_x, &mut scale_x);
+    ternary_bfp_i8_matmul_into(&trits_bfp_i, bfp_rows, bfp_cols, &m_i8, &scale_x, 1.0, &mut y_bfp_i8);
+    let err_i8 = relative_error(&y_bfp_i8, &y_ref);
+    assert!(err_i8 < 0.03, "BFP-i8 error on spiky outlier vector should be < 3%: {err_i8}");
+
+    let mut y_bfp_i16 = vec![0.0f64; bfp_cols];
+    quantize_bfp_i16_group64_into(&x_bfp, &mut m_i16, &mut exp_x, &mut scale_x);
+    ternary_bfp_i16_matmul_into(&trits_bfp_i, bfp_rows, bfp_cols, &m_i16, &scale_x, 1.0, &mut y_bfp_i16);
+    let err_i16 = relative_error(&y_bfp_i16, &y_ref);
+    assert!(err_i16 < 1e-4, "BFP-i16 error should be < 1e-4: {err_i16}");
+    assert!(err_i16 < err_i8, "BFP-i16 must be strictly more accurate than BFP-i8");
+
+    let mut y_bfp_mem8 = vec![0.0f64; bfp_cols];
+    let (promoted, total) = ternary_bfp_adaptive_mem8_matmul_into(
+        &trits_bfp_i,
+        bfp_rows,
+        bfp_cols,
+        &x_bfp,
+        0.003,
+        1.0,
+        &mut m_i8,
+        &mut m_i16,
+        &mut exp_x,
+        &mut scale_x,
+        &mut promoted_mask,
+        &mut y_bfp_mem8,
+    );
+    assert_eq!(total, 2);
+    assert!(promoted >= 1, "expected spiky block to be promoted to i16");
+    let err_mem8 = relative_error(&y_bfp_mem8, &y_ref);
+    assert!(
+        err_mem8 < err_i8 * 0.5,
+        "MEM|8 adaptive error ({err_mem8}) must cut spiky i8 error ({err_i8}) by >2x"
+    );
 }

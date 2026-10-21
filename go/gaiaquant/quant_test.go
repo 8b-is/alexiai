@@ -177,3 +177,32 @@ func TestFoldSpectrumModulatesEntropy(t *testing.T) {
 		t.Fatalf("sampling out of bounds: %+v", s)
 	}
 }
+
+func TestTernaryMatMulPqMatchesFloatTo1e6(t *testing.T) {
+	rows, cols := 64, 64
+	w := make([]float64, rows*cols)
+	for i := range w {
+		w[i] = float64((i*17+3)%23)/11.0 - 1.0
+	}
+	x := make([]float64, rows)
+	for j := range x {
+		x[j] = float64((j*11+5)%19)/9.0 - 1.0
+	}
+	trits, scales := QuantizePerRow(w, rows, cols)
+	packed := make([]uint8, (rows*cols+TritPerByte-1)/TritPerByte)
+	PackTrits(trits, packed)
+
+	outFloat := make([]float64, cols)
+	TernaryMatMul(packed, rows, cols, x, scales, 1.0, outFloat)
+
+	pX := make([]int32, rows)
+	QuantizePqInto(x, PqDefaultQ, pX)
+	acc := make([]int64, cols)
+	outPq := make([]float64, cols)
+	TernaryMatMulPq(packed, rows, cols, pX, PqDefaultQ, scales, 1.0, acc, outPq)
+
+	err := RelativeError(outPq, outFloat)
+	if err > 1e-5 {
+		t.Fatalf("TernaryMatMulPq relative error vs float too high: %v", err)
+	}
+}

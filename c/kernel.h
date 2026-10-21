@@ -18,6 +18,7 @@ extern "C" {
 #endif
 
 #define GMQ_TRITS_PER_BYTE 5
+#define GMQ_PQ_DEFAULT_Q (1048576LL) /* 2^20: "Counting Divided" dyadic denominator */
 
 /* Pack trits into a caller-owned, zero-initialized byte buffer. */
 void gmq_pack_ternary(const int8_t *trits, size_t n, uint8_t *out);
@@ -28,10 +29,23 @@ void gmq_unpack_ternary(const uint8_t *bytes, size_t count, int8_t *out);
 /* sum_j (pos[j] - neg[j]) * x[j] — the primitive the kernels are built on. */
 double gmq_trit_dot(const int8_t *pos, const int8_t *neg, const double *x, size_t n);
 
+/* Project double values onto int32 numerators p_out[k] = round(x[k] * q) in O(n). */
+void gmq_quantize_pq(const double *x, size_t n, int64_t q, int32_t *p_out);
+
+/* Pure integer-numerator dot product sum_j trits[j] * p_x[j] in Z (SSE4.1 pmulld / NEON smull). */
+int64_t gmq_trit_dot_pq(const int8_t *trits, const int32_t *p_x, size_t n);
+
 /* The masked kernel, j-major: out[i] = gamma * sum_j trit[j][i] * scale[j] * x[j]. */
 void gmq_ternary_matmul(const uint8_t *packed, size_t rows, size_t cols,
                         const double *x, const double *scales, double gamma,
                         double *out);
+
+/* Pure p/q ("Counting Divided") integer-numerator masked kernel: accumulates in Z (acc_scratch)
+ * with zero inner-loop int->double conversions, dividing by q_x only once per output column. */
+void gmq_ternary_matmul_pq(const uint8_t *packed, size_t rows, size_t cols,
+                           const int32_t *p_x, int64_t q_x,
+                           const double *scales, double gamma,
+                           int64_t *acc_scratch, double *out);
 
 /* Dense float64 reference. */
 void gmq_dense_matmul(const double *w, size_t rows, size_t cols,

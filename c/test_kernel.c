@@ -149,6 +149,46 @@ static void test_fold_spectrum(void) {
     CHECK(high.coherence >= 0.0 && high.coherence <= 1.0, "fold_spectrum coherence in [0, 1]");
 }
 
+static void test_pq_kernels(void) {
+    enum { N = 135, ROWS = 16, COLS = 25 };
+    int8_t trits_dot[N];
+    double x_dot[N];
+    int32_t px_dot[N];
+    int64_t ref_dot = 0, got_dot;
+    int8_t trits_m[ROWS * COLS];
+    double x_m[ROWS], scales_m[ROWS];
+    int32_t px_m[ROWS];
+    uint8_t packed_m[(ROWS * COLS + 4) / 5];
+    int64_t acc_m[COLS];
+    double out_float[COLS], out_pq[COLS];
+    int i;
+
+    for (i = 0; i < N; i++) {
+        trits_dot[i] = (int8_t)((i % 3) - 1);
+        x_dot[i] = ((double)((i * 11 + 3) % 19) / 9.0) - 1.0;
+    }
+    gmq_quantize_pq(x_dot, N, GMQ_PQ_DEFAULT_Q, px_dot);
+    for (i = 0; i < N; i++) {
+        ref_dot += (int64_t)trits_dot[i] * (int64_t)px_dot[i];
+    }
+    got_dot = gmq_trit_dot_pq(trits_dot, px_dot, N);
+    CHECK(got_dot == ref_dot, "gmq_trit_dot_pq SSE4.1/C99 matches exact integer numerator");
+
+    for (i = 0; i < ROWS * COLS; i++) trits_m[i] = (int8_t)(((i * 7 + 2) % 3) - 1);
+    for (i = 0; i < ROWS; i++) {
+        x_m[i] = ((double)((i * 13 + 5) % 17) / 8.0) - 1.0;
+        scales_m[i] = 0.35 + (double)(i % 5) * 0.12;
+    }
+    memset(packed_m, 0, sizeof(packed_m));
+    gmq_pack_ternary(trits_m, ROWS * COLS, packed_m);
+    gmq_quantize_pq(x_m, ROWS, GMQ_PQ_DEFAULT_Q, px_m);
+
+    gmq_ternary_matmul(packed_m, ROWS, COLS, x_m, scales_m, 1.0, out_float);
+    gmq_ternary_matmul_pq(packed_m, ROWS, COLS, px_m, GMQ_PQ_DEFAULT_Q, scales_m, 1.0, acc_m, out_pq);
+    CHECK(gmq_relative_error(out_pq, out_float, COLS) < 1e-5,
+          "gmq_ternary_matmul_pq matches float kernel within 1e-5");
+}
+
 #ifdef GMQ_CUDA
 static void test_cuda_matches_cpu(void) {
     char gpu_name[128] = {0};
@@ -210,6 +250,7 @@ int main(void) {
     test_non_aligned_rows();
     test_relative_error();
     test_fold_spectrum();
+    test_pq_kernels();
 #ifdef GMQ_CUDA
     test_cuda_matches_cpu();
 #endif

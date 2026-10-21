@@ -152,17 +152,81 @@ func QuantizePerRow(w []float64, rows, cols int) (trits []int8, scales []float64
 			scale = 1
 		}
 		scales[r] = scale
+		posThresh := 0.5 * scale
+		negThresh := -posThresh
 		for c, v := range row {
-			q := math.Round(v / scale)
 			switch {
-			case q > 0:
+			case v >= posThresh:
 				trits[r*cols+c] = 1
-			case q < 0:
+			case v <= negThresh:
 				trits[r*cols+c] = -1
 			}
 		}
 	}
 	return trits, scales
+}
+
+// PqDefaultQ is the default dyadic denominator q = 2^20 = 1,048,576 ("Counting Divided").
+const PqDefaultQ int64 = 1 << 20
+
+// QuantizePqInto projects a float64 slice onto int32 numerators pOut[k] = round(x[k] * q)
+// in O(K) with zero heap allocations.
+func QuantizePqInto(x []float64, q int64, pOut []int32) {
+	qf := float64(q)
+	for i, v := range x {
+		pOut[i] = int32(math.Round(v * qf))
+	}
+}
+
+// TernaryMatMulPq is the p/q ("Counting Divided") integer-numerator kernel:
+// accumulates all ternary products in Z (accScratch []int64) with zero inner-loop
+// int8->float64 conversions, dividing by qX only once per output column.
+func TernaryMatMulPq(packed []uint8, rows, cols int, pX []int32, qX int64, scales []float64, gamma float64, accScratch []int64, out []float64) {
+	for i := range accScratch[:cols] {
+		accScratch[i] = 0
+	}
+	for j := 0; j < rows; j++ {
+		pxj := int64(pX[j])
+		if pxj == 0 {
+			continue
+		}
+		if scales != nil {
+			pxj = int64(math.Round(float64(pxj) * scales[j]))
+			if pxj == 0 {
+				continue
+			}
+		}
+		startT := j * cols
+		endT := startT + cols
+		startB := startT / TritPerByte
+		endB := (endT + TritPerByte - 1) / TritPerByte
+		for b := startB; b < endB; b++ {
+			byte_ := packed[b]
+			if byte_ == 0 {
+				continue
+			}
+			base := b * TritPerByte
+			if t := base; t >= startT && t < endT {
+				accScratch[t-startT] += int64(T0[byte_]) * pxj
+			}
+			if t := base + 1; t >= startT && t < endT {
+				accScratch[t-startT] += int64(T1[byte_]) * pxj
+			}
+			if t := base + 2; t >= startT && t < endT {
+				accScratch[t-startT] += int64(T2[byte_]) * pxj
+			}
+			if t := base + 3; t >= startT && t < endT {
+				accScratch[t-startT] += int64(T3[byte_]) * pxj
+			}
+			if t := base + 4; t >= startT && t < endT {
+				accScratch[t-startT] += int64(T4[byte_]) * pxj
+			}
+		}
+	}
+	invQ := gamma / float64(qX)
+	for i := 0; i < cols; i++ {
+		out[i] = float64(accScratch[i]) * invQ
+	}
 }
 
 // RelativeError is the relative L2 error of actual against reference.

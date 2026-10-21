@@ -172,6 +172,10 @@ func bench(args []string) error {
 
 	dense := make([]float64, cols)
 	ternary := make([]float64, cols)
+	ternaryPq := make([]float64, cols)
+	pX := make([]int32, rows)
+	accScratch := make([]int64, cols)
+	gaiaquant.QuantizePqInto(x, gaiaquant.PqDefaultQ, pX)
 
 	start := time.Now()
 	gaiaquant.DenseMatMul(w, rows, cols, x, dense)
@@ -181,12 +185,18 @@ func bench(args []string) error {
 	gaiaquant.TernaryMatMul(packed, rows, cols, x, scales, 1, ternary)
 	ternaryNs := time.Since(start).Nanoseconds()
 
+	start = time.Now()
+	gaiaquant.TernaryMatMulPq(packed, rows, cols, pX, gaiaquant.PqDefaultQ, scales, 1, accScratch, ternaryPq)
+	ternaryPqNs := time.Since(start).Nanoseconds()
+
 	fmt.Println("  gaiaquant bench — honest numbers")
 	fmt.Printf("    shape      %dx%d\n", rows, cols)
 	fmt.Printf("    packing    %.4f bits/weight · %d bytes vs %d float64 (%.1fx)\n",
 		gaiaquant.BitsPerWeight, len(packed), len(w)*8, float64(len(w)*8)/float64(len(packed)))
 	fmt.Printf("    dense      %d ns\n", denseNs)
 	fmt.Printf("    ternary    %d ns\n", ternaryNs)
+	fmt.Printf("    p/q int    %d ns (vs float ternary: %.2fe diff)\n",
+		ternaryPqNs, gaiaquant.RelativeError(ternaryPq, ternary))
 	fmt.Printf("    error      %.4f relative L2 vs dense (random weights — the worst case)\n",
 		gaiaquant.RelativeError(ternary, dense))
 	return nil
