@@ -56,10 +56,19 @@ extern crate std;
 #[cfg(feature = "std")]
 extern crate alloc;
 
+pub mod engram;
 pub mod gaia;
 pub mod kernel;
 pub mod mlx;
 pub mod pack;
+
+pub use engram::{
+    Bfp64HeadRow, ENGRAM_DEFAULT_HC_MULT, ENGRAM_HEAD_DIM, Mem8AdaptiveHeadRow, PrimeBucketMod,
+    engram_bfp64_int_aligned_matmul_into, engram_bfp64_prequant_matmul_into,
+    engram_gather_bfp64_heads_into, engram_hash_ngram_mod_into, engram_hash_ngram_pq_into,
+    engram_hc_gate, engram_mem8_adaptive_matmul_into, engram_step_bfp64_into,
+    engram_step_dense_fp64_into,
+};
 
 pub use gaia::{
     ENTROPY_REST, GRAVITY, Layer, PHI, RESONANCE, WEATHER_REST, Fold, Sampling, fold,

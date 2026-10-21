@@ -41,15 +41,19 @@ static ALLOCATOR: Counting = Counting;
 #[test]
 fn hot_paths_perform_zero_allocations() {
     use gaia_mlx_quant::{
-        PQ_DEFAULT_Q, b158_matmul_pq_i_major_into, fold, fold_spectrum, gather_qmm_into,
-        gather_qmm_pq_into, maybe_matmul_into, mergeq_matmul_into, mlx_dequantize_group64_into,
-        mlx_matmul_pq_group64_into, mlx_quantize_group64_into, mlx_quantized_matmul_into,
-        pack_ternary_i_major_into, pack_ternary_into, quantize_bfp_i8_group64_into,
-        quantize_bfp_i16_group64_into, quantize_pq_adaptive_into, quantize_pq_into, rms_norm_into,
-        rope_into, sampling, sdpa_pq_single_query_into, sdpa_single_query_into,
-        ste_linear_backward_into, swiglu_into, ternary_bfp_adaptive_mem8_matmul_into,
-        ternary_bfp_i8_matmul_into, ternary_bfp_i16_matmul_into, ternary_matmul,
-        ternary_simd_pq_matmul_into, ternary_transformer_step_into, unpack_ternary_into,
+        Bfp64HeadRow, Mem8AdaptiveHeadRow, PQ_DEFAULT_Q, PrimeBucketMod, b158_matmul_pq_i_major_into,
+        engram_bfp64_int_aligned_matmul_into, engram_bfp64_prequant_matmul_into,
+        engram_gather_bfp64_heads_into, engram_hash_ngram_pq_into,
+        engram_mem8_adaptive_matmul_into, engram_step_bfp64_into, fold, fold_spectrum,
+        gather_qmm_into, gather_qmm_pq_into, maybe_matmul_into, mergeq_matmul_into,
+        mlx_dequantize_group64_into, mlx_matmul_pq_group64_into, mlx_quantize_group64_into,
+        mlx_quantized_matmul_into, pack_ternary_i_major_into, pack_ternary_into,
+        quantize_bfp_i8_group64_into, quantize_bfp_i16_group64_into, quantize_pq_adaptive_into,
+        quantize_pq_into, rms_norm_into, rope_into, sampling, sdpa_pq_single_query_into,
+        sdpa_single_query_into, ste_linear_backward_into, swiglu_into,
+        ternary_bfp_adaptive_mem8_matmul_into, ternary_bfp_i8_matmul_into,
+        ternary_bfp_i16_matmul_into, ternary_matmul, ternary_simd_pq_matmul_into,
+        ternary_transformer_step_into, unpack_ternary_into,
     };
 
     const ROWS: usize = 64;
@@ -91,6 +95,14 @@ fn hot_paths_perform_zero_allocations() {
     let mut exp_x = vec![0i8; ROWS / 64];
     let mut scale_x = vec![0f64; ROWS / 64];
     let mut promoted_mask = vec![false; ROWS / 64];
+
+    let engram_buckets = [PrimeBucketMod::new(17, 0)];
+    let engram_tokens = [3u64, 7, 11, 13];
+    let engram_mults = [131u64, 997u64];
+    let mut engram_indices = vec![0usize; 4];
+    let bfp_head_table = vec![Bfp64HeadRow::from_f64_slice(&x); 17];
+    let mem8_head_table = vec![Mem8AdaptiveHeadRow::from_f64_slice(&x, 0.005); 17];
+    let mut engram_out_hc = vec![0f64; COLS];
 
     // Warm the paths (first-call branches and tables are settled).
     pack_ternary_into(&trits, &mut packed);
@@ -185,6 +197,32 @@ fn hot_paths_perform_zero_allocations() {
         );
         let f1 = fold("Analyze Shinjuku 2.4GHz Ch 6 saturation", None);
         let f2 = fold_spectrum("Analyze Shinjuku 2.4GHz Ch 6 saturation", 2.418, None);
+        engram_hash_ngram_pq_into(&engram_tokens, 2, &engram_mults, 1, &engram_buckets, &mut engram_indices);
+        engram_gather_bfp64_heads_into(&bfp_head_table, &engram_indices[..1], &mut m_i8, &mut exp_x);
+        engram_bfp64_prequant_matmul_into(&m_i8, &exp_x, &trits, &mlx_scales, ROWS, COLS, &mut out);
+        engram_bfp64_int_aligned_matmul_into(&m_i8, &exp_x, &trits, &p_scales, ROWS, COLS, &mut out);
+        engram_mem8_adaptive_matmul_into(&mem8_head_table, &engram_indices[..1], &trits, &mlx_scales, ROWS, COLS, &mut out);
+        engram_step_bfp64_into(
+            &bfp_head_table,
+            &engram_indices[..1],
+            &x,
+            &trits,
+            &mlx_scales,
+            &trits,
+            &mlx_scales,
+            &scales,
+            &scales,
+            1,
+            ROWS,
+            COLS,
+            &mut m_i8,
+            &mut exp_x,
+            &mut s_v,
+            &mut s_k,
+            &mut s_norm,
+            &mut s_q,
+            &mut engram_out_hc,
+        );
         std::hint::black_box((sampling(&f1), sampling(&f2)));
     }
     let after = ALLOCS.load(Ordering::Relaxed);
