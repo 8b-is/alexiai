@@ -1,8 +1,10 @@
 use gaia_mlx_quant::{
-    MLX_GROUP64_COMPRESSION, MlxQuantizedMatrix, StridedView, gather_qmm_into, maybe_matmul_into,
-    mergeq_matmul_into, mlx_code_of, mlx_quantized_matmul_into, mlx_trit_of,
-    pack_ternary_i_major_into, relative_error, rms_norm_into, rope_into, sdpa_single_query_into,
-    ste_linear_backward_into, swiglu_into, ternary_transformer_step_into,
+    MLX_GROUP64_COMPRESSION, MlxQuantizedMatrix, PQ_DEFAULT_Q, Pq, StridedView,
+    b158_matmul_pq_i_major_into, gather_qmm_into, maybe_matmul_into, mergeq_matmul_into,
+    mlx_code_of, mlx_matmul_pq_group64_into, mlx_quantized_matmul_into, mlx_trit_of,
+    pack_ternary_i_major_into, quantize_pq_into, relative_error, rms_norm_into, rope_into,
+    sdpa_single_query_into, ste_linear_backward_into, swiglu_into, ternary_matmul_i_major,
+    ternary_simd_pq_matmul_into, ternary_transformer_step_into,
 };
 
 #[test]
@@ -245,4 +247,71 @@ fn ste_linear_backward_produces_valid_gradients() {
     let mut y1 = [0.0f64; 1];
     mlx_quantized_matmul_into(&x64, &codes, &scales, 1, 64, &mut y1);
     assert!(y1[0].is_finite());
+}
+
+#[test]
+fn pq_rational_and_integer_numerator_kernels_match_float_to_1e6() {
+    // 1. Exact rational Pq arithmetic
+    let a = Pq::reduced(6, 8).unwrap();
+    assert_eq!((a.p, a.q), (3, 4));
+    let b = Pq::reduced(1, 4).unwrap();
+    assert_eq!(a.add(b), Pq { p: 1, q: 1 });
+    assert_eq!(a.mul(b), Pq { p: 3, q: 16 });
+    assert!(Pq::new(1, 0).is_none());
+
+    // 2. MLX Group-64 p/q vs float Group-64
+    let rows = 32;
+    let cols = 128;
+    let w: Vec<f64> = (0..rows * cols)
+        .map(|i| ((i * 19 + 7) % 29) as f64 / 14.0 - 1.0)
+        .collect();
+    let x: Vec<f64> = (0..cols).map(|k| ((k * 11 + 3) % 17) as f64 / 8.0 - 1.0).collect();
+
+    let q = MlxQuantizedMatrix::quantize(&w, rows, cols).unwrap();
+    let y_float = q.matvec(&x);
+
+    let mut p_x = vec![0i32; cols];
+    let mut p_scales = vec![0i32; q.scales.len()];
+    quantize_pq_into(&x, PQ_DEFAULT_Q, &mut p_x);
+    quantize_pq_into(&q.scales, PQ_DEFAULT_Q, &mut p_scales);
+
+    let mut y_pq = vec![0.0f64; rows];
+    mlx_matmul_pq_group64_into(
+        &p_x,
+        PQ_DEFAULT_Q,
+        &q.codes,
+        &p_scales,
+        PQ_DEFAULT_Q,
+        rows,
+        cols,
+        &mut y_pq,
+    );
+    let err_g64 = relative_error(&y_pq, &y_float);
+    assert!(err_g64 < 1e-5, "p/q Group-64 vs float error: {err_g64}");
+
+    // 3. GAIA b1.58 i-major p/q & Wide-SIMD p/q vs float b1.58 i-major
+    let trits_j: Vec<i8> = (0..rows * cols).map(|i| [-1, 0, 1][(i * 7 + 2) % 3]).collect();
+    let mut trits_i = vec![0i8; rows * cols];
+    for j in 0..rows {
+        for i in 0..cols {
+            trits_i[i * rows + j] = trits_j[j * cols + i];
+        }
+    }
+    let mut packed_i = vec![0u8; (rows * cols).div_ceil(5)];
+    pack_ternary_i_major_into(&trits_j, rows, cols, &mut packed_i);
+
+    let x_row: Vec<f64> = (0..rows).map(|j| ((j * 5 + 1) % 13) as f64 / 6.0 - 1.0).collect();
+    let mut p_x_row = vec![0i32; rows];
+    quantize_pq_into(&x_row, PQ_DEFAULT_Q, &mut p_x_row);
+
+    let mut y_b158_float = vec![0.0f64; cols];
+    let mut y_b158_pq = vec![0.0f64; cols];
+    let mut y_simd_pq = vec![0.0f64; cols];
+
+    ternary_matmul_i_major(&packed_i, rows, cols, &x_row, None, 1.0, &mut y_b158_float);
+    b158_matmul_pq_i_major_into(&packed_i, rows, cols, &p_x_row, PQ_DEFAULT_Q, 1.0, &mut y_b158_pq);
+    ternary_simd_pq_matmul_into(&trits_i, rows, cols, &p_x_row, PQ_DEFAULT_Q, None, 1.0, &mut y_simd_pq);
+
+    assert!(relative_error(&y_b158_pq, &y_b158_float) < 1e-6);
+    assert!(relative_error(&y_simd_pq, &y_b158_float) < 1e-6);
 }

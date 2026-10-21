@@ -27,10 +27,11 @@ const HERO_SVG: &str = include_str!("../../../web/hero-alexandra.svg");
 pub fn run_bench(dim: usize) -> String {
     use std::time::Instant;
     use gaia_mlx_quant::{
-        MLX_GROUP64_COMPRESSION, MlxQuantizedMatrix, dense_matmul, gather_qmm_into,
-        maybe_matmul_into, mergeq_matmul_into, pack_ternary, pack_ternary_i_major_into,
+        MLX_GROUP64_COMPRESSION, MlxQuantizedMatrix, PQ_DEFAULT_Q, b158_matmul_pq_i_major_into,
+        dense_matmul, gather_qmm_into, maybe_matmul_into, mergeq_matmul_into,
+        mlx_matmul_pq_group64_into, pack_ternary, pack_ternary_i_major_into, quantize_pq_into,
         quantize_ternary, relative_error, ternary_matmul, ternary_matmul_i_major,
-        ternary_transformer_step_into,
+        ternary_simd_pq_matmul_into, ternary_transformer_step_into,
     };
 
     let aligned_dim = dim.max(64).div_ceil(64) * 64;
@@ -124,6 +125,36 @@ pub fn run_bench(dim: usize) -> String {
     ternary_matmul_i_major(&w_dd, aligned_dim, aligned_dim, &x_al, None, 1.0, &mut y_imajor);
     let imajor_us = t_imaj.elapsed().as_nanos() as f64 / 1000.0;
 
+    // p / q ("Counting Divided" — Pure Integer-Numerator Kernels, zero inner-loop float conversions)
+    let mut p_x = vec![0i32; aligned_dim];
+    let mut p_scales = vec![0i32; mlx_q.scales.len()];
+    quantize_pq_into(&x_al, PQ_DEFAULT_Q, &mut p_x);
+    quantize_pq_into(&mlx_q.scales, PQ_DEFAULT_Q, &mut p_scales);
+
+    let mut y_pq_g64 = vec![0.0f64; aligned_dim];
+    let t_pqg64 = Instant::now();
+    mlx_matmul_pq_group64_into(
+        &p_x,
+        PQ_DEFAULT_Q,
+        &mlx_q.codes,
+        &p_scales,
+        PQ_DEFAULT_Q,
+        aligned_dim,
+        aligned_dim,
+        &mut y_pq_g64,
+    );
+    let pq_g64_us = t_pqg64.elapsed().as_nanos() as f64 / 1000.0;
+
+    let mut y_pq_b158 = vec![0.0f64; aligned_dim];
+    let t_pqb158 = Instant::now();
+    b158_matmul_pq_i_major_into(&w_dd, aligned_dim, aligned_dim, &p_x, PQ_DEFAULT_Q, 1.0, &mut y_pq_b158);
+    let pq_b158_us = t_pqb158.elapsed().as_nanos() as f64 / 1000.0;
+
+    let mut y_pq_simd = vec![0.0f64; aligned_dim];
+    let t_pqsimd = Instant::now();
+    ternary_simd_pq_matmul_into(&trits_dd, aligned_dim, aligned_dim, &p_x, PQ_DEFAULT_Q, None, 1.0, &mut y_pq_simd);
+    let pq_simd_us = t_pqsimd.elapsed().as_nanos() as f64 / 1000.0;
+
     let ones_d = vec![1.0f64; aligned_dim];
     let mut k_cache = vec![0.0f64; 8 * aligned_dim];
     let mut v_cache = vec![0.0f64; 8 * aligned_dim];
@@ -168,7 +199,7 @@ pub fn run_bench(dim: usize) -> String {
     let tok_per_sec_16_layers = if tf_us > 0.0 { 1_000_000.0 / (tf_us * 16.0) } else { 0.0 };
 
     format!(
-        r#"{{"dim":{dim},"bitsPerWeight":1.585,"bytesPacked":{},"bytesFloat64":{},"compression":{:.2},"relativeError":{:.4},"mlxRust":{{"engine":"gaia-mlx-quant (100% safe no_std Rust · zero heap allocs)","denseMicros":{:.2},"b158JMajorMicros":{:.2},"b158IMajorMicros":{:.2},"group64":{{"compressionVsF32":{:.2},"packedBytes":{},"micros":{:.2},"relativeError":{:.4}}},"mergeQ":{{"intermediateBytes":0,"micros":{:.2},"relativeError":{:.4}}},"maybeStochastic":{{"micros":{:.2}}},"gatherQmmMoE":{{"experts":4,"topK":2,"micros":{:.2}}},"ternaryTransformerBlock":{{"dim":{aligned_dim},"hiddenDim":{hidden_dim},"layerMicros":{:.2},"estTokPerSec16Layer":{:.1}}}}}}}"#,
+        r#"{{"dim":{dim},"bitsPerWeight":1.585,"bytesPacked":{},"bytesFloat64":{},"compression":{:.2},"relativeError":{:.4},"mlxRust":{{"engine":"gaia-mlx-quant (100% safe no_std Rust · zero heap allocs · p/q integer numerator)","denseMicros":{:.2},"b158JMajorMicros":{:.2},"b158IMajorMicros":{:.2},"pqB158IMajorMicros":{:.2},"pqWideSimdMicros":{:.2},"group64":{{"compressionVsF32":{:.2},"packedBytes":{},"micros":{:.2},"pqMicros":{:.2},"relativeError":{:.4}}},"mergeQ":{{"intermediateBytes":0,"micros":{:.2},"relativeError":{:.4}}},"maybeStochastic":{{"micros":{:.2}}},"gatherQmmMoE":{{"experts":4,"topK":2,"micros":{:.2}}},"ternaryTransformerBlock":{{"dim":{aligned_dim},"hiddenDim":{hidden_dim},"layerMicros":{:.2},"estTokPerSec16Layer":{:.1}}}}}}}"#,
         packed.len(),
         w.len() * 8,
         compression,
@@ -176,9 +207,12 @@ pub fn run_bench(dim: usize) -> String {
         dense_us,
         b158_us,
         imajor_us,
+        pq_b158_us,
+        pq_simd_us,
         MLX_GROUP64_COMPRESSION,
         mlx_q.packed_bytes(),
         g64_us,
+        pq_g64_us,
         g64_err,
         mergeq_us,
         mergeq_err,

@@ -41,11 +41,12 @@ static ALLOCATOR: Counting = Counting;
 #[test]
 fn hot_paths_perform_zero_allocations() {
     use gaia_mlx_quant::{
-        fold, fold_spectrum, gather_qmm_into, maybe_matmul_into, mergeq_matmul_into,
-        mlx_dequantize_group64_into, mlx_quantize_group64_into, mlx_quantized_matmul_into,
-        pack_ternary_i_major_into, pack_ternary_into, rms_norm_into, rope_into, sampling,
-        sdpa_single_query_into, ste_linear_backward_into, swiglu_into, ternary_matmul,
-        ternary_transformer_step_into, unpack_ternary_into,
+        PQ_DEFAULT_Q, b158_matmul_pq_i_major_into, fold, fold_spectrum, gather_qmm_into,
+        maybe_matmul_into, mergeq_matmul_into, mlx_dequantize_group64_into,
+        mlx_matmul_pq_group64_into, mlx_quantize_group64_into, mlx_quantized_matmul_into,
+        pack_ternary_i_major_into, pack_ternary_into, quantize_pq_into, rms_norm_into, rope_into,
+        sampling, sdpa_single_query_into, ste_linear_backward_into, swiglu_into, ternary_matmul,
+        ternary_simd_pq_matmul_into, ternary_transformer_step_into, unpack_ternary_into,
     };
 
     const ROWS: usize = 64;
@@ -67,6 +68,8 @@ fn hot_paths_perform_zero_allocations() {
     let mut unpacked = vec![0i8; ROWS * COLS];
     let mut mlx_codes = vec![0u32; ROWS * (COLS / 16)];
     let mut mlx_scales = vec![0f64; ROWS * (COLS / 64)];
+    let mut p_x = vec![0i32; COLS];
+    let mut p_scales = vec![0i32; ROWS * (COLS / 64)];
     let mut dequant_w = vec![0f64; ROWS * COLS];
     let mut grad_x = vec![0f64; COLS];
     let mut grad_w = vec![0f64; ROWS * COLS];
@@ -112,6 +115,11 @@ fn hot_paths_perform_zero_allocations() {
         mlx_quantize_group64_into(&weights, ROWS, COLS, &mut mlx_codes, &mut mlx_scales);
         mlx_dequantize_group64_into(&mlx_codes, &mlx_scales, ROWS, COLS, &mut dequant_w);
         mlx_quantized_matmul_into(&x, &mlx_codes, &mlx_scales, ROWS, COLS, &mut out);
+        quantize_pq_into(&x, PQ_DEFAULT_Q, &mut p_x);
+        quantize_pq_into(&mlx_scales, PQ_DEFAULT_Q, &mut p_scales);
+        mlx_matmul_pq_group64_into(&p_x, PQ_DEFAULT_Q, &mlx_codes, &p_scales, PQ_DEFAULT_Q, ROWS, COLS, &mut out);
+        b158_matmul_pq_i_major_into(&packed_i, ROWS, COLS, &p_x, PQ_DEFAULT_Q, 1.0, &mut out);
+        ternary_simd_pq_matmul_into(&trits, ROWS, COLS, &p_x, PQ_DEFAULT_Q, None, 1.0, &mut out);
         mergeq_matmul_into(&x, &weights, ROWS, COLS, 64, &mut out);
         maybe_matmul_into(&x, &weights, ROWS, COLS, 64, 42, &mut out);
         gather_qmm_into(&x, &mlx_codes, &mlx_scales, 1, ROWS, COLS, &[0], &[1.0], &mut s_norm, &mut out);

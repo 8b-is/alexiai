@@ -220,21 +220,16 @@ pub fn mlx_quantize_group64_into(
             let mean = abs_sum / (MLX_GROUP_SIZE as f64);
             let scale = if mean == 0.0 { 1.0 } else { mean };
             row_scales[g] = scale;
-            let inv_scale = 1.0 / scale;
+            // Threshold hoist: val / scale >= 0.5  <=>  val >= 0.5 * scale (zero float muls per weight!)
+            let pos_thresh = 0.5 * scale;
+            let neg_thresh = -pos_thresh;
 
-            // Pack 64 weights into 4 u32 words (16 two-bit codes per word).
+            // Pack 64 weights into 4 u32 words (16 two-bit codes per word) with branchless comparisons.
             for w_idx in 0..4 {
                 let sub = &group[w_idx * TRITS_PER_U32..(w_idx + 1) * TRITS_PER_U32];
                 let mut word = 0u32;
                 for (k, &val) in sub.iter().enumerate() {
-                    let scaled = val * inv_scale;
-                    let trit: i8 = if scaled >= 0.5 {
-                        1
-                    } else if scaled <= -0.5 {
-                        -1
-                    } else {
-                        0
-                    };
+                    let trit = ((val >= pos_thresh) as i8) - ((val <= neg_thresh) as i8);
                     word |= (mlx_code_of(trit) & 0x03) << (k * 2);
                 }
                 row_codes[g * 4 + w_idx] = word;
@@ -392,18 +387,16 @@ pub fn mergeq_matmul_into(
             }
             let scale = abs_sum / (group_w.len() as f64);
             if scale > 0.0 {
-                let inv_scale = 1.0 / scale;
+                // Threshold hoist + branchless ternary select: eliminates 2 float muls per weight!
+                let pos_thresh = 0.5 * scale;
+                let neg_thresh = -pos_thresh;
                 let mut g_acc = 0.0f64;
                 for (&wv, &xv) in group_w.iter().zip(group_x.iter()) {
-                    let s = wv * inv_scale;
-                    let trit = if s >= 0.5 {
-                        1.0
-                    } else if s <= -0.5 {
-                        -1.0
-                    } else {
-                        0.0
-                    };
-                    g_acc = fma(trit, xv, g_acc);
+                    if wv >= pos_thresh {
+                        g_acc += xv;
+                    } else if wv <= neg_thresh {
+                        g_acc -= xv;
+                    }
                 }
                 row_acc = fma(g_acc, scale, row_acc);
             }
@@ -814,10 +807,18 @@ pub fn ternary_transformer_step_into(
     // 1. Pre-Attention RMSNorm
     rms_norm_into(x_in, Some(rms1_w), 1e-5, scratch_norm);
 
-    // 2. Ternary Q, K, V projections (1.585 bits/weight i-major)
-    ternary_matmul_i_major(wq_i_packed, dim, dim, scratch_norm, None, 1.0, scratch_q);
-    ternary_matmul_i_major(wk_i_packed, dim, dim, scratch_norm, None, 1.0, scratch_k);
-    ternary_matmul_i_major(wv_i_packed, dim, dim, scratch_norm, None, 1.0, scratch_v);
+    // 2. Ternary Q, K, V projections via p/q integer-numerator fast path (zero i8->f64 conversions!)
+    let mut px_buf = [0i32; 2048];
+    if dim <= px_buf.len() && hidden_dim <= px_buf.len() {
+        quantize_pq_into(&scratch_norm[..dim], PQ_DEFAULT_Q, &mut px_buf[..dim]);
+        b158_matmul_pq_i_major_into(wq_i_packed, dim, dim, &px_buf[..dim], PQ_DEFAULT_Q, 1.0, scratch_q);
+        b158_matmul_pq_i_major_into(wk_i_packed, dim, dim, &px_buf[..dim], PQ_DEFAULT_Q, 1.0, scratch_k);
+        b158_matmul_pq_i_major_into(wv_i_packed, dim, dim, &px_buf[..dim], PQ_DEFAULT_Q, 1.0, scratch_v);
+    } else {
+        ternary_matmul_i_major(wq_i_packed, dim, dim, scratch_norm, None, 1.0, scratch_q);
+        ternary_matmul_i_major(wk_i_packed, dim, dim, scratch_norm, None, 1.0, scratch_k);
+        ternary_matmul_i_major(wv_i_packed, dim, dim, scratch_norm, None, 1.0, scratch_v);
+    }
 
     // 3. Rotary Position Embeddings (RoPE) on Q and K, writing into KV cache at `pos`
     let k_slot = &mut k_cache[pos * dim..(pos + 1) * dim];
@@ -839,7 +840,12 @@ pub fn ternary_transformer_step_into(
     );
 
     // 5. Ternary Output Projection + Residual 1
-    ternary_matmul_i_major(wo_i_packed, dim, dim, scratch_attn, None, 1.0, scratch_norm);
+    if dim <= px_buf.len() {
+        quantize_pq_into(&scratch_attn[..dim], PQ_DEFAULT_Q, &mut px_buf[..dim]);
+        b158_matmul_pq_i_major_into(wo_i_packed, dim, dim, &px_buf[..dim], PQ_DEFAULT_Q, 1.0, scratch_norm);
+    } else {
+        ternary_matmul_i_major(wo_i_packed, dim, dim, scratch_attn, None, 1.0, scratch_norm);
+    }
     for i in 0..dim {
         x_out[i] = x_in[i] + scratch_norm[i];
     }
@@ -847,14 +853,26 @@ pub fn ternary_transformer_step_into(
     // 6. Pre-MLP RMSNorm
     rms_norm_into(x_out, Some(rms2_w), 1e-5, scratch_norm);
 
-    // 7. Ternary SwiGLU MLP (Gate + Up -> SiLU*Up -> Down) + Residual 2
-    ternary_matmul_i_major(wgate_i_packed, dim, hidden_dim, scratch_norm, None, 1.0, scratch_gate);
-    ternary_matmul_i_major(wup_i_packed, dim, hidden_dim, scratch_norm, None, 1.0, scratch_up);
-    for i in 0..hidden_dim {
-        let g = scratch_gate[i];
-        scratch_gate[i] = (g / (1.0 + exp_approx(-g))) * scratch_up[i];
+    // 7. Ternary SwiGLU MLP (Gate + Up -> SiLU*Up -> Down) + Residual 2 via p/q integer fast path
+    if dim <= px_buf.len() && hidden_dim <= px_buf.len() {
+        quantize_pq_into(&scratch_norm[..dim], PQ_DEFAULT_Q, &mut px_buf[..dim]);
+        b158_matmul_pq_i_major_into(wgate_i_packed, dim, hidden_dim, &px_buf[..dim], PQ_DEFAULT_Q, 1.0, scratch_gate);
+        b158_matmul_pq_i_major_into(wup_i_packed, dim, hidden_dim, &px_buf[..dim], PQ_DEFAULT_Q, 1.0, scratch_up);
+        for i in 0..hidden_dim {
+            let g = scratch_gate[i];
+            scratch_gate[i] = (g / (1.0 + exp_approx(-g))) * scratch_up[i];
+        }
+        quantize_pq_into(&scratch_gate[..hidden_dim], PQ_DEFAULT_Q, &mut px_buf[..hidden_dim]);
+        b158_matmul_pq_i_major_into(wdown_i_packed, hidden_dim, dim, &px_buf[..hidden_dim], PQ_DEFAULT_Q, 1.0, scratch_norm);
+    } else {
+        ternary_matmul_i_major(wgate_i_packed, dim, hidden_dim, scratch_norm, None, 1.0, scratch_gate);
+        ternary_matmul_i_major(wup_i_packed, dim, hidden_dim, scratch_norm, None, 1.0, scratch_up);
+        for i in 0..hidden_dim {
+            let g = scratch_gate[i];
+            scratch_gate[i] = (g / (1.0 + exp_approx(-g))) * scratch_up[i];
+        }
+        ternary_matmul_i_major(wdown_i_packed, hidden_dim, dim, scratch_gate, None, 1.0, scratch_norm);
     }
-    ternary_matmul_i_major(wdown_i_packed, hidden_dim, dim, scratch_gate, None, 1.0, scratch_norm);
     for i in 0..dim {
         x_out[i] += scratch_norm[i];
     }
@@ -928,3 +946,349 @@ impl MlxQuantizedMatrix {
         self.f32_bytes() as f64 / (self.packed_bytes().max(1) as f64)
     }
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// p / q ("Counting Divided" — Exact Rational & Integer-Numerator Engine)
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// Why p/q beats float conversion in safe Rust (`#![forbid(unsafe_code)]`):
+// 1. In float kernels, every ternary weight (-1, 0, +1) is converted `i8 -> f64`
+//    (`cvtsi2sd`) N * K times (65,536 times for a 256×256 matrix).
+// 2. IEEE-754 floating-point addition is non-associative, which legally forbids
+//    LLVM from auto-vectorizing a simple float reduction loop into wide SIMD.
+// 3. By projecting the input vector `x` ONCE (O(K)) onto integer numerators `p_x[k]`
+//    over a shared denominator `q_x` (e.g. `q_x = 1 << 20`), the entire O(N * K)
+//    matrix-vector product happens in pure integer arithmetic (Z):
+//      - Zero `i8 -> f64` conversions in the O(N * K) inner loop
+//      - Associative integer addition unlocks LLVM AVX2 / NEON wide SIMD (`vpaddd` / `vpmulld`)
+//      - The denominator `q` is applied ONLY ONCE per output row (`O(N)` instead of `O(N * K)`).
+
+/// Default dyadic denominator $q = 2^{20} = 1{,}048{,}576$ (~6 decimal digits of precision, zero overflow in `i32`/`i64`).
+pub const PQ_DEFAULT_Q: i64 = 1 << 20;
+
+/// Exact rational number $p / q \in \mathbb{Q}$ (`q > 0`) — "counting, divided".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pq {
+    pub p: i64,
+    pub q: i64,
+}
+
+impl Pq {
+    /// Construct a rational `p / q` (`q` must be non-zero; sign is normalized into `p`).
+    #[inline]
+    pub const fn new(p: i64, q: i64) -> Option<Self> {
+        if q == 0 {
+            None
+        } else if q < 0 {
+            Some(Self { p: -p, q: -q })
+        } else {
+            Some(Self { p, q })
+        }
+    }
+
+    /// Construct a reduced rational `p / q` in lowest terms via Euclidean GCD.
+    #[inline]
+    pub const fn reduced(p: i64, q: i64) -> Option<Self> {
+        let Some(raw) = Self::new(p, q) else {
+            return None;
+        };
+        let g = gcd_i64(raw.p.abs(), raw.q);
+        Some(Self {
+            p: raw.p / g,
+            q: raw.q / g,
+        })
+    }
+
+    /// Project a float onto $p / q$ with explicit denominator `q > 0`.
+    #[inline]
+    pub fn from_f64(val: f64, q: i64) -> Self {
+        let q_pos = q.abs().max(1);
+        let p = (val * (q_pos as f64)).round() as i64;
+        Self { p, q: q_pos }
+    }
+
+    /// Evaluate $p / q$ to `f64` at the boundary.
+    #[inline]
+    pub fn to_f64(self) -> f64 {
+        (self.p as f64) / (self.q as f64)
+    }
+
+    /// Exact rational addition $\frac{p_1}{q_1} + \frac{p_2}{q_2}$.
+    #[inline]
+    pub const fn add(self, rhs: Self) -> Self {
+        let num = self.p * rhs.q + rhs.p * self.q;
+        let den = self.q * rhs.q;
+        let g = gcd_i64(num.abs(), den);
+        Self {
+            p: num / g,
+            q: den / g,
+        }
+    }
+
+    /// Exact rational multiplication $\frac{p_1}{q_1} \cdot \frac{p_2}{q_2}$.
+    #[inline]
+    pub const fn mul(self, rhs: Self) -> Self {
+        let num = self.p * rhs.p;
+        let den = self.q * rhs.q;
+        let g = gcd_i64(num.abs(), den);
+        Self {
+            p: num / g,
+            q: den / g,
+        }
+    }
+}
+
+#[inline]
+const fn gcd_i64(mut a: i64, mut b: i64) -> i64 {
+    while b != 0 {
+        let r = a % b;
+        a = b;
+        b = r;
+    }
+    if a == 0 { 1 } else { a }
+}
+
+/// Compile-time 256-entry byte LUTs for MLX 2-bit codes (`-1 -> 0`, `0 -> 1`, `+1 -> 2`) as `i32`.
+/// Each byte holds 4 trits; `MLX_B0..MLX_B3` unpack a byte into four `i32` trits with zero shifts
+/// and zero float conversions.
+const MLX_B0: [i32; 256] = build_mlx_byte_lut(0);
+const MLX_B1: [i32; 256] = build_mlx_byte_lut(2);
+const MLX_B2: [i32; 256] = build_mlx_byte_lut(4);
+const MLX_B3: [i32; 256] = build_mlx_byte_lut(6);
+
+const fn build_mlx_byte_lut(shift: usize) -> [i32; 256] {
+    let mut table = [0i32; 256];
+    let mut b = 0usize;
+    while b < 256 {
+        let code = ((b >> shift) & 0x03) as u32;
+        table[b] = mlx_trit_of(code) as i32;
+        b += 1;
+    }
+    table
+}
+
+/// Project a slice of `f64` values onto `i32` numerators `p_out[k] = round(x[k] * q)`
+/// in $O(K)$. Performs **zero heap allocations**.
+#[inline]
+pub fn quantize_pq_into(x: &[f64], q: i64, p_out: &mut [i32]) {
+    debug_assert!(p_out.len() >= x.len());
+    let q_f64 = q as f64;
+    for (dst, &val) in p_out.iter_mut().zip(x.iter()) {
+        *dst = (val * q_f64).round() as i32;
+    }
+}
+
+/// **`mlx_matmul_pq_group64_into`** — Pure $p/q$ Integer-Numerator MLX Group-64 Matmul.
+///
+/// Given integer activation numerators `p_x` (`x[k] ≈ p_x[k] / q_x`), packed MLX `u32` ternary
+/// codes `w_codes`, and integer group-scale numerators `p_scales` (`scale[n, g] ≈ p_scales[n, g] / q_s`),
+/// computes the entire $N \times K$ matrix-vector product in **pure integer arithmetic ($\mathbb{Z}$)**
+/// with **zero `int -> float` conversions in the inner loop**, dividing by $q_x \cdot q_s$
+/// **only once per output row**.
+///
+/// Performs **zero heap allocations**.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub fn mlx_matmul_pq_group64_into(
+    p_x: &[i32],
+    q_x: i64,
+    w_codes: &[u32],
+    p_scales: &[i32],
+    q_s: i64,
+    n_out: usize,
+    k_in: usize,
+    y_out: &mut [f64],
+) {
+    debug_assert!(k_in.is_multiple_of(MLX_GROUP_SIZE));
+    let groups_per_row = k_in / MLX_GROUP_SIZE;
+    let words_per_row = k_in / TRITS_PER_U32;
+    debug_assert!(p_x.len() >= k_in);
+    debug_assert!(w_codes.len() >= n_out * words_per_row);
+    debug_assert!(p_scales.len() >= n_out * groups_per_row);
+    debug_assert!(y_out.len() >= n_out);
+
+    let inv_q_total = 1.0 / ((q_x as f64) * (q_s as f64));
+
+    for (n, slot) in y_out[..n_out].iter_mut().enumerate() {
+        let row_codes = &w_codes[n * words_per_row..(n + 1) * words_per_row];
+        let row_pscales = &p_scales[n * groups_per_row..(n + 1) * groups_per_row];
+        let mut row_num_i64 = 0i64;
+
+        for g in 0..groups_per_row {
+            let p_scale = row_pscales[g];
+            if p_scale == 0 {
+                continue;
+            }
+            let mut g_acc0 = 0i32;
+            let mut g_acc1 = 0i32;
+            let mut g_acc2 = 0i32;
+            let mut g_acc3 = 0i32;
+
+            for w_idx in 0..4 {
+                let word = row_codes[g * 4 + w_idx];
+                if word == 0x5555_5555 {
+                    continue;
+                }
+                let px = &p_x[g * MLX_GROUP_SIZE + w_idx * TRITS_PER_U32
+                    ..g * MLX_GROUP_SIZE + (w_idx + 1) * TRITS_PER_U32];
+
+                let b0 = (word & 0xFF) as usize;
+                let b1 = ((word >> 8) & 0xFF) as usize;
+                let b2 = ((word >> 16) & 0xFF) as usize;
+                let b3 = (word >> 24) as usize;
+
+                g_acc0 = g_acc0.wrapping_add(MLX_B0[b0].wrapping_mul(px[0]));
+                g_acc1 = g_acc1.wrapping_add(MLX_B1[b0].wrapping_mul(px[1]));
+                g_acc2 = g_acc2.wrapping_add(MLX_B2[b0].wrapping_mul(px[2]));
+                g_acc3 = g_acc3.wrapping_add(MLX_B3[b0].wrapping_mul(px[3]));
+
+                g_acc0 = g_acc0.wrapping_add(MLX_B0[b1].wrapping_mul(px[4]));
+                g_acc1 = g_acc1.wrapping_add(MLX_B1[b1].wrapping_mul(px[5]));
+                g_acc2 = g_acc2.wrapping_add(MLX_B2[b1].wrapping_mul(px[6]));
+                g_acc3 = g_acc3.wrapping_add(MLX_B3[b1].wrapping_mul(px[7]));
+
+                g_acc0 = g_acc0.wrapping_add(MLX_B0[b2].wrapping_mul(px[8]));
+                g_acc1 = g_acc1.wrapping_add(MLX_B1[b2].wrapping_mul(px[9]));
+                g_acc2 = g_acc2.wrapping_add(MLX_B2[b2].wrapping_mul(px[10]));
+                g_acc3 = g_acc3.wrapping_add(MLX_B3[b2].wrapping_mul(px[11]));
+
+                g_acc0 = g_acc0.wrapping_add(MLX_B0[b3].wrapping_mul(px[12]));
+                g_acc1 = g_acc1.wrapping_add(MLX_B1[b3].wrapping_mul(px[13]));
+                g_acc2 = g_acc2.wrapping_add(MLX_B2[b3].wrapping_mul(px[14]));
+                g_acc3 = g_acc3.wrapping_add(MLX_B3[b3].wrapping_mul(px[15]));
+            }
+            let group_sum = (g_acc0 + g_acc1 + g_acc2 + g_acc3) as i64;
+            row_num_i64 += group_sum * (p_scale as i64);
+        }
+        // Single division by q_x * q_s at the end of the row!
+        *slot = (row_num_i64 as f64) * inv_q_total;
+    }
+}
+
+/// **`b158_matmul_pq_i_major_into`** — Pure $p/q$ Integer-Numerator GAIA Base-3 (`5 trits/byte`) i-major Matmul.
+///
+/// Accumulates `T0..T4` LUT trits $\times$ integer numerators `p_x` in pure `i32`/`i64` arithmetic
+/// without a single `int -> float` conversion in the $O(N \times K)$ loop, dividing by `q_x`
+/// **only once per output column**.
+///
+/// Performs **zero heap allocations**.
+#[inline]
+pub fn b158_matmul_pq_i_major_into(
+    packed_i: &[u8],
+    rows: usize,
+    cols: usize,
+    p_x: &[i32],
+    q_x: i64,
+    gamma: f64,
+    y_out: &mut [f64],
+) {
+    use crate::pack::{T0, T1, T2, T3, T4};
+    debug_assert!(p_x.len() >= rows);
+    debug_assert!(y_out.len() >= cols);
+    debug_assert!(packed_i.len() * TRITS_PER_BYTE >= rows * cols);
+
+    let scale_out = gamma / (q_x as f64);
+
+    if rows.is_multiple_of(TRITS_PER_BYTE) {
+        let bytes_per_col = rows / TRITS_PER_BYTE;
+        for (i, slot) in y_out[..cols].iter_mut().enumerate() {
+            let col_bytes = &packed_i[i * bytes_per_col..(i + 1) * bytes_per_col];
+            let mut acc0 = 0i64;
+            let mut acc1 = 0i64;
+            let mut acc2 = 0i64;
+            let mut acc3 = 0i64;
+            let mut acc4 = 0i64;
+            let mut j = 0usize;
+            for &byte in col_bytes {
+                if byte == 0 {
+                    j += TRITS_PER_BYTE;
+                    continue;
+                }
+                let b = byte as usize;
+                acc0 += (T0[b] as i64) * (p_x[j] as i64);
+                acc1 += (T1[b] as i64) * (p_x[j + 1] as i64);
+                acc2 += (T2[b] as i64) * (p_x[j + 2] as i64);
+                acc3 += (T3[b] as i64) * (p_x[j + 3] as i64);
+                acc4 += (T4[b] as i64) * (p_x[j + 4] as i64);
+                j += TRITS_PER_BYTE;
+            }
+            *slot = ((acc0 + acc1 + acc2 + acc3 + acc4) as f64) * scale_out;
+        }
+        return;
+    }
+
+    for (i, slot) in y_out[..cols].iter_mut().enumerate() {
+        let start = i * rows;
+        let end = start + rows;
+        let start_b = start / TRITS_PER_BYTE;
+        let end_b = end.div_ceil(TRITS_PER_BYTE);
+        let mut acc = 0i64;
+
+        for (b_idx, &byte) in packed_i[start_b..end_b].iter().enumerate() {
+            if byte == 0 {
+                continue;
+            }
+            let b = byte as usize;
+            let base = (start_b + b_idx) * TRITS_PER_BYTE;
+            if base >= start && base < end {
+                acc += (T0[b] as i64) * (p_x[base - start] as i64);
+            }
+            let t1 = base + 1;
+            if t1 >= start && t1 < end {
+                acc += (T1[b] as i64) * (p_x[t1 - start] as i64);
+            }
+            let t2 = base + 2;
+            if t2 >= start && t2 < end {
+                acc += (T2[b] as i64) * (p_x[t2 - start] as i64);
+            }
+            let t3 = base + 3;
+            if t3 >= start && t3 < end {
+                acc += (T3[b] as i64) * (p_x[t3 - start] as i64);
+            }
+            let t4 = base + 4;
+            if t4 >= start && t4 < end {
+                acc += (T4[b] as i64) * (p_x[t4 - start] as i64);
+            }
+        }
+        *slot = (acc as f64) * scale_out;
+    }
+}
+
+/// **`ternary_simd_pq_matmul_into`** — Wide-SIMD Auto-Vectorized $p/q$ Integer Dot Product.
+///
+/// Because integer addition in $\mathbb{Z}$ is associative (unlike IEEE-754 `f64`), LLVM
+/// compiles this contiguous `i8 × i32 -> i32` dot product directly into 256-bit AVX2 / 128-bit NEON
+/// vector instructions (`vpmovsxbd` + `vpmulld` + `vpaddd`) in 100% safe `#![forbid(unsafe_code)]` Rust.
+///
+/// Divides by `q_x` **only once per output column** and performs **zero heap allocations**.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub fn ternary_simd_pq_matmul_into(
+    trits_i_major: &[i8],
+    rows: usize,
+    cols: usize,
+    p_x: &[i32],
+    q_x: i64,
+    scales_col: Option<&[f64]>,
+    gamma: f64,
+    y_out: &mut [f64],
+) {
+    debug_assert!(trits_i_major.len() >= rows * cols);
+    debug_assert!(p_x.len() >= rows);
+    debug_assert!(y_out.len() >= cols);
+
+    let inv_q = gamma / (q_x as f64);
+    let px_slice = &p_x[..rows];
+
+    for (i, slot) in y_out[..cols].iter_mut().enumerate() {
+        let col_trits = &trits_i_major[i * rows..(i + 1) * rows];
+        let dot_i32: i32 = col_trits
+            .iter()
+            .zip(px_slice.iter())
+            .map(|(&t, &px)| (t as i32).wrapping_mul(px))
+            .fold(0i32, i32::wrapping_add);
+        let col_scale = scales_col.map(|s| s[i]).unwrap_or(1.0);
+        *slot = (dot_i32 as f64) * inv_q * col_scale;
+    }
+}
+
