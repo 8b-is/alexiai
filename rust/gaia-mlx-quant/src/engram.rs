@@ -88,7 +88,11 @@ impl PrimeBucketMod {
     }
 }
 
-/// Reference N-gram XOR-multiply hash + hardware `% prime` modulo (`engram_demo_v1.py` baseline).
+/// Reference N-gram XOR-multiply hash + hardware `% prime` modulo over the
+/// 32-bit-folded mix (`mix ^ (mix >> 32)`, matching the `use_pq_hash` path of
+/// `engram_demo_v1.py`). Note: the upstream demo's default path hashes the
+/// full 64-bit mix, so this kernel is bit-identical to the folded reference,
+/// not to the un-folded Python baseline.
 ///
 /// - `tokens`: token IDs of length `seq_len`
 /// - `pad_id`: padding token ID for left-shifted context
@@ -328,6 +332,11 @@ pub fn engram_mem8_adaptive_matmul_into(
 ) {
     let num_groups = in_features / MLX_GROUP_SIZE;
     assert_eq!(head_indices.len(), num_groups);
+    assert!(
+        num_groups <= 64,
+        "num_groups ({}) exceeds the 64-group BFP-64 alignment limit",
+        num_groups
+    );
 
     let mut exp2_cache = [0.0f64; 64];
     for (g, &idx) in head_indices.iter().enumerate().take(64) {
@@ -412,6 +421,11 @@ pub fn engram_bfp64_prequant_matmul_into(
     assert!(w_signs.len() >= out_features * in_features);
     assert!(group_scales.len() >= out_features * num_groups);
     assert!(out.len() >= out_features);
+    assert!(
+        num_groups <= 64,
+        "num_groups ({}) exceeds the 64-group BFP-64 alignment limit",
+        num_groups
+    );
 
     // Precompute 2^(exp_x[g]) once per head block (only 16 heads for 1024-dim Engram!)
     let mut exp2_cache = [0.0f64; 64];
@@ -465,6 +479,11 @@ pub fn engram_bfp64_int_aligned_matmul_into(
     assert!(w_signs.len() >= out_features * in_features);
     assert!(group_scales_pq.len() >= out_features * num_groups);
     assert!(out.len() >= out_features);
+    assert!(
+        num_groups <= 64,
+        "num_groups ({}) exceeds the 64-group BFP-64 alignment limit",
+        num_groups
+    );
 
     // Align the 16 head exponents relative to min_exp so every head has an exact integer shift `2^(exp_x[g] - min_exp)`
     let mut min_exp = i8::MAX;
@@ -519,6 +538,11 @@ pub fn engram_bfp64_int_q16_matmul_into(
     out_q16: &mut [i32],
 ) {
     let num_groups = in_features / MLX_GROUP_SIZE;
+    assert!(
+        num_groups <= 64,
+        "num_groups ({}) exceeds the 64-group BFP-64 alignment limit",
+        num_groups
+    );
     let mut min_exp = i8::MAX;
     for &e in &exp_x[..num_groups] {
         if e < min_exp {
@@ -1384,5 +1408,157 @@ mod tests {
         assert!(mem8_err < proj_err, "Expected MEM|8 Adaptive error < BFP-i8 error");
         #[cfg(not(debug_assertions))]
         assert!(bfp64_step_us < dense_step_us);
+    }
+
+    #[test]
+    fn engram_zero_float_step_tracks_dense_step() {
+        let primes: [u64; 8] = [101, 103, 107, 109, 113, 127, 131, 137];
+        let mut head_indices = [0usize; 8];
+        let mut total_rows = 0usize;
+        for (i, &p) in primes.iter().enumerate() {
+            head_indices[i] = total_rows;
+            total_rows += p as usize;
+        }
+        let mut dense_table = vec![0.0f64; total_rows * ENGRAM_HEAD_DIM];
+        for (i, v) in dense_table.iter_mut().enumerate() {
+            *v = (((i * 73 + 19) % 200) as f64 - 100.0) * 0.005;
+        }
+        let bfp_table: Vec<Bfp64HeadRow> = (0..total_rows)
+            .map(|r| {
+                Bfp64HeadRow::from_f64_slice(&dense_table[r * ENGRAM_HEAD_DIM..(r + 1) * ENGRAM_HEAD_DIM])
+            })
+            .collect();
+
+        let hc_mult = 2usize;
+        let hidden_size = 64usize;
+        let engram_dim = 8 * ENGRAM_HEAD_DIM;
+        let num_groups = engram_dim / MLX_GROUP_SIZE;
+
+        let mut key_signs = vec![0i8; hc_mult * hidden_size * engram_dim];
+        let mut key_scales_pq = vec![0i32; hc_mult * hidden_size * num_groups];
+        let mut key_dense = vec![0.0f64; hc_mult * hidden_size * engram_dim];
+        for i in 0..key_signs.len() {
+            let s = match (i * 37 + 11) % 3 {
+                0 => -1i8,
+                1 => 0i8,
+                _ => 1i8,
+            };
+            key_signs[i] = s;
+            let row = i / engram_dim;
+            let g = (i % engram_dim) / MLX_GROUP_SIZE;
+            let scale = 0.015 + ((row + g) % 7) as f64 * 0.002;
+            key_scales_pq[row * num_groups + g] = (scale * 1_048_576.0).round() as i32;
+            key_dense[i] = (s as f64) * scale;
+        }
+        let mut val_signs = vec![0i8; hidden_size * engram_dim];
+        let mut val_scales_pq = vec![0i32; hidden_size * num_groups];
+        let mut val_dense = vec![0.0f64; hidden_size * engram_dim];
+        for i in 0..val_signs.len() {
+            let s = match (i * 53 + 7) % 3 {
+                0 => -1i8,
+                1 => 0i8,
+                _ => 1i8,
+            };
+            val_signs[i] = s;
+            let row = i / engram_dim;
+            let g = (i % engram_dim) / MLX_GROUP_SIZE;
+            let scale = 0.018 + ((row + g) % 5) as f64 * 0.002;
+            val_scales_pq[row * num_groups + g] = (scale * 1_048_576.0).round() as i32;
+            val_dense[i] = (s as f64) * scale;
+        }
+
+        let hidden_states: Vec<f64> = (0..hc_mult * hidden_size)
+            .map(|i| (((i * 41 + 3) % 100) as f64 - 50.0) * 0.02)
+            .collect();
+        let hidden_states_q16: Vec<i32> = hidden_states
+            .iter()
+            .map(|&x| (x * (ENGRAM_PQ_Q16 as f64)).round() as i32)
+            .collect();
+        let norm_w = vec![1.0f64; hidden_size];
+        let norm_w_q16 = vec![ENGRAM_PQ_Q16 as i32; hidden_size];
+        let short_conv_w = vec![0.25f64; hc_mult * hidden_size];
+        let short_conv_w_q16 =
+            vec![(0.25 * (ENGRAM_PQ_Q16 as f64)).round() as i32; hc_mult * hidden_size];
+
+        let mut emb_scratch = vec![0.0f64; engram_dim];
+        let mut m_x_scratch = vec![0i8; engram_dim];
+        let mut exp_x_scratch = vec![0i8; num_groups];
+        let mut val_scratch = vec![0.0f64; hidden_size];
+        let mut key_scratch = vec![0.0f64; hidden_size];
+        let mut nk_scratch = vec![0.0f64; hidden_size];
+        let mut nq_scratch = vec![0.0f64; hidden_size];
+        let mut val_q16_scratch = vec![0i32; hidden_size];
+        let mut key_q16_scratch = vec![0i32; hidden_size];
+        let mut out_dense = vec![0.0f64; hc_mult * hidden_size];
+        let mut out_q16 = vec![0i32; hc_mult * hidden_size];
+
+        engram_step_dense_fp64_into(
+            &dense_table,
+            &head_indices,
+            &hidden_states,
+            &key_dense,
+            &val_dense,
+            &norm_w,
+            &short_conv_w,
+            hc_mult,
+            engram_dim,
+            hidden_size,
+            &mut emb_scratch,
+            &mut val_scratch,
+            &mut key_scratch,
+            &mut nk_scratch,
+            &mut nq_scratch,
+            &mut out_dense,
+        );
+        engram_step_pq_no_floats_into(
+            &bfp_table,
+            &head_indices,
+            &hidden_states_q16,
+            &key_signs,
+            &key_scales_pq,
+            &val_signs,
+            &val_scales_pq,
+            &norm_w_q16,
+            &short_conv_w_q16,
+            hc_mult,
+            engram_dim,
+            hidden_size,
+            &mut m_x_scratch,
+            &mut exp_x_scratch,
+            &mut val_q16_scratch,
+            &mut key_q16_scratch,
+            &mut out_q16,
+        );
+
+        let norm_ref = out_dense.iter().map(|x| x * x).sum::<f64>().sqrt();
+        let err: f64 = out_dense
+            .iter()
+            .zip(out_q16.iter())
+            .map(|(&a, &b)| (a - (b as f64) / (ENGRAM_PQ_Q16 as f64)).powi(2))
+            .sum::<f64>()
+            .sqrt()
+            / norm_ref;
+        assert!(err < 0.05, "zero-float step relative error {err} exceeds 0.05");
+    }
+
+    #[test]
+    #[should_panic(expected = "num_groups")]
+    fn engram_matmul_functions_reject_more_than_64_groups() {
+        let in_features = 65 * MLX_GROUP_SIZE;
+        let out_features = 4;
+        let m_x = vec![0i8; in_features];
+        let exp_x = vec![0i8; 65];
+        let signs = vec![0i8; out_features * in_features];
+        let scales_pq = vec![0i32; out_features * 65];
+        let mut out = vec![0.0f64; out_features];
+        engram_bfp64_int_aligned_matmul_into(
+            &m_x,
+            &exp_x,
+            &signs,
+            &scales_pq,
+            in_features,
+            out_features,
+            &mut out,
+        );
     }
 }
