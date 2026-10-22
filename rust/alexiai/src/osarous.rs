@@ -14,11 +14,14 @@ use crate::transport::{self, SseEvent};
 pub const DEFAULT_BASE_URL: &str = "http://127.0.0.1:1337";
 /// Default Ollama loopback endpoint (OpenAI-compatible `/v1/*`).
 pub const OLLAMA_BASE_URL: &str = "http://127.0.0.1:11434";
+/// Sovereign loopback SSH bridge to MacBook.local Ollama (`127.0.0.1:11435 -> MacBook 127.0.0.1:11434`).
+pub const OLLAMA_MACBOOK_BRIDGE_URL: &str = "http://127.0.0.1:11435";
 /// Advertised context window when a model does not declare one.
 pub const DEFAULT_CONTEXT_WINDOW: u64 = 262144;
 
-/// Probe loopback endpoints (`127.0.0.1:1337` then `127.0.0.1:11434`) so both
-/// osarous/LM Studio and local GPU Ollama work out of the box.
+/// Probe loopback endpoints (`127.0.0.1:1337`, `127.0.0.1:11435`, then `127.0.0.1:11434`) so
+/// osarous/LM Studio, bridged Apple Silicon Ollama (`aye-gemma4:26b-16k` / `aye-qwen36:35b-16k`),
+/// and local Linux GPU Ollama all work out of the box over loopback.
 pub fn discover_endpoint() -> String {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
     use std::time::Duration;
@@ -33,6 +36,10 @@ pub fn discover_endpoint() -> String {
         || std::path::Path::new("/usr/bin/ollama").exists()
     {
         return OLLAMA_BASE_URL.to_string();
+    }
+    let addr_11435 = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 11435);
+    if TcpStream::connect_timeout(&addr_11435, timeout).is_ok() {
+        return OLLAMA_MACBOOK_BRIDGE_URL.to_string();
     }
     DEFAULT_BASE_URL.to_string()
 }
@@ -99,20 +106,29 @@ impl Osarous {
         {
             return m.to_string();
         }
-        self.models()
-            .ok()
-            .and_then(|models| models.into_iter().next().map(|m| m.id))
+        let catalog = self.models().unwrap_or_default();
+        // Prefer our fine-tuned Aye models (`aye-gemma4:26b-16k`, `aye-qwen36:35b-16k`) when available
+        for fav in ["aye-gemma4:26b-16k", "aye-qwen36:35b-16k", "gemma:latest"] {
+            if let Some(found) = catalog.iter().find(|m| m.id == fav) {
+                return found.id.clone();
+            }
+        }
+        catalog
+            .into_iter()
+            .next()
+            .map(|m| m.id)
             .unwrap_or_else(|| "local-model".to_string())
     }
 
-    pub fn models(&self) -> Result<Vec<CatalogModel>, String> {
-        let resp = transport::request(&format!("{}/v1/models", self.base_url), "GET", None)?;
+    fn fetch_models_from(endpoint: &str) -> Result<Vec<CatalogModel>, String> {
+        crate::sovereign::assert_loopback(endpoint)?;
+        let resp = transport::request(&format!("{endpoint}/v1/models"), "GET", None)?;
         if resp.status != 200 {
             return Err(format!("HTTP {}", resp.status));
         }
         let json: serde_json_lite::Value = serde_json_lite::parse_json(&resp.body_utf8())?;
         let rows = json.get("data").and_then(|d| d.as_array()).cloned().unwrap_or_default();
-        let models: Vec<CatalogModel> = rows
+        Ok(rows
             .iter()
             .map(|row| CatalogModel {
                 id: row.get("id").and_then(|v| v.as_str()).unwrap_or("local-model").to_string(),
@@ -122,7 +138,54 @@ impl Osarous {
                     .and_then(|v| v.as_u64())
                     .unwrap_or(DEFAULT_CONTEXT_WINDOW),
             })
-            .collect();
+            .collect())
+    }
+
+    /// Resolve which loopback endpoint (`self.base_url` or `127.0.0.1:11435` MacBook bridge)
+    /// hosts `model`. Strictly loopback-validated.
+    pub fn endpoint_for_model(&self, model: &str) -> String {
+        if let Ok(primary) = Self::fetch_models_from(&self.base_url)
+            && primary.iter().any(|m| m.id == model)
+        {
+            return self.base_url.clone();
+        }
+        if (self.base_url == OLLAMA_BASE_URL || self.base_url == DEFAULT_BASE_URL)
+            && let Ok(bridged) = Self::fetch_models_from(OLLAMA_MACBOOK_BRIDGE_URL)
+            && bridged.iter().any(|m| m.id == model)
+        {
+            return OLLAMA_MACBOOK_BRIDGE_URL.to_string();
+        }
+        self.base_url.clone()
+    }
+
+    pub fn models(&self) -> Result<Vec<CatalogModel>, String> {
+        let mut models = Vec::new();
+        if (self.base_url == OLLAMA_BASE_URL || self.base_url == DEFAULT_BASE_URL)
+            && let Ok(bridged) = Self::fetch_models_from(OLLAMA_MACBOOK_BRIDGE_URL)
+        {
+            for bm in bridged {
+                if !models.iter().any(|m: &CatalogModel| m.id == bm.id) {
+                    models.push(bm);
+                }
+            }
+        }
+        if let Ok(local) = Self::fetch_models_from(&self.base_url) {
+            for lm in local {
+                if !models.iter().any(|m: &CatalogModel| m.id == lm.id) {
+                    models.push(lm);
+                }
+            }
+        }
+        models.sort_by_key(|m| match m.id.as_str() {
+            "aye-gemma4:26b-16k" => 0,
+            "aye-qwen36:35b-16k" => 1,
+            "qwen3.6:35b" => 2,
+            "gemma4:26b" => 3,
+            _ => 4,
+        });
+        if models.is_empty() && self.base_url != OLLAMA_BASE_URL && self.base_url != DEFAULT_BASE_URL {
+            return Self::fetch_models_from(&self.base_url);
+        }
         Ok(if models.is_empty() {
             vec![CatalogModel {
                 id: "local-model".to_string(),
@@ -173,8 +236,9 @@ impl Osarous {
         sampling: Option<SamplingParams>,
     ) -> Result<(String, String, String), String> {
         let body = self.build_body(model, messages, false, sampling);
+        let endpoint = self.endpoint_for_model(model);
         let resp = transport::request(
-            &format!("{}/v1/chat/completions", self.base_url),
+            &format!("{endpoint}/v1/chat/completions"),
             "POST",
             Some(&body),
         )?;
@@ -212,7 +276,8 @@ impl Osarous {
         sampling: Option<SamplingParams>,
     ) -> Result<impl Iterator<Item = Result<(String, String), String>>, String> {
         let body = self.build_body(model, messages, true, sampling);
-        let url = format!("{}/v1/chat/completions", self.base_url);
+        let endpoint = self.endpoint_for_model(model);
+        let url = format!("{endpoint}/v1/chat/completions");
         Ok(transport::sse(&url, "POST", Some(&body))?.map(|frame| -> Result<(String, String), String> {
             let frame: SseEvent = frame?;
             if frame.event == "error" {

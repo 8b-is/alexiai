@@ -18,6 +18,8 @@ use crate::transport;
 
 pub const ST_DAEMON_URL: &str = "http://127.0.0.1:28428";
 pub const WORKSPACE_ROOT: &str = "/home/hue/8b-is";
+pub const MACBOOK_8B_ROOT: &str = "/home/hue/macbook-source/8b-is";
+pub const MACBOOK_WRAITH_ROOT: &str = "/home/hue/macbook-source/8bit-wraith";
 pub const SONY_ROOT: &str = "/home/hue/sony";
 pub const SG_ROOT: &str = "/home/hue/standardgalactic";
 pub const MEMORY_FILE_PATH: &str = "/home/hue/.local/share/alexiai/memory.jsonl";
@@ -981,8 +983,9 @@ pub fn workspace_and_memory_digest() -> String {
     repos_8b.sort();
 
     let mut digest = format!(
-        "LIVE 8B-IS WORKSPACE LEDGER (`{WORKSPACE_ROOT}` — {} repos on disk):\n\
+        "LIVE 8B-IS WORKSPACE LEDGER (`{WORKSPACE_ROOT}` — {} local repos + `{MACBOOK_8B_ROOT}` NFS share on `wraith@MacBook.local` with 2.9 TiB free & 238 repos):\n\
          - Local 8b-is repositories: {}\n\
+         - Shared MacBook Apple Silicon Resources (`macbook-bridge.service` over loopback): `/home/hue/macbook-source` (2.9 TiB NFS), Ollama on `127.0.0.1:11435` (`aye-gemma4:26b-16k`, `aye-qwen36:35b-16k`, `qwen3.6:35b`, `gemma4:26b`), and Smart Tree v10.2.0 daemon on `127.0.0.1:28429`.\n\
          - Key project notes:\n\
            • `beehive` (`/home/hue/8b-is/beehive`): Local family-graph, WebAudio, FindMy/LoRa frame codec (`<~~0o0|v2|...|0o0~~>` with 9-trit `b3` signature + CRC32), Android WebView bridge, Swift `BeeHiveKit` CLI, and 5-stage file digest pipeline (`pipeline/beehive-pipeline.mjs`). (NEVER confuse `beehive` with Cardano/blockchain — it is our `8b-is/beehive` family-graph & codec repo!)\n\
            • `alexiai` (`/home/hue/8b-is/alexiai`): Sovereign offline companion on `gaia-mlx-quant` v0.3.0 (Rust/Go/C/Swift, zero-float `p/q`, Quantum 64-Trit `POPCNT`, Omni `BFP-64`, `wupz` ABI v1, and zero-float DeepSeek `Engram`).\n\
@@ -1323,9 +1326,9 @@ fn extract_repo_or_path(prompt: &str) -> Option<String> {
         if stopwords.contains(&lower.as_str()) {
             continue;
         }
-        // Check exact or case-insensitive / hyphen-normalized match in /home/hue/8b-is and /home/hue/sony
+        // Check exact or case-insensitive / hyphen-normalized match across local & MacBook NFS roots
         let key = normalize_repo_key(clean);
-        for root in [WORKSPACE_ROOT, SONY_ROOT] {
+        for root in [WORKSPACE_ROOT, MACBOOK_8B_ROOT, MACBOOK_WRAITH_ROOT, SONY_ROOT] {
             let exact = format!("{root}/{clean}");
             if Path::new(&exact).is_dir() {
                 return Some(exact);
