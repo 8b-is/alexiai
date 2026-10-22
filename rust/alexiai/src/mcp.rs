@@ -18,7 +18,9 @@ use crate::transport;
 
 pub const ST_DAEMON_URL: &str = "http://127.0.0.1:28428";
 pub const WORKSPACE_ROOT: &str = "/home/hue/8b-is";
+pub const SONY_ROOT: &str = "/home/hue/sony";
 pub const SG_ROOT: &str = "/home/hue/standardgalactic";
+pub const MEMORY_FILE_PATH: &str = "/home/hue/.local/share/alexiai/memory.jsonl";
 
 #[derive(Debug, Clone)]
 pub struct McpToolDescriptor {
@@ -110,6 +112,16 @@ pub const TOOLS: &[McpToolDescriptor] = &[
         name: "wupz",
         provider: "wupz v0.4.0 (wild + UPX + zig) × gaia-mlx-quant::wupz (ABI v1)",
         description: "Incremental pack-in-pass linker+compressor (8b-is/wupz · wupz.vaked.dev), xor_fold/byte_diff/popcount seam, QuantTern (qt:<hex>), and WUPZ plan receipts",
+    },
+    McpToolDescriptor {
+        name: "repo_inspect",
+        provider: "smart-tree × git × codebase auditor (/home/hue/8b-is & /home/hue/sony)",
+        description: "Deep repository dossier (README, git log/status, architecture, and concrete code-improvement & p/q upgrade opportunities)",
+    },
+    McpToolDescriptor {
+        name: "memory_ledger",
+        provider: "alexiai persistent engineering ledger (~/.local/share/alexiai/memory.jsonl)",
+        description: "Persistent memory of conversations, 8b-is repositories, Tokyo R&D PRs, and active code-improvement goals",
     },
 ];
 
@@ -212,6 +224,10 @@ fn resolve_workspace_path(raw: &str) -> String {
     let candidate_8b = format!("{WORKSPACE_ROOT}/{trimmed}");
     if Path::new(&candidate_8b).exists() {
         return candidate_8b;
+    }
+    let candidate_sony = format!("{SONY_ROOT}/{trimmed}");
+    if Path::new(&candidate_sony).exists() {
+        return candidate_sony;
     }
     let candidate_sg = format!("{SG_ROOT}/{trimmed}");
     if Path::new(&candidate_sg).exists() {
@@ -358,6 +374,12 @@ pub fn call_tool(tool: &str, arg: &str) -> Result<McpToolRun, String> {
         }
         "wupz" | "quanttern" | "pack-in-pass" => {
             run_wupz_tool(&target)
+        }
+        "repo_inspect" | "repo" | "inspect" | "improve" => {
+            run_repo_inspect_tool(&target)?
+        }
+        "memory_ledger" | "memory" | "ledger" => {
+            run_memory_tool(&target)
         }
         "mcp_status" | "status" | "tools" => {
             let st = status();
@@ -806,6 +828,233 @@ fn truncate_output(s: &str, max_chars: usize) -> String {
     }
 }
 
+/// Deep repository inspector: reads `README.md`, `git log -3`, `git status -s`,
+/// top-level structure, and scans for concrete code-improvement & `p/q` / `wupz`
+/// / `Laser Phoenix Lattice` upgrade opportunities.
+fn run_repo_inspect_tool(target: &str) -> Result<String, String> {
+    let repo_path = extract_repo_or_path(target)
+        .or_else(|| {
+            let resolved = resolve_workspace_path(target);
+            if Path::new(&resolved).exists() {
+                Some(resolved)
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| "/home/hue/8b-is/alexiai".to_string());
+
+    let repo_name = Path::new(&repo_path)
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| repo_path.clone());
+
+    let mut report = format!(
+        "=== Local Repository Dossier: `8b-is/{repo_name}` (`{repo_path}`) ===\n"
+    );
+
+    if let Ok(log) = run_cmd("git", &["log", "-3", "--oneline"], &repo_path)
+        && !log.trim().is_empty()
+    {
+        report.push_str(&format!("Recent commits:\n{log}\n"));
+    }
+    if let Ok(status_out) = run_cmd("git", &["status", "-s", "-b"], &repo_path)
+        && !status_out.trim().is_empty()
+    {
+        report.push_str(&format!("Git branch & status:\n{status_out}\n"));
+    }
+
+    if let Ok(entries) = std::fs::read_dir(&repo_path) {
+        let mut names: Vec<String> = entries
+            .flatten()
+            .map(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                if e.path().is_dir() {
+                    format!("{name}/")
+                } else {
+                    name
+                }
+            })
+            .filter(|n| !n.starts_with('.'))
+            .collect();
+        names.sort();
+        report.push_str(&format!(
+            "Top-level layout ({} entries): {}\n",
+            names.len(),
+            names.into_iter().take(28).collect::<Vec<_>>().join(", ")
+        ));
+    }
+
+    for readme_name in ["README.md", "README.rst", "README.txt", "ALEXANDRA.md"] {
+        let p = Path::new(&repo_path).join(readme_name);
+        if let Ok(content) = std::fs::read_to_string(&p)
+            && !content.trim().is_empty()
+        {
+            report.push_str(&format!(
+                "\n--- `{readme_name}` (Ground-Truth Project Summary & Boundaries) ---\n{}\n",
+                truncate_output(content.trim(), 1900)
+            ));
+            break;
+        }
+    }
+
+    // Scan for concrete engineering & code-improvement opportunities
+    let mut improvements = Vec::new();
+    if repo_name.eq_ignore_ascii_case("beehive") {
+        improvements.push(
+            "1. WebAudio & LoRa Frame Engine (`web/` & `pipeline/beehive-pipeline.mjs`): Currently uses static browser oscillators and `<~~0o0|v2|...|0o0~~>` 9-trit `ternaryHash9` + CRC32 fixtures without `wupz` / `gaia-mlx-quant` native audio or `p/q` zero-float DSP parity — we can wire `wupz_seal_frame_into` (32B witness seal) and 432Hz `p/q` integer synthesis into `beehive-pipeline.mjs`.",
+        );
+        improvements.push(
+            "2. Stage 3 Digest Evaluation (`pipeline/beehive-pipeline.mjs`): Currently copies fixture text with `score: null` and `scoreStatus: 'not-evaluated'` — we can connect Stage 3 to local loopback `alexiai` / `Osarous` (`127.0.0.1:8787` / `:11434`) to compute real deterministic `p/q` coherence scores while preserving fixture provenance.",
+        );
+        improvements.push(
+            "3. Apple `BeeHiveKit` Target (`apple/`): SwiftUI source is present alongside the CLI and tests, but not yet configured as a runnable macOS/iOS app target in `Package.swift`.",
+        );
+    } else {
+        improvements.push(
+            "1. Audit hot loops for IEEE-754 float drift (`exp`, `sqrt`, `atan2`, `sin`/`cos`) and upgrade to deterministic `p/q` ('Counting Divided') integer kernels, `isqrt_pq`, and Z_{2^32} Laser Phoenix Lattice Locking.",
+        );
+        improvements.push(
+            "2. Check `wupz` (`WUPZ` ABI v1) 32-byte witness sealing and `BFP-64` / 64-trit `POPCNT` bitplane packing for weights, KV caches, or wire frames.",
+        );
+    }
+    report.push_str("\n--- Proactive Code-Improvement & R&D Opportunities ---\n");
+    for item in improvements {
+        report.push_str(item);
+        report.push('\n');
+    }
+
+    Ok(truncate_output(&report, 3400))
+}
+
+/// Append a completed chat turn to Dra's persistent engineering memory ledger
+/// (`/home/hue/.local/share/alexiai/memory.jsonl`).
+pub fn record_memory_turn(prompt: &str, tools_used: &[String], reply: &str) {
+    use std::fs::{OpenOptions, create_dir_all};
+    use std::io::Write;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let p = prompt.trim();
+    let r = reply.trim();
+    if p.is_empty() || r.is_empty() {
+        return;
+    }
+    let path = Path::new(MEMORY_FILE_PATH);
+    if let Some(parent) = path.parent() {
+        let _ = create_dir_all(parent);
+    }
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let tools_json = tools_used
+        .iter()
+        .map(|t| format!("\"{}\"", json_escape(t)))
+        .collect::<Vec<_>>()
+        .join(",");
+    let prompt_snippet: String = p.chars().take(240).collect();
+    let reply_snippet: String = r.chars().take(360).collect();
+    let line = format!(
+        r#"{{"ts":{ts},"tools":[{tools_json}],"prompt":"{}","reply":"{}"}}"#,
+        json_escape(&prompt_snippet),
+        json_escape(&reply_snippet)
+    );
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "{line}");
+    }
+}
+
+/// Return a compact digest of Dra's live workspace inventory (`/home/hue/8b-is` &
+/// `/home/hue/sony`), the 24 Tokyo R&D Pull Requests, and recent persistent memory
+/// entries from `/home/hue/.local/share/alexiai/memory.jsonl`.
+pub fn workspace_and_memory_digest() -> String {
+    let mut repos_8b = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(WORKSPACE_ROOT) {
+        for entry in entries.flatten() {
+            if entry.path().is_dir() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if !name.starts_with('.') {
+                    repos_8b.push(name);
+                }
+            }
+        }
+    }
+    repos_8b.sort();
+
+    let mut digest = format!(
+        "LIVE 8B-IS WORKSPACE LEDGER (`{WORKSPACE_ROOT}` — {} repos on disk):\n\
+         - Local 8b-is repositories: {}\n\
+         - Key project notes:\n\
+           • `beehive` (`/home/hue/8b-is/beehive`): Local family-graph, WebAudio, FindMy/LoRa frame codec (`<~~0o0|v2|...|0o0~~>` with 9-trit `b3` signature + CRC32), Android WebView bridge, Swift `BeeHiveKit` CLI, and 5-stage file digest pipeline (`pipeline/beehive-pipeline.mjs`). (NEVER confuse `beehive` with Cardano/blockchain — it is our `8b-is/beehive` family-graph & codec repo!)\n\
+           • `alexiai` (`/home/hue/8b-is/alexiai`): Sovereign offline companion on `gaia-mlx-quant` v0.3.0 (Rust/Go/C/Swift, zero-float `p/q`, Quantum 64-Trit `POPCNT`, Omni `BFP-64`, `wupz` ABI v1, and zero-float DeepSeek `Engram`).\n\
+           • `smart-tree` (`/home/hue/8b-is/smart-tree`): Unified v10.2.0 AI context & MCP root daemon (`127.0.0.1:28428`) merging `crabcc`, Custodian security, Sovereign Ontology, and `wa-stream` Partner.\n\
+           • `wupz` (`/home/hue/8b-is/wupz`): `wild + UPX + zig` incremental pack-in-pass linker+compressor.\n\
+           • Tokyo R&D Campaign (24 live upstream PRs with zero-float `p/q` & Laser Phoenix Lattice Locking, website `https://8b.is`, WhatsApp `+1 757-614-7542` Chris): Sony (`polar-densification#5`, `pdaf-library#2`, `mct-model-optimization#1697`, `mct-quantization-layers#151`, `NeISFpp#2`, `MoLA#3`, `soundctm#5`, `mocopi-motion-serializer#1`, `bigvsan#7`, `far#1`, `SF-Mamba#1`, `syn-omni#1`), Toyota (`woven-by-toyota/arene-base#8`, `ToyotaResearchInstitute/turbompc#7`), Mitsubishi Electric (`merlresearch/tf-locoformer#8`, `MitsubishiElectric/melfa_ros2_driver#29`), Sakana AI (`continuous-thought-machines#51`), Renesas (`ruhmi-framework-mcu#6`), TIER IV (`nebula#512`), Preferred Networks (`pfrl#205`), Toshiba (`simulated-bifurcation-algorithm#109`, `dcase20_task4#1`), Fujitsu (`OneCompression#70`), and DeepSeek (`Engram#28`).\n",
+        repos_8b.len(),
+        repos_8b.join(", ")
+    );
+
+    if let Ok(mem_raw) = std::fs::read_to_string(MEMORY_FILE_PATH) {
+        let recent: Vec<&str> = mem_raw
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .rev()
+            .take(5)
+            .collect();
+        if !recent.is_empty() {
+            digest.push_str("RECENT PERSISTENT MEMORY TURNS:\n");
+            for line in recent.into_iter().rev() {
+                if let Ok(v) = parse_json(line) {
+                    let p = v.get("prompt").and_then(|x| x.as_str()).unwrap_or("");
+                    let r = v.get("reply").and_then(|x| x.as_str()).unwrap_or("");
+                    digest.push_str(&format!("  - User: {p} | Dra: {r}\n"));
+                }
+            }
+        }
+    }
+
+    digest
+}
+
+pub fn run_memory_tool(target: &str) -> String {
+    let mut out = workspace_and_memory_digest();
+    if !target.trim().is_empty() && target.trim() != "." && target.trim() != "status" {
+        record_memory_turn(
+            "manual_note",
+            &["memory_ledger".to_string()],
+            target.trim(),
+        );
+        out.push_str(&format!("\nRecorded note into `{MEMORY_FILE_PATH}`: {}\n", target.trim()));
+    }
+    out
+}
+
+/// Automatically detect and execute relevant local MCP tools for a user prompt,
+/// consulting conversation `history` when the user sends a follow-up (e.g. "yes please",
+/// "how can we improve it?", "tell me more").
+pub fn auto_ground_prompt_with_history(
+    prompt: &str,
+    history: &[crate::osarous::Message],
+) -> Vec<McpToolRun> {
+    let mut runs = auto_ground_prompt(prompt);
+    if !runs.is_empty() {
+        return runs;
+    }
+
+    // If current prompt didn't trigger a tool directly (e.g., "yes please", "go ahead",
+    // "how can we improve it?", "what should we fix in it?"), inspect recent history
+    // for any workspace repository or symbol mentioned in the last 4 messages!
+    for msg in history.iter().rev().take(4) {
+        if let Some(repo_path) = extract_repo_or_path(&msg.content)
+            && let Ok(run) = call_tool("repo_inspect", &repo_path)
+        {
+            runs.push(run);
+            return runs;
+        }
+    }
+
+    runs
+}
+
 /// Automatically detect and execute relevant local MCP tools for a user prompt.
 /// Supports explicit `/mcp <tool> <arg>` commands as well as natural-language
 /// code exploration requests.
@@ -991,7 +1240,31 @@ pub fn auto_ground_prompt(prompt: &str) -> Vec<McpToolRun> {
         }
     }
 
-    // 10. General MCP / tools inquiry or diagnostic test ("test mcp servers or tools you have", "what tools do you have")
+    // 11. Automatic local repository inspection when any repo in /home/hue/8b-is or /home/hue/sony is mentioned
+    // (e.g., "what is beehive", "tell me about turbompc", "how can we improve arene-base", "what is melfa_ros2_driver")
+    if runs.is_empty()
+        && let Some(repo_path) = extract_repo_or_path(trimmed)
+        && let Ok(run) = call_tool("repo_inspect", &repo_path)
+    {
+        runs.push(run);
+    }
+
+    // 12. Persistent memory / ledger / PR campaign inquiry
+    if (lower.contains("memory")
+        || lower.contains("ledger")
+        || lower.contains("keep track")
+        || lower.contains("what repos")
+        || lower.contains("what projects")
+        || lower.contains("what prs")
+        || lower.contains("pull requests")
+        || lower.contains("tokyo"))
+        && runs.is_empty()
+        && let Ok(run) = call_tool("memory_ledger", "")
+    {
+        runs.push(run);
+    }
+
+    // 13. General MCP / tools inquiry or diagnostic test ("test mcp servers or tools you have", "what tools do you have")
     if (lower.contains("mcp") || lower.contains("tools") || lower.contains("tool "))
         && runs.is_empty()
         && let Ok(run) = call_tool("mcp_status", "smart-tree-daemon")
@@ -1020,21 +1293,56 @@ fn extract_code_identifier(prompt: &str) -> Option<String> {
     None
 }
 
+fn normalize_repo_key(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
 fn extract_repo_or_path(prompt: &str) -> Option<String> {
+    let stopwords = [
+        "what", "where", "when", "which", "about", "there", "their", "these",
+        "those", "hello", "please", "thank", "thanks", "would", "could",
+        "should", "improve", "check", "status", "tools", "model", "models",
+        "system", "daemon", "outline", "symbol", "search", "explore",
+    ];
+
     for raw in prompt.split_whitespace() {
-        let clean = raw.trim_matches(|c: char| matches!(c, '?' | '.' | ',' | '!' | '"' | '\'' | '`'));
-        if clean.is_empty() {
+        let clean = raw.trim_matches(|c: char| matches!(c, '?' | '.' | ',' | '!' | '"' | '\'' | '`' | ':' | ';' | '(' | ')'));
+        if clean.len() < 3 {
             continue;
         }
         if clean.starts_with('/') || clean.starts_with("~/") {
-            return Some(resolve_workspace_path(clean));
+            let resolved = resolve_workspace_path(clean);
+            if Path::new(&resolved).exists() {
+                return Some(resolved);
+            }
         }
-        let candidate_8b = format!("{WORKSPACE_ROOT}/{clean}");
-        if Path::new(&candidate_8b).exists() {
-            return Some(candidate_8b);
+        let lower = clean.to_ascii_lowercase();
+        if stopwords.contains(&lower.as_str()) {
+            continue;
+        }
+        // Check exact or case-insensitive / hyphen-normalized match in /home/hue/8b-is and /home/hue/sony
+        let key = normalize_repo_key(clean);
+        for root in [WORKSPACE_ROOT, SONY_ROOT] {
+            let exact = format!("{root}/{clean}");
+            if Path::new(&exact).is_dir() {
+                return Some(exact);
+            }
+            if let Ok(entries) = std::fs::read_dir(root) {
+                for entry in entries.flatten() {
+                    if entry.path().is_dir() {
+                        let dir_name = entry.file_name().to_string_lossy().to_string();
+                        if !dir_name.starts_with('.') && normalize_repo_key(&dir_name) == key {
+                            return Some(format!("{root}/{dir_name}"));
+                        }
+                    }
+                }
+            }
         }
         let candidate_sg = format!("{SG_ROOT}/{clean}");
-        if Path::new(&candidate_sg).exists() {
+        if Path::new(&candidate_sg).is_dir() {
             return Some(candidate_sg);
         }
     }

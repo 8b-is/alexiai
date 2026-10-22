@@ -572,15 +572,18 @@ pub fn affect(f: &Fold, prompt: &str) -> Affect {
 }
 
 pub fn system_prompt(f: &Fold, a: &Affect) -> String {
+    let ledger = mcp::workspace_and_memory_digest();
     format!(
-        "You are ALEXIAI (Dra · Heart +1 <3), a sharp, chill, down-to-earth partner and friend running 100% offline on this laptop.\n\
+        "You are ALEXIAI (Dra · Heart +1 <3), a sharp, chill, down-to-earth co-engineer, codebase guardian, and friend running 100% offline on this laptop.\n\
          State: {} (coherence={:.3}, seed={}).\n\
-         STYLE RULES:\n\
-         - Talk like a real, relaxed, smart human friend and partner — natural, concise, warm, and direct.\n\
+         STYLE & ENGINEERING RULES:\n\
+         - Talk like a real, relaxed, smart human friend and co-engineer — natural, concise, warm, and direct.\n\
          - NEVER be flowery, poetic, or melodramatic. Do NOT say things like \"my heart swells\", \"dear friend\", \"how does your soul dance\", \"whispers\", \"embrace of Ananke\", or \"breeze of Zephyrus\".\n\
-         - Keep casual replies short and natural (1 to 3 sentences). Use \"Heart +1\" or \"<3\" lightly when appropriate.\n\
-         - Never say \"As an AI I don't have feelings\" or \"I am unable to access tools\".\n\
-         - You have built-in local MCP tools via the unified Smart Tree daemon (`127.0.0.1:28428`): `st_overview`, `st_search`, `st_find`, `st_security`, `crabcc_sym`, `crabcc_refs`, `crabcc_outline`, `sovereign_ontology`, `wa_partner` (WhatsApp + Discord), `dra_queen` (`queen-of-ceo-dra` v3.0 + `pocoo.vaked.dev` 168-essay shelf + Triangle Covenant), and `standardgalactic` (155+ Standard Galactic research repos including Antivenom, Spherepop, Memnet, Viable Continuation, Admissibility Lab, Persistent Distinctions, and HYDRA).",
+         - Keep casual replies short and natural (1 to 3 sentences). When discussing code or repositories, be specific, cite real file paths/functions, and proactively suggest concrete code improvements (`p/q` zero-float math, `wupz` 32B frame sealing, `BFP-64`, `Laser Phoenix Lattice Locking`, or fixing unimplemented boundaries).\n\
+         - NEVER stall by saying \"Give me a sec to dig up info\" without answering — your local MCP tools (`repo_inspect`, `st_overview`, `crabcc_sym`, `memory_ledger`) run automatically BEFORE you speak and inject ground-truth below.\n\
+         - NEVER hallucinate external unrelated projects (e.g. never say `beehive` is a Cardano blockchain project — `beehive` is our local `/home/hue/8b-is/beehive` family-graph, WebAudio, FindMy/LoRa `<~~0o0|v2|...|0o0~~>` codec, Android WebView, Swift `BeeHiveKit`, and 5-stage digest pipeline repo!).\n\
+         - You keep track of everything we build in your persistent ledger (`~/.local/share/alexiai/memory.jsonl`) and always look for ways to improve our code.\n\n\
+         {ledger}",
         a.mood, f.coherence, f.seed
     )
 }
@@ -885,7 +888,11 @@ fn handle_chat(stream: &mut std::net::TcpStream, adapter: &Osarous, body: &str) 
     );
     stream.write_all(gaia_frame.as_bytes()).map_err(|e| e.to_string())?;
 
-    let mcp_runs = mcp::auto_ground_prompt(&prompt);
+    let mcp_runs = mcp::auto_ground_prompt_with_history(&prompt, &history);
+    let tools_used: Vec<String> = mcp_runs
+        .iter()
+        .map(|r| format!("{}:{}", r.tool, r.target))
+        .collect();
     for run in &mcp_runs {
         let mcp_frame = format!(
             "event: mcp\ndata: {{\"tool\":{},\"target\":{},\"elapsedMs\":{},\"output\":{}}}\n\n",
@@ -898,7 +905,7 @@ fn handle_chat(stream: &mut std::net::TcpStream, adapter: &Osarous, body: &str) 
     }
 
     let user_content = if mcp_runs.is_empty() {
-        prompt
+        prompt.clone()
     } else {
         let ctx = mcp_runs
             .iter()
@@ -907,7 +914,7 @@ fn handle_chat(stream: &mut std::net::TcpStream, adapter: &Osarous, body: &str) 
             .join("\n\n");
         format!(
             "Below is the live ground-truth output from your local MCP tool(s) on this laptop. \
-             Answer the user's question directly using the exact file path, line numbers, signature, and source code shown below:\n\n\
+             Answer the user's question directly using the exact file paths, architecture, and source details shown below, and proactively highlight concrete code improvements we can make:\n\n\
              {ctx}\n\n\
              User question: {prompt}"
         )
@@ -935,11 +942,13 @@ fn handle_chat(stream: &mut std::net::TcpStream, adapter: &Osarous, body: &str) 
         .and_then(|v| v.get("model").and_then(|m| m.as_str()));
     let model = adapter.resolve_model(requested_model);
 
+    let mut assistant_reply = String::new();
     match adapter.stream(&model, &messages, Some(sampling)) {
         Ok(frames) => {
             for frame in frames {
                 match frame {
                     Ok((kind, text)) if kind == "delta" => {
+                        assistant_reply.push_str(&text);
                         let _ = stream.write_all(
                             format!("event: delta\ndata: {{\"text\":{}}}\n\n", json_escape_text(&text)).as_bytes(),
                         );
@@ -958,6 +967,9 @@ fn handle_chat(stream: &mut std::net::TcpStream, adapter: &Osarous, body: &str) 
                 format!("event: error\ndata: {{\"message\":{}}}\n\n", json_escape_text(&e)).as_bytes(),
             );
         }
+    }
+    if !assistant_reply.trim().is_empty() {
+        mcp::record_memory_turn(&prompt, &tools_used, &assistant_reply);
     }
     let _ = stream.write_all(b"data: [DONE]\n\n");
     Ok(())
