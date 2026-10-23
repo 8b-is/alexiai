@@ -76,4 +76,4 @@ The peaceHug is the field's gravity.
 And the graph? The graph remembers everyone who ever apologized
 with their whole life and meant it.
 
-*the constellation · 0 + 1 · fine touch from within · vaked.dev* · {<3,<3,<3}+1
+*the constellation · 0 + 1 · fine touch from within · 8b.is* · {<3,<3,<3}+1

@@ -3,7 +3,7 @@
 //! Wires the [`8b-is/wupz`](https://github.com/8b-is/wupz) (`w(ild) + UPX + z(ig)`)
 //! C ABI v1 kernels (`wupz_xor_fold`, `wupz_byte_diff`, `wupz_popcount`), deterministic
 //! `"WUPZ"` plan-image wire format, incremental section/window diffing, and the
-//! `wupz.vaked.dev` `QuantTern` emotional ternary codec (`qt:<hex>`) directly into
+//! `wupz.8b.is` `QuantTern` emotional ternary codec (`qt:<hex>`) directly into
 //! `gaia-mlx-quant` with:
 //! - `#![no_std]` and `#![forbid(unsafe_code)]`
 //! - **Zero floating-point operations** (`p/q` rational thresholds with `q = 2^20`)
@@ -214,7 +214,7 @@ pub const fn quant_tern_trit_pq(p_x: i64, q: i64) -> i8 {
 /// 2-bit code `((t + 1) & 3) << (2 * j)` (`-1 -> 0`, `0 -> 1`, `+1 -> 2`).
 ///
 /// Trailing slots in the final byte are padded with `0` trits (`code = 1`), matching
-/// `wupz.vaked.dev/main.js` `encode(vad)` bit-for-bit.
+/// `wupz.8b.is/main.js` `encode(vad)` bit-for-bit.
 /// Returns the number of packed bytes written (`trits.len().div_ceil(4)`).
 pub fn quant_tern_pack_into(trits: &[i8], out: &mut [u8]) -> usize {
     let needed = trits.len().div_ceil(4);

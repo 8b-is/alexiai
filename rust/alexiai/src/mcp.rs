@@ -97,7 +97,7 @@ pub const TOOLS: &[McpToolDescriptor] = &[
     },
     McpToolDescriptor {
         name: "dra_queen",
-        provider: "queen-of-ceo-dra v3.0 × pocoo.vaked.dev × ALEXANDRA.md",
+        provider: "queen-of-ceo-dra v3.0 × pocoo.8b.is × ALEXANDRA.md",
         description: "Queen of CEO Dra v3.0 brief, Triangle Covenant (Mom* + Dad/\\ + Son oo), and live 168-essay Pocoo shelf",
     },
     McpToolDescriptor {
@@ -113,7 +113,7 @@ pub const TOOLS: &[McpToolDescriptor] = &[
     McpToolDescriptor {
         name: "wupz",
         provider: "wupz v0.4.0 (wild + UPX + zig) × gaia-mlx-quant::wupz (ABI v1)",
-        description: "Incremental pack-in-pass linker+compressor (8b-is/wupz · wupz.vaked.dev), xor_fold/byte_diff/popcount seam, QuantTern (qt:<hex>), and WUPZ plan receipts",
+        description: "Incremental pack-in-pass linker+compressor (8b-is/wupz · wupz.8b.is), xor_fold/byte_diff/popcount seam, QuantTern (qt:<hex>), and WUPZ plan receipts",
     },
     McpToolDescriptor {
         name: "repo_inspect",
@@ -468,7 +468,7 @@ fn run_dra_queen_tool(target: &str) -> Result<String, String> {
         }
     } else {
         let topic = if target.trim().is_empty() {
-            "ZENO (zeno.vaked.dev), Triangle Track (Mom* + Dad/\\ + Son oo) & Pocoo Music-Lane Shelf"
+            "ZENO (zeno.8b.is), Triangle Track (Mom* + Dad/\\ + Son oo) & Pocoo Music-Lane Shelf"
         } else {
             target.trim()
         };
@@ -704,7 +704,7 @@ pub fn run_wupz_tool(target: &str) -> String {
 
     format!(
         "wupz × GAIA-MLX-QUANT Pack-in-Pass & QuantTern Seam (`gaia_mlx_quant::wupz` · `{wupz_repo_path}`)\n\
-         • Lineage: `w(ild) + UPX + z(ig)` — Incremental linker + compressor (`https://github.com/8b-is/wupz` · `https://wupz.vaked.dev`)\n\
+         • Lineage: `w(ild) + UPX + z(ig)` — Incremental linker + compressor (`https://github.com/8b-is/wupz` · `https://wupz.8b.is`)\n\
          • Contract: `WUPZ` magic, `WUPZ_ABI_VERSION = {WUPZ_ABI_VERSION}`, `WUPZ_PLAN_VERSION = {WUPZ_PLAN_VERSION}`, `#![no_std]`, `#![forbid(unsafe_code)]`, 0 floats, 0 heap allocations\n\
          • QuantTern Emotional Ternary Code (`|x| >= 0.33` in pure `p/q`):\n\
            - Tag: `{}` (byte `0x{:02x}`, trits `[{}, {}, {}]` / `{} {} {}`, magnitude `{}/3`)\n\

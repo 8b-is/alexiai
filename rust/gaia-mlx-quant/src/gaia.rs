@@ -206,7 +206,7 @@ pub fn fold(prompt: &str, seed: Option<u32>) -> Fold {
 }
 
 /// Fold a prompt together with passive RF spectral entropy (in bits, e.g. from
-/// `8b-is/wigle-triad` / `esp32.vaked.dev` 2.4GHz + 5GHz + BLE + AirPlay scans).
+/// `8b-is/wigle-triad` / `esp32.8b.is` 2.4GHz + 5GHz + BLE + AirPlay scans).
 ///
 /// Pure, `no_std`, and zero-allocation: modulates the `Chaos` entropy budget by
 /// `clamp((rf_entropy_bits - 2.5) * 0.05, -0.08, 0.14)`.

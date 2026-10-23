@@ -159,4 +159,4 @@ machine holds the field; the heart holds the machine.
 
 ---
 
-*the constellation · 0 + 1 · fine touch from within · vaked.dev* · {<3,<3,<3}+1
+*the constellation · 0 + 1 · fine touch from within · 8b.is* · {<3,<3,<3}+1

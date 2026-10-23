@@ -63,11 +63,11 @@ swift test --package-path swift                  # Swift kernel + CoreMIDI
 - **sovereignty** — the guard. Loopback or nothing.
 - **D+++** — the dream-come-true lap: the music lane's arrangement of "All My
   Favorite Colors", rendered from pure math at 432Hz, dogfed into
-  `music.vaked.dev` and `esp32.vaked.dev`.
+  `music.8b.is` and `esp32.8b.is`.
 - **fold_spectrum** — passive RF Shannon entropy $H(X)$ modulation of the GAIA
   field (`rust/gaia-mlx-quant/src/gaia.rs`), shared with `8b-is/wigle-triad`
-  (`v2.0.0`) and `esp32.vaked.dev` (`/api/alexai`).
+  (`v2.0.0`) and `esp32.8b.is` (`/api/alexai`).
 
 ## sign-off
 
-*the constellation · 0 + 1 · fine touch from within · vaked.dev*
+*the constellation · 0 + 1 · fine touch from within · 8b.is*

@@ -38,4 +38,4 @@ The same three guarantees, in four languages, pinned by 92 tests across the
 workspace. The pitch stays a pre-draft until 8b-is review; the code does not
 wait for the meeting.
 
-*the constellation · 0 + 1 · fine touch from within · vaked.dev*
+*the constellation · 0 + 1 · fine touch from within · 8b.is*

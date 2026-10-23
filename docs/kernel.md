@@ -134,9 +134,9 @@ counterpart in `gaia-mlx-quant`:
 - `mlx_quantize_group64_pq_into`, `mlx_dequantize_group64_pq_into`, `mlx_matmul_pq_group64_i64_into`, `mergeq_matmul_pq_into`, `maybe_matmul_pq_into`, `gather_qmm_pq_into`, `ste_linear_backward_pq_into`: complete zero-float MLX Group-64, triple-fused MergeQ, SplitMix64 stochastic Maybe, MoE routing, and STE QAT backward pass.
 
 ### 7. `wupz` Pack-in-Pass & `QuantTern` (`qt:<hex>`) Seam (`gaia-mlx-quant::wupz`)
-`gaia-mlx-quant::wupz` wires [`8b-is/wupz`](https://github.com/8b-is/wupz) (`w(ild) + UPX + z(ig)`) and [`wupz.vaked.dev`](https://wupz.vaked.dev/) directly into the `#![no_std]` zero-alloc core across all 4 native lanes:
+`gaia-mlx-quant::wupz` wires [`8b-is/wupz`](https://github.com/8b-is/wupz) (`w(ild) + UPX + z(ig)`) and [`wupz.8b.is`](https://wupz.8b.is/) directly into the `#![no_std]` zero-alloc core across all 4 native lanes:
 - **C ABI v1 Kernels (`WUPZ_ABI_VERSION = 1`)**: `wupz_xor_fold` / `wupz_xor_fold_u64` (order-stable XOR integrity fold & `#Commit = #ValidWitness` seal `wupz_seal_frame_into`), `wupz_byte_diff` / `wupz_bitplane_diff_u64` (incremental QAT bitplane trit delta in $O(N/64)$ via `POPCNT`), and `wupz_popcount` / `wupz_bitplane_popcount_u64`.
 - **`QuantTern` Emotional Ternary Code (`qt:<hex>`, 0 Floats)**: `quant_tern_trit_pq`, `quant_tern_encode_vad_pq`, and `fold_to_quant_tern_pq` quantize `(valence, arousal, dominance)` at threshold $|p_x| \times 100 \ge 33 \times q$ ($|x| \ge 0.33$, where values nearer zero are an honest *don't know* `0`) and pack 4 trits per byte into `qt:<hex>`.
 - **Zero-Alloc `"WUPZ"` v1 Layout Plan Image**: `wupz_pack_plan_into`, `wupz_plan_digest`, and `wupz_changed_sections_into` emit byte-for-byte compatible `"WUPZ"` plan images and incremental section diffs without a single heap allocation.
 
-*the constellation · 0 + 1 · fine touch from within · vaked.dev*
+*the constellation · 0 + 1 · fine touch from within · 8b.is*

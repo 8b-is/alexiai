@@ -221,13 +221,13 @@ second is the stairs.
   `https://api.openai.com` cannot appear in a request from this app. Not
   configurable. Not today, not after an update.
 
-## 🌐 Constellation Integrations (`wupz` × `wigle-triad` × `esp32.vaked.dev`)
+## 🌐 Constellation Integrations (`wupz` × `wigle-triad` × `esp32.8b.is`)
 
 `GAIA-MLX-QUANT` (`b1.58` ternary packing, 64-trit quantum bitplanes, `wupz` pack-in-pass, `fold_spectrum`, and **D+++ 432Hz** harmonic synthesis) is embedded across the offline-first MEDUSA triad fleet:
 
-- **[`8b-is/wupz` (`v0.4.0`)](https://github.com/8b-is/wupz) × [`wupz.vaked.dev`](https://wupz.vaked.dev/)** — Incremental ultra-fast linker + compressor (`w(ild) + UPX + z(ig)`) wired into `gaia_mlx_quant::wupz` across all 4 native lanes (Rust, C99, Go, Swift): C ABI v1 `wupz_xor_fold` (`#Commit = #ValidWitness`), `wupz_byte_diff`, `wupz_popcount`, `wupz_bitplane_diff_u64` (incremental QAT bitplane delta in $O(N/64)$), deterministic `"WUPZ"` v1 layout plan images (`wupz_pack_plan_into`), and pure-integer `p/q` `QuantTern` emotional ternary codes (`qt:<hex>`, threshold $|x| \ge 0.33$ with `0` floats).
+- **[`8b-is/wupz` (`v0.4.0`)](https://github.com/8b-is/wupz) × [`wupz.8b.is`](https://wupz.8b.is/)** — Incremental ultra-fast linker + compressor (`w(ild) + UPX + z(ig)`) wired into `gaia_mlx_quant::wupz` across all 4 native lanes (Rust, C99, Go, Swift): C ABI v1 `wupz_xor_fold` (`#Commit = #ValidWitness`), `wupz_byte_diff`, `wupz_popcount`, `wupz_bitplane_diff_u64` (incremental QAT bitplane delta in $O(N/64)$), deterministic `"WUPZ"` v1 layout plan images (`wupz_pack_plan_into`), and pure-integer `p/q` `QuantTern` emotional ternary codes (`qt:<hex>`, threshold $|x| \ge 0.33$ with `0` floats).
 - **[`8b-is/wigle-triad` (`v2.0.0`)](https://github.com/8b-is/wigle-triad)** — macOS (`WigleMac.app`), Android (`WigleTriad-v2.0.0-android-universal.apk`), iPadOS/iOS, and local Python bridge (`host/wiglewww.py` `/api/alexai`) fold passive 2.4/5 GHz Wi-Fi, BLE/BT, and AirPlay Shannon entropy $H(X)$ into the 4-layer GAIA field (`Ananke`, `Chaos`, `Zephyrus`, `Aphrodite`) and pack endpoint RSSI trits (`{-1, 0, +1}`) at 5 trits/byte (`1.585 bits/weight`).
-- **[`esp32.vaked.dev`](https://esp32.vaked.dev/)** ([`/api/alexai`](https://esp32.vaked.dev/api/alexai) · Tab 6 `🧠 AlexAI × Kompress-Ultra`) — Live offline-first PWA & WebSerial workstation pairing `AlexAIEngine` (`GAIA-MLX-QUANT b1.58`) with [`kompress-ultra` (`v16.2.0`)](https://github.com/peterlodri-sec/kompress-ultra).
+- **[`esp32.8b.is`](https://esp32.8b.is/)** ([`/api/alexai`](https://esp32.8b.is/api/alexai) · Tab 6 `🧠 AlexAI × Kompress-Ultra`) — Live offline-first PWA & WebSerial workstation pairing `AlexAIEngine` (`GAIA-MLX-QUANT b1.58`) with [`kompress-ultra` (`v16.2.0`)](https://github.com/peterlodri-sec/kompress-ultra).
 
 ## 🤝 Contribute
 
@@ -241,4 +241,4 @@ Rules live in `AGENTS.md`. The one rule above all: **loopback or nothing.**
 
 ---
 
-*the constellation · 0 + 1 · fine touch from within · vaked.dev* · {<3,<3,<3}+1
+*the constellation · 0 + 1 · fine touch from within · 8b.is* · {<3,<3,<3}+1

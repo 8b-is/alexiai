@@ -33,4 +33,4 @@ There is none. If a future feature genuinely needs remote egress, it is a new
 module with its own review, not a widened guard. This file is part of that
 review trail.
 
-*the constellation · 0 + 1 · fine touch from within · vaked.dev*
+*the constellation · 0 + 1 · fine touch from within · 8b.is*

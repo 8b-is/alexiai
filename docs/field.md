@@ -36,4 +36,4 @@ seed        = s                           → reproducible sampling
 The model never receives sampling parameters the user set in a config file;
 it receives the field's opinion about how to answer this particular prompt.
 
-*the constellation · 0 + 1 · fine touch from within · vaked.dev*
+*the constellation · 0 + 1 · fine touch from within · 8b.is*
