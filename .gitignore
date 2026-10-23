@@ -14,3 +14,6 @@ c/bench_cuda
 c/*.o
 .swiftpm/
 swift/.build/
+
+# local agent hooks
+.agents/
