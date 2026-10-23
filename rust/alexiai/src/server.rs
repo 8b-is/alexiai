@@ -720,7 +720,7 @@ fn handle_connection(mut stream: std::net::TcpStream, adapter: &Osarous) -> Resu
             let (up, detail, latency_ms) = adapter.health_with_latency();
             let a = attestation();
             let json = format!(
-                r#"{{"ok":{},"endpoint":"{}","detail":"{}","latencyMs":{},"sovereignty":{{"policy":"{}","installed":true,"loopbackHosts":[{}]}}}}"#,
+                r#"{{"ok":{},"version":"0.4.0","timezone":"Asia/Tokyo","location":"Tokyo · Sony R&D / Shinagawa-Osaki-Shinjuku Triad","endpoint":"{}","detail":"{}","latencyMs":{},"sovereignty":{{"policy":"{}","installed":true,"loopbackHosts":[{}]}}}}"#,
                 up,
                 adapter.base_url,
                 json_escape(detail.as_str()),
