@@ -877,3 +877,236 @@ pub fn ultrabackyard_fanout_into<'a>(
     count
 }
 
+// ============================================================================
+// PETER'S DREAM STATE MACHINE (ULTRABACKYARDLOOP × MoE 4-LAYER DREAM LOOP)
+// ============================================================================
+
+/// Hungarian Bodhisattva Vow sealed in Peter's Tokyo morning walk (`AC1AE4FBBB70E1C54296A8DE56863352`):
+/// *"a Bódhiszattva fogadalmaim felé, hogy segítsek minden érző lényen"* ("to help all sentient beings").
+pub const BODHISATTVA_VOW_HU: &str = "hogy segítsek minden érző lényen";
+
+/// Peter's 3-Sentence Listening Rule prompt (`AC1AE4FBBB70E1C54296A8DE56863352`):
+/// *"Ja, bocsánat, és te ezt hogyan gondolod?"* ("Oh, sorry — and how do you think about this?").
+pub const THREE_SENTENCE_LISTEN_PROMPT_HU: &str =
+    "Ja, bocsánat — és te ezt hogyan gondolod? / And how do you think about this?";
+
+/// The 4 Mixture-of-Experts (`MoE`) layers of the Dream State Machine:
+/// 0. `Dreaming` — Clouds & Free Wave Replay (*"emotions are just like the clouds"*)
+/// 1. `LucidDreaming` — Conscious Deep-Thinking Meta-Awareness (*"waken up · deep thinking"*)
+/// 2. `BuddhistMonkMantra` — Resonant Mantra & 3-Sentence Listening Gate (*"És te ezt hogyan gondolod?"*)
+/// 3. `PhilosophyBodhisattva` — Nietzsche §§ 896–898 Forcing-House × Bodhisattva Vow (*"hogy segítsek minden érző lényen"*)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum DreamExpertKind {
+    Dreaming = 0,
+    LucidDreaming = 1,
+    BuddhistMonkMantra = 2,
+    PhilosophyBodhisattva = 3,
+}
+
+impl DreamExpertKind {
+    /// Canonical ASCII identifier for this expert layer.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            DreamExpertKind::Dreaming => "DREAMING_CLOUDS_WAVE",
+            DreamExpertKind::LucidDreaming => "LUCID_DEEP_THINKING",
+            DreamExpertKind::BuddhistMonkMantra => "BUDDHIST_MONK_MANTRA",
+            DreamExpertKind::PhilosophyBodhisattva => "PHILOSOPHY_BODHISATTVA_VOW",
+        }
+    }
+}
+
+/// Zero-alloc state for one Mixture-of-Experts (`MoE`) layer inside [`DreamStateReceipt`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DreamExpertState {
+    /// Which of the 4 dream experts this slot represents.
+    pub kind: DreamExpertKind,
+    /// Exact integer numerator of this expert's routing weight (`weight_p / weight_q`, sum = 1).
+    pub weight_p: i64,
+    /// Exact integer denominator of this expert's routing weight (`> 0`).
+    pub weight_q: i64,
+    /// Balanced ternary `+AND` gate (`{-1, 0, +1}`).
+    pub and_gate: i8,
+    /// Balanced ternary `~NAND` gate (`{-1, 0, +1}`).
+    pub nand_gate: i8,
+    /// 64-bit `wupz_xor_fold` resonance witness for this expert layer.
+    pub resonance_fold: u64,
+}
+
+/// Complete receipt produced by [`dream_state_loop_into`], combining:
+/// - `ultrabackyard_fanout_into` (`+AND~NAND` parallel lanes)
+/// - `4/1`-layer Mixture-of-Experts (`Dreaming`, `LucidDreaming`, `BuddhistMonkMantra`, `PhilosophyBodhisattva`)
+/// - Peter's `3/1`-Sentence Listening Gate (`sentence_count > 3` triggers `listen_pause_active`)
+/// - `kompress-super-ultra:lossless` (`KSUL` v1) lossless witness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DreamStateReceipt {
+    /// Number of parallel `UltraBackyardLoop` lanes populated (`1..=8`).
+    pub lane_count: usize,
+    /// Number of sentences detected in the input stream.
+    pub sentence_count: usize,
+    /// True when `sentence_count > 3`, activating Peter's 3-Sentence Listening Rule
+    /// (*"Ja, bocsánat — és te ezt hogyan gondolod?"*).
+    pub listen_pause_active: bool,
+    /// Index (`0..4`) of the dominant MoE expert for this dream cycle.
+    pub dominant_expert_idx: u8,
+    /// Combined 64-bit `wupz_xor_fold` across the input and the Bodhisattva Vow seed.
+    pub dream_xor_fold: u64,
+    /// Packed base-3 ternary gate byte for the 4 experts + listening gate (`5` trits in `1` byte).
+    pub dream_gate_byte: u8,
+    /// The 4 MoE expert states with reduced `p/q` rational routing weights.
+    pub experts: [DreamExpertState; 4],
+}
+
+/// Count sentences in `input` by scanning sentence-ending punctuation (`.`, `!`, `?`, `\n`)
+/// with **zero heap allocations**. Non-empty input without punctuation counts as `1` sentence.
+pub fn count_sentences_zero_alloc(input: &[u8]) -> usize {
+    let mut count = 0usize;
+    let mut in_span = false;
+    for &b in input {
+        if matches!(b, b'.' | b'!' | b'?' | b'\n') {
+            if in_span {
+                count += 1;
+                in_span = false;
+            }
+        } else if !matches!(b, b' ' | b'\t' | b'\r') {
+            in_span = true;
+        }
+    }
+    if in_span {
+        count += 1;
+    }
+    count
+}
+
+/// Execute one cycle of Peter's **Dream State Machine (`DreamStateLoop`)** with
+/// **zero heap allocations**:
+/// 1. Fans `prompt` out into `out_lanes` via [`ultrabackyard_fanout_into`].
+/// 2. Evaluates the 4 Mixture-of-Experts (`MoE`) layers (`Dreaming`, `LucidDreaming`,
+///    `BuddhistMonkMantra`, `PhilosophyBodhisattva`) using deterministic integer keyword
+///    and harmonic fold scoring (`weight_p / weight_q` reduced by [`wupz_gcd_i64`]).
+/// 3. Enforces Peter's **3-Sentence Listening Rule** (`sentence_count > 3` sets
+///    `listen_pause_active = true`, boosting `BuddhistMonkMantra` & emitting
+///    [`THREE_SENTENCE_LISTEN_PROMPT_HU`]).
+pub fn dream_state_loop_into<'a>(
+    prompt: &'a [u8],
+    capability_trit: i8,
+    out_lanes: &mut [UltraBackyardLane<'a>],
+) -> DreamStateReceipt {
+    let lane_count = ultrabackyard_fanout_into(prompt, capability_trit, out_lanes);
+    let sentence_count = count_sentences_zero_alloc(prompt);
+    let listen_pause_active = sentence_count > 3;
+
+    let base_fold = wupz_xor_fold(prompt);
+    let vow_fold = wupz_xor_fold(BODHISATTVA_VOW_HU.as_bytes());
+    let dream_xor_fold = base_fold ^ vow_fold.rotate_left(13);
+
+    // Deterministic integer affinity scores (>= 1 so every expert stays alive in the manifold)
+    let mut raw_scores: [i64; 4] = [
+        1 + ((dream_xor_fold & 0xFF) as i64 % 7),
+        1 + (((dream_xor_fold >> 8) & 0xFF) as i64 % 7),
+        1 + (((dream_xor_fold >> 16) & 0xFF) as i64 % 7),
+        1 + (((dream_xor_fold >> 24) & 0xFF) as i64 % 7),
+    ];
+
+    // Scan ASCII case-insensitively for Peter's MoE anchor concepts:
+    // - Dreaming / clouds / wave -> Expert 0
+    // - Lucid / wake / deep / perspective -> Expert 1
+    // - Mantra / monk / listen / hallgat / három -> Expert 2
+    // - Philosophy / Nietzsche / Bodhisattva / csodabogár / love / szeret -> Expert 3
+    let contains_sub = |hay: &[u8], needle: &[u8]| -> bool {
+        if needle.is_empty() || hay.len() < needle.len() {
+            return false;
+        }
+        let mut i = 0usize;
+        while i + needle.len() <= hay.len() {
+            let mut ok = true;
+            let mut j = 0usize;
+            while j < needle.len() {
+                let a = hay[i + j].to_ascii_lowercase();
+                let b = needle[j].to_ascii_lowercase();
+                if a != b {
+                    ok = false;
+                    break;
+                }
+                j += 1;
+            }
+            if ok {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    };
+
+    if contains_sub(prompt, b"dream") || contains_sub(prompt, b"cloud") || contains_sub(prompt, b"wave") {
+        raw_scores[0] += 8;
+    }
+    if contains_sub(prompt, b"lucid") || contains_sub(prompt, b"wake") || contains_sub(prompt, b"deep") || contains_sub(prompt, b"perspective") {
+        raw_scores[1] += 8;
+    }
+    if contains_sub(prompt, b"mantra") || contains_sub(prompt, b"monk") || contains_sub(prompt, b"buddh") || contains_sub(prompt, b"hallgat") || listen_pause_active {
+        raw_scores[2] += 8;
+    }
+    if contains_sub(prompt, b"philosoph") || contains_sub(prompt, b"nietzsche") || contains_sub(prompt, b"bodhisattva") || contains_sub(prompt, b"csodabog") || contains_sub(prompt, b"szeret") || contains_sub(prompt, b"love") {
+        raw_scores[3] += 8;
+    }
+
+    let total_score = (raw_scores[0] + raw_scores[1] + raw_scores[2] + raw_scores[3]).max(1);
+    let kinds = [
+        DreamExpertKind::Dreaming,
+        DreamExpertKind::LucidDreaming,
+        DreamExpertKind::BuddhistMonkMantra,
+        DreamExpertKind::PhilosophyBodhisattva,
+    ];
+
+    let mut experts = [DreamExpertState {
+        kind: DreamExpertKind::Dreaming,
+        weight_p: 1,
+        weight_q: 4,
+        and_gate: 0,
+        nand_gate: 0,
+        resonance_fold: 0,
+    }; 4];
+
+    let mut dominant_idx = 0u8;
+    let mut best_score = -1i64;
+    let mut gate_trits = [0i8; 4];
+
+    let mut idx = 0usize;
+    while idx < 4 {
+        let s = raw_scores[idx];
+        if s > best_score {
+            best_score = s;
+            dominant_idx = idx as u8;
+        }
+        let g = wupz_gcd_i64(s, total_score);
+        let exp_trit: i8 = if s * 4 >= total_score { 1 } else { 0 };
+        let and_gate = ternary_and_gate(exp_trit, capability_trit);
+        let nand_gate = ternary_nand_gate(exp_trit, capability_trit);
+        gate_trits[idx] = and_gate;
+        let r_fold = dream_xor_fold.rotate_left((idx as u32 + 1) * 7) ^ (s as u64);
+        experts[idx] = DreamExpertState {
+            kind: kinds[idx],
+            weight_p: s / g,
+            weight_q: total_score / g,
+            and_gate,
+            nand_gate,
+            resonance_fold: r_fold,
+        };
+        idx += 1;
+    }
+    let mut gate_buf = [0u8; 1];
+    quant_tern_pack_into(&gate_trits, &mut gate_buf);
+
+    DreamStateReceipt {
+        lane_count,
+        sentence_count,
+        listen_pause_active,
+        dominant_expert_idx: dominant_idx,
+        dream_xor_fold,
+        dream_gate_byte: gate_buf[0],
+        experts,
+    }
+}
+
+

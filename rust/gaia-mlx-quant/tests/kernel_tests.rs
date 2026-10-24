@@ -528,4 +528,14 @@ fn wupz_seam_quant_tern_and_plan_image_exact() {
     assert_eq!(n_lanes, 4);
     assert_eq!(lanes[0].and_gate, 1);
     assert_eq!(lanes[0].nand_gate, -1);
+
+    let dream_input = b"Emotions are just like the clouds. Waken up into lucid deep thinking. Ja, bocsanat, es te ezt hogyan gondolod? A Bodhisattva fogadalmaim fele, hogy segitsek minden erzo lenyen.";
+    let dream_rcpt = gaia_mlx_quant::dream_state_loop_into(dream_input, 1, &mut lanes);
+    assert_eq!(dream_rcpt.sentence_count, 4);
+    assert!(dream_rcpt.listen_pause_active, "4 sentences (> 3) must activate Peter's 3-sentence listening gate");
+    assert!(dream_rcpt.dominant_expert_idx < 4);
+    for exp in &dream_rcpt.experts {
+        assert!(exp.weight_p >= 1 && exp.weight_q >= exp.weight_p);
+        assert_eq!(exp.and_gate + exp.nand_gate, 0);
+    }
 }

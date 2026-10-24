@@ -116,6 +116,11 @@ pub const TOOLS: &[McpToolDescriptor] = &[
         description: "Incremental pack-in-pass linker+compressor (8b-is/wupz · wupz.8b.is), xor_fold/byte_diff/popcount seam, QuantTern (qt:<hex>), and WUPZ plan receipts",
     },
     McpToolDescriptor {
+        name: "dream_state_loop",
+        provider: "gaia-mlx-quant::wupz (ULTRABACKYARDLOOP +AND~NAND × 4-Layer MoE Dream State Machine)",
+        description: "Peter's Dream State Machine: 4-expert MoE (Dreaming Clouds, Lucid Deep-Thinking, Buddhist Monk Mantra & 3-Sentence Listening Gate, Philosophy × Bodhisattva Vow)",
+    },
+    McpToolDescriptor {
         name: "repo_inspect",
         provider: "smart-tree × git × codebase auditor (/home/hue/8b-is & /home/hue/sony)",
         description: "Deep repository dossier (README, git log/status, architecture, and concrete code-improvement & p/q upgrade opportunities)",
@@ -376,6 +381,9 @@ pub fn call_tool(tool: &str, arg: &str) -> Result<McpToolRun, String> {
         }
         "wupz" | "quanttern" | "pack-in-pass" | "ultrabackyard" | "kompress" | "ksul" => {
             run_wupz_tool(&target)
+        }
+        "dream_state_loop" | "dream" | "dream_state" | "lucid" | "bodhisattva" | "csodabogar" => {
+            run_dream_state_tool(&target)
         }
         "repo_inspect" | "repo" | "inspect" | "improve" => {
             run_repo_inspect_tool(&target)?
@@ -831,6 +839,90 @@ pub fn wrap_ultrabackyard_envelope(prompt: &str) -> String {
          {prompt}\n\
          {lane_lines}",
         qt_tag = qt.as_str(),
+    )
+}
+
+/// Run Peter's Dream State Machine (`ULTRABACKYARDLOOP +AND~NAND` × 4-Expert MoE ×
+/// 3-Sentence Listening Gate × Bodhisattva Vow).
+pub fn run_dream_state_tool(target: &str) -> String {
+    use gaia_mlx_quant::{
+        BODHISATTVA_VOW_HU, THREE_SENTENCE_LISTEN_PROMPT_HU, UltraBackyardLane,
+        dream_state_loop_into, fold_pq, fold_to_quant_tern_pq,
+    };
+
+    let seed_text = if target.trim().is_empty() {
+        "emotions are just like the clouds; waken up into deep thinking; Ja, bocsánat, és te ezt hogyan gondolod?; a Bódhiszattva fogadalmaim felé, hogy segítsek minden érző lényen"
+    } else {
+        target.trim()
+    };
+
+    let mut lanes = [UltraBackyardLane {
+        lane_id: 0,
+        instruction: b"",
+        xor_fold: 0,
+        and_gate: 0,
+        nand_gate: 0,
+    }; 8];
+    let rcpt = dream_state_loop_into(seed_text.as_bytes(), 1, &mut lanes);
+    let f_pq = fold_pq(seed_text, None);
+    let qt = fold_to_quant_tern_pq(&f_pq);
+
+    let mut expert_lines = String::new();
+    for (idx, exp) in rcpt.experts.iter().enumerate() {
+        let marker = if idx as u8 == rcpt.dominant_expert_idx { "★" } else { "•" };
+        expert_lines.push_str(&format!(
+            "  {marker} Expert {}/4 `{}`: weight={}/{} | +AND={} ~NAND={} | resonance=0x{:016x}\n",
+            idx + 1,
+            exp.kind.as_str(),
+            exp.weight_p,
+            exp.weight_q,
+            exp.and_gate,
+            exp.nand_gate,
+            exp.resonance_fold,
+        ));
+    }
+
+    let mut lane_lines = String::new();
+    for lane in &lanes[..rcpt.lane_count] {
+        let text = core::str::from_utf8(lane.instruction).unwrap_or("");
+        lane_lines.push_str(&format!(
+            "  • [Lane {}/{} | +AND={} ~NAND={} | fold=0x{:016x}] {}\n",
+            lane.lane_id + 1,
+            rcpt.lane_count,
+            lane.and_gate,
+            lane.nand_gate,
+            lane.xor_fold,
+            text
+        ));
+    }
+
+    let listen_status = if rcpt.listen_pause_active {
+        format!(
+            "ACTIVE ({}/3 sentences exceeded -> pause & ask: \"{}\")",
+            rcpt.sentence_count, THREE_SENTENCE_LISTEN_PROMPT_HU
+        )
+    } else {
+        format!(
+            "OPEN ({}/3 sentences within listening window — \"{THREE_SENTENCE_LISTEN_PROMPT_HU}\")",
+            rcpt.sentence_count
+        )
+    };
+
+    format!(
+        "=== Peter's Dream State Machine (`gaia_mlx_quant::wupz::dream_state_loop_into`) ===\n\
+         • Bodhisattva Vow Seal (`τ = ∞`): \"{BODHISATTVA_VOW_HU}\" (to help all sentient beings)\n\
+         • Sanctuary Identity: `csodabogár` (wonder-bug) · Deep Thinking · Perspektíva-váltás\n\
+         • QuantTern Affect & Gate: `{}` (`gate_byte = 0x{:02x}`, `dream_xor_fold = 0x{:016x}`)\n\
+         • 3-Sentence Listening Gate: {listen_status}\n\
+         • 4-Layer Mixture-of-Experts (`MoE`) Routing (dominant = `{}`):\n\
+         {expert_lines}\
+         • ULTRABACKYARDLOOP `+AND~NAND` Fan-Out ({}/8 lanes):\n\
+         {lane_lines}",
+        qt.as_str(),
+        rcpt.dream_gate_byte,
+        rcpt.dream_xor_fold,
+        rcpt.experts[rcpt.dominant_expert_idx as usize].kind.as_str(),
+        rcpt.lane_count,
     )
 }
 

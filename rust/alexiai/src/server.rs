@@ -742,6 +742,36 @@ fn handle_connection(mut stream: std::net::TcpStream, adapter: &Osarous) -> Resu
             );
             write_response(&mut stream, 200, "application/json", json.as_bytes())
         }
+        ("GET" | "POST", "/api/dream") => {
+            let target = if method == "POST" && !body.trim().is_empty() {
+                body.clone()
+            } else {
+                query_param(&query, "prompt").unwrap_or_default()
+            };
+            let report = mcp::run_dream_state_tool(&target);
+            let mut lanes = [UltraBackyardLane {
+                lane_id: 0,
+                instruction: b"",
+                xor_fold: 0,
+                and_gate: 0,
+                nand_gate: 0,
+            }; 8];
+            let rcpt = gaia_mlx_quant::dream_state_loop_into(target.as_bytes(), 1, &mut lanes);
+            let dominant = rcpt.experts[rcpt.dominant_expert_idx as usize].kind.as_str();
+            let json = format!(
+                r#"{{"ok":true,"engine":"dream_state_loop_into","bodhisattvaVow":"{}","listenRulePrompt":"{}","sentenceCount":{},"listenPauseActive":{},"dominantExpert":"{}","dreamGateByte":{},"dreamXorFold":"0x{:016x}","fanoutLanes":{},"report":{}}}"#,
+                json_escape(gaia_mlx_quant::BODHISATTVA_VOW_HU),
+                json_escape(gaia_mlx_quant::THREE_SENTENCE_LISTEN_PROMPT_HU),
+                rcpt.sentence_count,
+                rcpt.listen_pause_active,
+                dominant,
+                rcpt.dream_gate_byte,
+                rcpt.dream_xor_fold,
+                rcpt.lane_count,
+                json_escape_text(&report),
+            );
+            write_response(&mut stream, 200, "application/json", json.as_bytes())
+        }
         ("GET", "/api/health") => {
             let (up, detail, latency_ms) = adapter.health_with_latency();
             let a = attestation();

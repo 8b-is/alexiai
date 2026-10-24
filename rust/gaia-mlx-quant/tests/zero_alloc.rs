@@ -359,6 +359,11 @@ fn hot_paths_perform_zero_allocations() {
             nand_gate: 0,
         }; 4];
         let _ = ultrabackyard_fanout_into(b"lane one; lane two\nlane three", 1, &mut ub_lanes);
+        let _ = gaia_mlx_quant::dream_state_loop_into(
+            b"clouds dream. lucid wake. mantra hallgat. bodhisattva szeret.",
+            1,
+            &mut ub_lanes,
+        );
         let _ = fold_to_quant_tern_pq(&fpq1);
         std::hint::black_box((sampling(&f1), sampling(&f2), sampling_pq(&fpq1), sampling_pq(&fpq2)));
     }
