@@ -1179,5 +1179,88 @@ pub fn ultra_omni_create_dream_into<'a>(
     })
 }
 
+/// Fixed-capacity `no_std`, zero-allocation `O(1)` Circular Ring Buffer (`[Option<T>; N]`).
+///
+/// Overwrites the oldest slot in `O(1)` when full; zero heap allocations (`#![no_std]`, `#![forbid(unsafe_code)]`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConstRingBuffer<T: Copy, const N: usize> {
+    slots: [Option<T>; N],
+    head: usize,
+    len: usize,
+}
+
+impl<T: Copy, const N: usize> Default for ConstRingBuffer<T, N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T: Copy, const N: usize> ConstRingBuffer<T, N> {
+    /// Construct an empty `no_std` circular ring buffer of capacity `N`.
+    pub const fn new() -> Self {
+        Self {
+            slots: [None; N],
+            head: 0,
+            len: 0,
+        }
+    }
+
+    /// Capacity `N` of the ring buffer.
+    #[inline]
+    pub const fn capacity(&self) -> usize {
+        N
+    }
+
+    /// Number of occupied slots (`0..=N`).
+    #[inline]
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    /// True when `len == 0`.
+    #[inline]
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Push `item` in `O(1)`. If full, overwrites and returns the oldest item.
+    pub fn push_overwrite(&mut self, item: T) -> Option<T> {
+        if N == 0 {
+            return Some(item);
+        }
+        if self.len < N {
+            let idx = (self.head + self.len) % N;
+            self.slots[idx] = Some(item);
+            self.len += 1;
+            None
+        } else {
+            let idx = self.head;
+            let evicted = self.slots[idx].replace(item);
+            self.head = (self.head + 1) % N;
+            evicted
+        }
+    }
+
+    /// Pop the oldest item in `O(1)` (FIFO order).
+    pub fn pop_oldest(&mut self) -> Option<T> {
+        if self.len == 0 || N == 0 {
+            return None;
+        }
+        let item = self.slots[self.head].take();
+        self.head = (self.head + 1) % N;
+        self.len -= 1;
+        item
+    }
+
+    /// Read the `i`-th item from oldest (`0`) to newest (`len - 1`).
+    pub const fn get_chronological(&self, offset_from_oldest: usize) -> Option<T> {
+        if offset_from_oldest >= self.len || N == 0 {
+            return None;
+        }
+        let idx = (self.head + offset_from_oldest) % N;
+        self.slots[idx]
+    }
+}
+
 
 
