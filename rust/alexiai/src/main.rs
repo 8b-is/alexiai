@@ -24,6 +24,7 @@ alexiai <3 — Omni edition (Rust everywhere)
   alexiai mcp [list | <tool> [arg]]              list or run local MCP tools
   alexiai gaia [\"<text>\"]                        fold the field (+ QuantTern qt:<hex>)
   alexiai wupz [\"<text>\"]                        wupz pack-in-pass & QuantTern receipt
+  alexiai dream [\"<text>\"]                       ultra-omni-create << kompress-ultra(ultrabackyardloop)
   alexiai bench [--dim 256]                      ternary vs dense
 
   --endpoint must be loopback. That is not a bug, it is the product.
@@ -47,6 +48,7 @@ fn main() {
         "mcp" => cmd_mcp(rest),
         "gaia" => cmd_gaia(rest),
         "wupz" => cmd_wupz(rest),
+        "dream" | "ultra-omni-create" => cmd_dream(rest),
         "bench" => cmd_bench(rest),
         _ => {
             print!("{USAGE}");
@@ -256,6 +258,12 @@ fn cmd_gaia(rest: &[String]) -> Result<(), String> {
 fn cmd_wupz(rest: &[String]) -> Result<(), String> {
     let text = rest.join(" ");
     println!("\n{}\n", mcp::run_wupz_tool(&text));
+    Ok(())
+}
+
+fn cmd_dream(rest: &[String]) -> Result<(), String> {
+    let text = rest.join(" ");
+    println!("\n{}\n", mcp::run_dream_state_tool(&text));
     Ok(())
 }
 

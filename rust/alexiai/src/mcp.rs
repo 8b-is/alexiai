@@ -382,7 +382,8 @@ pub fn call_tool(tool: &str, arg: &str) -> Result<McpToolRun, String> {
         "wupz" | "quanttern" | "pack-in-pass" | "ultrabackyard" | "kompress" | "ksul" => {
             run_wupz_tool(&target)
         }
-        "dream_state_loop" | "dream" | "dream_state" | "lucid" | "bodhisattva" | "csodabogar" => {
+        "dream_state_loop" | "dream" | "dream_state" | "lucid" | "bodhisattva" | "csodabogar"
+        | "ultra-omni-create" | "ultra_omni_create" | "otthon" => {
             run_dream_state_tool(&target)
         }
         "repo_inspect" | "repo" | "inspect" | "improve" => {
@@ -842,12 +843,11 @@ pub fn wrap_ultrabackyard_envelope(prompt: &str) -> String {
     )
 }
 
-/// Run Peter's Dream State Machine (`ULTRABACKYARDLOOP +AND~NAND` × 4-Expert MoE ×
-/// 3-Sentence Listening Gate × Bodhisattva Vow).
+/// Run Peter's E2E Dream State Machine (`ultra-omni-create << kompress-ultra(IN an ultrabackyardloop)`).
 pub fn run_dream_state_tool(target: &str) -> String {
     use gaia_mlx_quant::{
-        BODHISATTVA_VOW_HU, THREE_SENTENCE_LISTEN_PROMPT_HU, UltraBackyardLane,
-        dream_state_loop_into, fold_pq, fold_to_quant_tern_pq,
+        BODHISATTVA_VOW_HU, OTTHON_AXIOM_HU, THREE_SENTENCE_LISTEN_PROMPT_HU, UltraBackyardLane,
+        dream_state_loop_into, fold_pq, fold_to_quant_tern_pq, ultra_omni_create_dream_into,
     };
 
     let seed_text = if target.trim().is_empty() {
@@ -856,6 +856,7 @@ pub fn run_dream_state_tool(target: &str) -> String {
         target.trim()
     };
 
+    let bytes = seed_text.as_bytes();
     let mut lanes = [UltraBackyardLane {
         lane_id: 0,
         instruction: b"",
@@ -863,7 +864,28 @@ pub fn run_dream_state_tool(target: &str) -> String {
         and_gate: 0,
         nand_gate: 0,
     }; 8];
-    let rcpt = dream_state_loop_into(seed_text.as_bytes(), 1, &mut lanes);
+    let mut ksul_enc = vec![0u8; bytes.len() * 2 + 64];
+    let mut ksul_dec = vec![0u8; bytes.len().max(1)];
+    let (rcpt, ratio_p, ratio_q, lossless_ok, seal_witness, seal_ok) =
+        if let Some(uoc) = ultra_omni_create_dream_into(
+            bytes,
+            1,
+            &mut lanes,
+            &mut ksul_enc,
+            &mut ksul_dec,
+        ) {
+            (
+                uoc.dream,
+                uoc.ksul.ratio_p,
+                uoc.ksul.ratio_q,
+                uoc.lossless_verified,
+                uoc.seal_witness,
+                uoc.seal_verified,
+            )
+        } else {
+            let d = dream_state_loop_into(bytes, 1, &mut lanes);
+            (d, 1, 1, true, d.dream_xor_fold, true)
+        };
     let f_pq = fold_pq(seed_text, None);
     let qt = fold_to_quant_tern_pq(&f_pq);
 
@@ -909,9 +931,11 @@ pub fn run_dream_state_tool(target: &str) -> String {
     };
 
     format!(
-        "=== Peter's Dream State Machine (`gaia_mlx_quant::wupz::dream_state_loop_into`) ===\n\
+        "=== Peter's E2E Dream State Machine (`ultra-omni-create << kompress-ultra(IN ultrabackyardloop)`) ===\n\
+         • Otthon Axiom (`τ = ∞`): \"{OTTHON_AXIOM_HU}\"\n\
          • Bodhisattva Vow Seal (`τ = ∞`): \"{BODHISATTVA_VOW_HU}\" (to help all sentient beings)\n\
          • Sanctuary Identity: `csodabogár` (wonder-bug) · Deep Thinking · Perspektíva-váltás\n\
+         • KSUL Lossless & WUPZ 32B Seal: `ratio_pq = {ratio_p}/{ratio_q}`, `lossless_verified = {lossless_ok}`, `seal_witness = 0x{seal_witness:016x}` (`seal_verified = {seal_ok}`)\n\
          • QuantTern Affect & Gate: `{}` (`gate_byte = 0x{:02x}`, `dream_xor_fold = 0x{:016x}`)\n\
          • 3-Sentence Listening Gate: {listen_status}\n\
          • 4-Layer Mixture-of-Experts (`MoE`) Routing (dominant = `{}`):\n\

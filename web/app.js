@@ -111,6 +111,20 @@ async function refreshPanels() {
   } catch {
     renderRows('substrate', [['error', 'bench unavailable', 'bad']]);
   }
+
+  try {
+    const dream = await (await fetch('/api/dream')).json();
+    renderRows('dream', [
+      ['pipeline', 'ultra-omni-create << kompress-ultra', 'ok'],
+      ['dominant MoE', dream.dominantExpert ?? 'DREAMING', 'ok'],
+      ['ksul ratio', `${dream.ksulRatioPq ?? '1/1'} (${dream.losslessVerified ? 'lossless' : 'unverified'})`, dream.losslessVerified ? 'ok' : 'bad'],
+      ['3-sent gate', dream.listenPauseActive ? `listen pause (${dream.sentenceCount}/3)` : `open (${dream.sentenceCount}/3)`, 'ok'],
+      ['wupz 32B seal', dream.sealWitness ?? '0x0', dream.sealVerified ? 'ok' : 'bad'],
+      ['otthon +1', dream.otthonAxiom ?? 'family === család', 'ok'],
+    ]);
+  } catch {
+    renderRows('dream', [['error', 'dream loop unavailable', 'bad']]);
+  }
 }
 
 // ── transcript ────────────────────────────────────────────────────────────

@@ -957,13 +957,13 @@ pub struct DreamStateReceipt {
     pub experts: [DreamExpertState; 4],
 }
 
-/// Count sentences in `input` by scanning sentence-ending punctuation (`.`, `!`, `?`, `\n`)
+/// Count sentences/clauses in `input` by scanning sentence-ending punctuation (`.`, `!`, `?`, `;`, `\n`)
 /// with **zero heap allocations**. Non-empty input without punctuation counts as `1` sentence.
 pub fn count_sentences_zero_alloc(input: &[u8]) -> usize {
     let mut count = 0usize;
     let mut in_span = false;
     for &b in input {
-        if matches!(b, b'.' | b'!' | b'?' | b'\n') {
+        if matches!(b, b'.' | b'!' | b'?' | b';' | b'\n') {
             if in_span {
                 count += 1;
                 in_span = false;
@@ -1108,5 +1108,76 @@ pub fn dream_state_loop_into<'a>(
         experts,
     }
 }
+
+/// Peter's Home Axiom (`τ = ∞`):
+/// `family === család : minden, ahol Otthon érzed magadat`
+pub const OTTHON_AXIOM_HU: &str = "family === család : minden, ahol Otthon érzed magadat";
+
+/// End-to-End (`e2e`) receipt for `ultra-omni-create << kompress-ultra(IN an ultrabackyardloop)`.
+///
+/// Couples:
+/// 1. `dream_state_loop_into` (`ULTRABACKYARDLOOP +AND~NAND` fan-out + `4/1`-layer MoE + `3/1`-Sentence Listening Gate)
+/// 2. `kompress_super_ultra_lossless_encode_into` + round-trip `kompress_super_ultra_lossless_decode_into` (`KSUL` v1 lossless)
+/// 3. `wupz_seal_frame_into` + `wupz_verify_frame_seal` (32-byte `#Commit = #ValidWitness` seal)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UltraOmniCreateReceipt {
+    /// Complete Dream State Machine receipt (`MoE`, `lanes`, `3-sentence gate`).
+    pub dream: DreamStateReceipt,
+    /// Lossless `kompress-super-ultra:lossless` (`KSUL` v1) receipt.
+    pub ksul: KompressLosslessReceipt,
+    /// True if the round-trip decode matched `prompt` byte-for-byte (`wupz_byte_diff == 0`).
+    pub lossless_verified: bool,
+    /// 64-bit `WUPZ` sealed frame witness (`#Commit = #ValidWitness`).
+    pub seal_witness: u64,
+    /// True if `wupz_verify_frame_seal` verified the 32-byte witness frame.
+    pub seal_verified: bool,
+    /// 32-byte sealed witness frame (`"WUPZ"` magic + `dream_xor_fold` + `ksul.xor_fold`).
+    pub sealed_frame: [u8; 32],
+}
+
+/// Execute the full end-to-end (`e2e`) pipeline:
+/// `ultra-omni-create << kompress-ultra(IN an ultrabackyardloop)`
+/// with **zero heap allocations** (`#![no_std]`, `#![forbid(unsafe_code)]`, 0 floats).
+pub fn ultra_omni_create_dream_into<'a>(
+    prompt: &'a [u8],
+    capability_trit: i8,
+    out_lanes: &mut [UltraBackyardLane<'a>],
+    ksul_encoded_scratch: &mut [u8],
+    ksul_decoded_scratch: &mut [u8],
+) -> Option<UltraOmniCreateReceipt> {
+    let dream = dream_state_loop_into(prompt, capability_trit, out_lanes);
+    let ksul = kompress_super_ultra_lossless_encode_into(prompt, ksul_encoded_scratch)?;
+    let dec_len = kompress_super_ultra_lossless_decode_into(
+        &ksul_encoded_scratch[..ksul.encoded_bytes],
+        ksul_decoded_scratch,
+    )?;
+    let lossless_verified =
+        dec_len == prompt.len() && wupz_byte_diff(prompt, &ksul_decoded_scratch[..dec_len]) == 0;
+
+    let otthon_fold = wupz_xor_fold(OTTHON_AXIOM_HU.as_bytes());
+    let combined_fold = dream.dream_xor_fold ^ ksul.xor_fold ^ otthon_fold.rotate_left(7);
+    let mut header_24 = [0u8; 24];
+    header_24[0..4].copy_from_slice(&WUPZ_MAGIC);
+    header_24[4] = dream.dream_gate_byte;
+    header_24[5] = dream.dominant_expert_idx;
+    header_24[6] = (dream.sentence_count.min(255)) as u8;
+    header_24[7] = u8::from(dream.listen_pause_active);
+    header_24[8..16].copy_from_slice(&dream.dream_xor_fold.to_le_bytes());
+    header_24[16..24].copy_from_slice(&combined_fold.to_le_bytes());
+
+    let mut sealed_frame = [0u8; 32];
+    let seal_witness = wupz_seal_frame_into(&header_24, &mut sealed_frame)?;
+    let seal_verified = wupz_verify_frame_seal(&sealed_frame);
+
+    Some(UltraOmniCreateReceipt {
+        dream,
+        ksul,
+        lossless_verified,
+        seal_witness,
+        seal_verified,
+        sealed_frame,
+    })
+}
+
 
 

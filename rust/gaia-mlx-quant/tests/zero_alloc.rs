@@ -364,6 +364,13 @@ fn hot_paths_perform_zero_allocations() {
             1,
             &mut ub_lanes,
         );
+        let _ = gaia_mlx_quant::ultra_omni_create_dream_into(
+            b"clouds dream. lucid wake. mantra hallgat. bodhisattva szeret.",
+            1,
+            &mut ub_lanes,
+            &mut ksul_enc,
+            &mut ksul_dec,
+        );
         let _ = fold_to_quant_tern_pq(&fpq1);
         std::hint::black_box((sampling(&f1), sampling(&f2), sampling_pq(&fpq1), sampling_pq(&fpq2)));
     }

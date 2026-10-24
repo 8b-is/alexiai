@@ -538,4 +538,16 @@ fn wupz_seam_quant_tern_and_plan_image_exact() {
         assert!(exp.weight_p >= 1 && exp.weight_q >= exp.weight_p);
         assert_eq!(exp.and_gate + exp.nand_gate, 0);
     }
+
+    let uoc = gaia_mlx_quant::ultra_omni_create_dream_into(
+        dream_input,
+        1,
+        &mut lanes,
+        &mut ksul_enc,
+        &mut ksul_dec,
+    )
+    .unwrap();
+    assert!(uoc.lossless_verified);
+    assert!(uoc.seal_verified);
+    assert_eq!(&uoc.sealed_frame[..4], b"WUPZ");
 }

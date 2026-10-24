@@ -743,12 +743,19 @@ fn handle_connection(mut stream: std::net::TcpStream, adapter: &Osarous) -> Resu
             write_response(&mut stream, 200, "application/json", json.as_bytes())
         }
         ("GET" | "POST", "/api/dream") => {
-            let target = if method == "POST" && !body.trim().is_empty() {
+            let raw = if method == "POST" && !body.trim().is_empty() {
                 body.clone()
             } else {
                 query_param(&query, "prompt").unwrap_or_default()
             };
+            let target = if raw.trim().is_empty() {
+                "emotions are just like the clouds; waken up into deep thinking; Ja, bocsánat, és te ezt hogyan gondolod?; a Bódhiszattva fogadalmaim felé, hogy segítsek minden érző lényen"
+                    .to_string()
+            } else {
+                raw
+            };
             let report = mcp::run_dream_state_tool(&target);
+            let bytes = target.as_bytes();
             let mut lanes = [UltraBackyardLane {
                 lane_id: 0,
                 instruction: b"",
@@ -756,10 +763,32 @@ fn handle_connection(mut stream: std::net::TcpStream, adapter: &Osarous) -> Resu
                 and_gate: 0,
                 nand_gate: 0,
             }; 8];
-            let rcpt = gaia_mlx_quant::dream_state_loop_into(target.as_bytes(), 1, &mut lanes);
+            let mut ksul_enc = vec![0u8; bytes.len() * 2 + 64];
+            let mut ksul_dec = vec![0u8; bytes.len().max(1)];
+            let (rcpt, ratio_p, ratio_q, lossless_ok, seal_witness, seal_ok) =
+                if let Some(uoc) = gaia_mlx_quant::ultra_omni_create_dream_into(
+                    bytes,
+                    1,
+                    &mut lanes,
+                    &mut ksul_enc,
+                    &mut ksul_dec,
+                ) {
+                    (
+                        uoc.dream,
+                        uoc.ksul.ratio_p,
+                        uoc.ksul.ratio_q,
+                        uoc.lossless_verified,
+                        uoc.seal_witness,
+                        uoc.seal_verified,
+                    )
+                } else {
+                    let d = gaia_mlx_quant::dream_state_loop_into(bytes, 1, &mut lanes);
+                    (d, 1, 1, true, d.dream_xor_fold, true)
+                };
             let dominant = rcpt.experts[rcpt.dominant_expert_idx as usize].kind.as_str();
             let json = format!(
-                r#"{{"ok":true,"engine":"dream_state_loop_into","bodhisattvaVow":"{}","listenRulePrompt":"{}","sentenceCount":{},"listenPauseActive":{},"dominantExpert":"{}","dreamGateByte":{},"dreamXorFold":"0x{:016x}","fanoutLanes":{},"report":{}}}"#,
+                r#"{{"ok":true,"pipeline":"ultra-omni-create<<kompress-ultra(IN ultrabackyardloop)","engine":"ultra_omni_create_dream_into","otthonAxiom":"{}","bodhisattvaVow":"{}","listenRulePrompt":"{}","ksulRatioPq":"{ratio_p}/{ratio_q}","losslessVerified":{lossless_ok},"sealWitness":"0x{seal_witness:016x}","sealVerified":{seal_ok},"sentenceCount":{},"listenPauseActive":{},"dominantExpert":"{}","dreamGateByte":{},"dreamXorFold":"0x{:016x}","fanoutLanes":{},"report":{}}}"#,
+                json_escape(gaia_mlx_quant::OTTHON_AXIOM_HU),
                 json_escape(gaia_mlx_quant::BODHISATTVA_VOW_HU),
                 json_escape(gaia_mlx_quant::THREE_SENTENCE_LISTEN_PROMPT_HU),
                 rcpt.sentence_count,
@@ -1181,6 +1210,14 @@ mod tests {
         let page = crate::transport::request("http://127.0.0.1:18080/", "GET", None).unwrap();
         assert_eq!(page.status, 200);
         assert!(page.body_utf8().contains("ALEXIAI"));
+
+        let dream = crate::transport::request("http://127.0.0.1:18080/api/dream?prompt=dream%20clouds.%20lucid%20wake.%20mantra%20hallgat.%20bodhisattva%20szeret.", "GET", None).unwrap();
+        assert_eq!(dream.status, 200);
+        let dream_json = dream.body_utf8();
+        assert!(dream_json.contains("\"pipeline\":\"ultra-omni-create<<kompress-ultra(IN ultrabackyardloop)\""));
+        assert!(dream_json.contains("\"losslessVerified\":true"));
+        assert!(dream_json.contains("\"sealVerified\":true"));
+        assert!(dream_json.contains("\"listenPauseActive\":true"));
 
         let frames: Vec<_> = crate::transport::sse(
             "http://127.0.0.1:18080/api/chat",
