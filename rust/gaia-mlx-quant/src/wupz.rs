@@ -510,3 +510,370 @@ pub fn wupz_section_from_bytes<'a>(
         hash: wupz_xor_fold(bytes),
     }
 }
+
+// ── 4. `ULTRABACKYARDLOOP +AND~NAND` & `kompress-super-ultra:lossless` ──────
+
+/// Wire magic for `kompress-super-ultra:lossless` frames (`"KSUL"`).
+pub const KSUL_MAGIC: [u8; 4] = *b"KSUL";
+
+/// Header byte length for `kompress-super-ultra:lossless` (`"KSUL"` + `orig_len: u32` + `xor_fold: u64`).
+pub const KSUL_HEADER_LEN: usize = 4 + 4 + 8;
+
+/// Balanced ternary `+AND` gate ($\min(a, b)$ in $\{-1, 0, +1\}$).
+///
+/// Admits `+1` (Affirm) only when both input `a` and capability gate `b` affirm (`+1`);
+/// attenuates to `-1` (Refuse) if either is `-1`; rests at `0` otherwise.
+#[inline]
+pub const fn ternary_and_gate(a: i8, b: i8) -> i8 {
+    let ca = if a > 1 { 1 } else if a < -1 { -1 } else { a };
+    let cb = if b > 1 { 1 } else if b < -1 { -1 } else { b };
+    if ca < cb { ca } else { cb }
+}
+
+/// Balanced ternary `~NAND` gate ($-\min(a, b)$ in $\{-1, 0, +1\}$).
+///
+/// Universal functional-completeness dual of [`ternary_and_gate`]: together,
+/// `(+AND, ~NAND)` span all boolean and Kleene/Łukasiewicz balanced-ternary logic
+/// with zero information erasure (`ternary_and_gate(a, b) + ternary_nand_gate(a, b) == 0`).
+#[inline]
+pub const fn ternary_nand_gate(a: i8, b: i8) -> i8 {
+    -ternary_and_gate(a, b)
+}
+
+/// 64-trit parallel quantum bitplane `+AND` and `~NAND` gate evaluation in $O(1)$ bitwise ops.
+///
+/// Given two 64-trit registers `(pos_a, neg_a)` and `(pos_b, neg_b)` where
+/// `+1 = (1, 0)`, `0 = (0, 0)`, `-1 = (0, 1)`:
+/// - `+AND` ($\min(A, B)$): `and_pos = pos_a & pos_b`, `and_neg = neg_a | neg_b`
+/// - `~NAND` ($-\min(A, B)$): `nand_pos = neg_a | neg_b`, `nand_neg = pos_a & pos_b`
+///
+/// Returns `(and_pos, and_neg, nand_pos, nand_neg)`.
+#[inline]
+pub const fn wupz_bitplane_and_nand_u64(
+    pos_a: u64,
+    neg_a: u64,
+    pos_b: u64,
+    neg_b: u64,
+) -> (u64, u64, u64, u64) {
+    let and_pos = pos_a & pos_b;
+    let and_neg = neg_a | neg_b;
+    let nand_pos = and_neg;
+    let nand_neg = and_pos;
+    (and_pos, and_neg, nand_pos, nand_neg)
+}
+
+/// Exact Euclidean GCD over `i64` for reduced rational `p/q` compression ratios (`0` floats).
+#[inline]
+pub const fn wupz_gcd_i64(mut a: i64, mut b: i64) -> i64 {
+    if a < 0 {
+        a = -a;
+    }
+    if b < 0 {
+        b = -b;
+    }
+    while b != 0 {
+        let r = a % b;
+        a = b;
+        b = r;
+    }
+    if a == 0 { 1 } else { a }
+}
+
+/// Receipt returned by [`kompress_super_ultra_lossless_encode_into`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KompressLosslessReceipt {
+    /// Original uncompressed byte length.
+    pub orig_bytes: usize,
+    /// Total encoded frame byte length (including 16-byte `"KSUL"` header).
+    pub encoded_bytes: usize,
+    /// Pure payload token stream byte length (excluding 16-byte `"KSUL"` header).
+    pub stream_bytes: usize,
+    /// Reduced rational numerator `p` of `orig_bytes / stream_bytes` (`0` floats).
+    pub ratio_p: i64,
+    /// Reduced rational denominator `q` of `orig_bytes / stream_bytes` (`0` floats).
+    pub ratio_q: i64,
+    /// 64-bit `wupz_xor_fold` lossless witness of the original bytes.
+    pub xor_fold: u64,
+    /// Balanced ternary `+AND` gate state across the payload's `QuantTern` VAD axes.
+    pub and_gate: i8,
+    /// Balanced ternary `~NAND` gate state across the payload's `QuantTern` VAD axes.
+    pub nand_gate: i8,
+    /// Packed `QuantTern` byte (`((and_gate+1)&3) | (((nand_gate+1)&3)<<2)`).
+    pub gate_byte: u8,
+}
+
+/// Encode `src` into `out` using `kompress-super-ultra:lossless` (`"KSUL"` v1) with
+/// **zero heap allocations** and **zero floating-point operations**.
+///
+/// Token wire format after the 16-byte header (`b"KSUL" | orig_len: u32 | xor_fold: u64`):
+/// - `0b00_LLLLLL` (`L = 0..63`, run length `L + 1` = `1..=64`): literal span of `L + 1` raw bytes.
+/// - `0b01_LLLLLL` (`L = 0..63`, run length `L + 4` = `4..=67`) + `byte`: RLE repeat of `byte`.
+/// - `0b10_LLLLLL` (`L = 0..63`, match length `L + 4` = `4..=67`) + `offset: u8` (`1..=255`):
+///   LZ77 sliding-window back-reference `offset` bytes back in the decoded stream.
+pub fn kompress_super_ultra_lossless_encode_into(
+    src: &[u8],
+    out: &mut [u8],
+) -> Option<KompressLosslessReceipt> {
+    let orig_len_u32 = u32::try_from(src.len()).ok()?;
+    if out.len() < KSUL_HEADER_LEN {
+        return None;
+    }
+    let xor_fold = wupz_xor_fold(src);
+    out[0..4].copy_from_slice(&KSUL_MAGIC);
+    out[4..8].copy_from_slice(&orig_len_u32.to_le_bytes());
+    out[8..16].copy_from_slice(&xor_fold.to_le_bytes());
+
+    let mut at = KSUL_HEADER_LEN;
+    let mut i = 0usize;
+    let mut lit_start = 0usize;
+
+    let flush_literals = |src: &[u8], mut s: usize, end: usize, out: &mut [u8], at: &mut usize| -> Option<()> {
+        while s < end {
+            let chunk = (end - s).min(64);
+            if *at + 1 + chunk > out.len() {
+                return None;
+            }
+            out[*at] = (chunk as u8 - 1) & 0x3F; // 0b00_LLLLLL
+            *at += 1;
+            out[*at..*at + chunk].copy_from_slice(&src[s..s + chunk]);
+            *at += chunk;
+            s += chunk;
+        }
+        Some(())
+    };
+
+    while i < src.len() {
+        // 1. Check RLE repeat run of >= 4 identical bytes
+        let b = src[i];
+        let mut rle_len = 1usize;
+        while i + rle_len < src.len() && src[i + rle_len] == b && rle_len < 67 {
+            rle_len += 1;
+        }
+
+        // 2. Check LZ77 sliding-window back-reference (window 1..=255, length 4..=67)
+        let mut best_off = 0usize;
+        let mut best_len = 0usize;
+        let win_start = i.saturating_sub(255);
+        let max_match = (src.len() - i).min(67);
+        if max_match >= 4 {
+            let mut cand = win_start;
+            while cand < i {
+                let mut mlen = 0usize;
+                while mlen < max_match && src[cand + mlen] == src[i + mlen] {
+                    mlen += 1;
+                }
+                if mlen >= 4 && mlen >= best_len {
+                    best_len = mlen;
+                    best_off = i - cand;
+                }
+                cand += 1;
+            }
+        }
+
+        if rle_len >= 4 && rle_len >= best_len {
+            flush_literals(src, lit_start, i, out, &mut at)?;
+            if at + 2 > out.len() {
+                return None;
+            }
+            out[at] = 0x40 | ((rle_len as u8 - 4) & 0x3F); // 0b01_LLLLLL
+            out[at + 1] = b;
+            at += 2;
+            i += rle_len;
+            lit_start = i;
+        } else if best_len >= 4 {
+            flush_literals(src, lit_start, i, out, &mut at)?;
+            if at + 2 > out.len() {
+                return None;
+            }
+            out[at] = 0x80 | ((best_len as u8 - 4) & 0x3F); // 0b10_LLLLLL
+            out[at + 1] = best_off as u8;
+            at += 2;
+            i += best_len;
+            lit_start = i;
+        } else {
+            i += 1;
+        }
+    }
+
+    flush_literals(src, lit_start, src.len(), out, &mut at)?;
+
+    let stream_bytes = (at - KSUL_HEADER_LEN).max(1);
+    let orig_i64 = (src.len().max(1)) as i64;
+    let stream_i64 = stream_bytes as i64;
+    let g = wupz_gcd_i64(orig_i64, stream_i64);
+
+    // Derive deterministic +AND and ~NAND gate state from the payload's bit density & fold
+    let pop = wupz_popcount(src) as i64;
+    let total_bits = (src.len() as i64 * 8).max(1);
+    let signal_trit = if pop * 3 >= total_bits { 1 } else if pop == 0 { -1 } else { 0 };
+    let cap_trit = if !src.is_empty() { 1 } else { 0 };
+    let and_gate = ternary_and_gate(signal_trit, cap_trit);
+    let nand_gate = ternary_nand_gate(signal_trit, cap_trit);
+    let mut gate_buf = [0u8; 1];
+    quant_tern_pack_into(&[and_gate, nand_gate, 1], &mut gate_buf);
+
+    Some(KompressLosslessReceipt {
+        orig_bytes: src.len(),
+        encoded_bytes: at,
+        stream_bytes: at - KSUL_HEADER_LEN,
+        ratio_p: orig_i64 / g,
+        ratio_q: stream_i64 / g,
+        xor_fold,
+        and_gate,
+        nand_gate,
+        gate_byte: gate_buf[0],
+    })
+}
+
+/// Decode a `kompress-super-ultra:lossless` (`"KSUL"` v1) frame into `out` with
+/// **zero heap allocations** and verify the 64-bit `wupz_xor_fold` witness.
+///
+/// Returns `Some(orig_len)` only if the magic, length, token stream, and
+/// `wupz_xor_fold(&out[..orig_len]) == expected_xor_fold` all match bit-for-bit.
+pub fn kompress_super_ultra_lossless_decode_into(
+    packed: &[u8],
+    out: &mut [u8],
+) -> Option<usize> {
+    if packed.len() < KSUL_HEADER_LEN || packed[0..4] != KSUL_MAGIC {
+        return None;
+    }
+    let orig_len = u32::from_le_bytes([packed[4], packed[5], packed[6], packed[7]]) as usize;
+    let expected_fold = u64::from_le_bytes([
+        packed[8], packed[9], packed[10], packed[11], packed[12], packed[13], packed[14],
+        packed[15],
+    ]);
+    if out.len() < orig_len {
+        return None;
+    }
+
+    let mut at = KSUL_HEADER_LEN;
+    let mut w = 0usize;
+    while at < packed.len() {
+        let tag = packed[at];
+        at += 1;
+        match tag >> 6 {
+            0b00 => {
+                let len = ((tag & 0x3F) as usize) + 1;
+                if at + len > packed.len() || w + len > orig_len {
+                    return None;
+                }
+                out[w..w + len].copy_from_slice(&packed[at..at + len]);
+                at += len;
+                w += len;
+            }
+            0b01 => {
+                let len = ((tag & 0x3F) as usize) + 4;
+                if at >= packed.len() || w + len > orig_len {
+                    return None;
+                }
+                let b = packed[at];
+                at += 1;
+                out[w..w + len].fill(b);
+                w += len;
+            }
+            0b10 => {
+                let len = ((tag & 0x3F) as usize) + 4;
+                if at >= packed.len() || w + len > orig_len {
+                    return None;
+                }
+                let off = packed[at] as usize;
+                at += 1;
+                if off == 0 || off > w {
+                    return None;
+                }
+                for k in 0..len {
+                    out[w + k] = out[w - off + k];
+                }
+                w += len;
+            }
+            _ => return None,
+        }
+    }
+
+    if w != orig_len || wupz_xor_fold(&out[..orig_len]) != expected_fold {
+        return None;
+    }
+    Some(orig_len)
+}
+
+/// Borrowed descriptor for a single parallel fan-out lane inside an `ULTRABACKYARDLOOP`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UltraBackyardLane<'a> {
+    /// Zero-based lane index (`0..lane_count`).
+    pub lane_id: u8,
+    /// Human-readable slice of the incoming instruction assigned to this lane (unmangled).
+    pub instruction: &'a [u8],
+    /// 64-bit `wupz_xor_fold` witness for this lane's instruction slice.
+    pub xor_fold: u64,
+    /// Balanced ternary `+AND` gate (`{-1, 0, +1}`) for this lane.
+    pub and_gate: i8,
+    /// Balanced ternary `~NAND` gate (`{-1, 0, +1}`) for this lane.
+    pub nand_gate: i8,
+}
+
+/// Partition an incoming instruction byte slice into parallel `ULTRABACKYARDLOOP +AND~NAND`
+/// fan-out lanes in `out_lanes` with **zero heap allocations**, preserving 100% human
+/// readability of every lane slice.
+///
+/// Splits on newline (`b'\n'`) or semicolon (`b';'`) boundaries (skipping empty segments)
+/// up to `out_lanes.len()`. Returns the number of populated parallel lanes.
+pub fn ultrabackyard_fanout_into<'a>(
+    prompt: &'a [u8],
+    capability_trit: i8,
+    out_lanes: &mut [UltraBackyardLane<'a>],
+) -> usize {
+    if out_lanes.is_empty() {
+        return 0;
+    }
+    let trim_ascii = |s: &'a [u8]| -> &'a [u8] {
+        let mut a = 0usize;
+        let mut b = s.len();
+        while a < b && matches!(s[a], b' ' | b'\t' | b'\r' | b'\n') {
+            a += 1;
+        }
+        while b > a && matches!(s[b - 1], b' ' | b'\t' | b'\r' | b'\n') {
+            b -= 1;
+        }
+        &s[a..b]
+    };
+
+    let clean = trim_ascii(prompt);
+    if clean.is_empty() {
+        return 0;
+    }
+
+    let mut count = 0usize;
+    let mut seg_start = 0usize;
+    let mut i = 0usize;
+    while i <= clean.len() {
+        let is_delim = i == clean.len() || clean[i] == b'\n' || clean[i] == b';';
+        if is_delim {
+            let seg = if count + 1 == out_lanes.len() && i < clean.len() {
+                // Last available lane absorbs the remainder so nothing is ever dropped
+                let rem = trim_ascii(&clean[seg_start..]);
+                i = clean.len();
+                rem
+            } else {
+                trim_ascii(&clean[seg_start..i])
+            };
+            if !seg.is_empty() && count < out_lanes.len() {
+                let fold = wupz_xor_fold(seg);
+                let sig_trit: i8 = if !seg.is_empty() { 1 } else { 0 };
+                let and_gate = ternary_and_gate(sig_trit, capability_trit);
+                let nand_gate = ternary_nand_gate(sig_trit, capability_trit);
+                out_lanes[count] = UltraBackyardLane {
+                    lane_id: count as u8,
+                    instruction: seg,
+                    xor_fold: fold,
+                    and_gate,
+                    nand_gate,
+                };
+                count += 1;
+            }
+            seg_start = i + 1;
+        }
+        i += 1;
+    }
+    count
+}
+

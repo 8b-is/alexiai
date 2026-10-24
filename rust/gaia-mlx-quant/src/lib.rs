@@ -114,11 +114,15 @@ pub use pack::{
 #[cfg(feature = "std")]
 pub use pack::{pack_ternary, unpack_ternary};
 pub use wupz::{
-    QUANT_TERN_THRESHOLD_DEN, QUANT_TERN_THRESHOLD_NUM, QuantTernVad, WUPZ_ABI_VERSION,
+    KSUL_HEADER_LEN, KSUL_MAGIC, KompressLosslessReceipt, QUANT_TERN_THRESHOLD_DEN,
+    QUANT_TERN_THRESHOLD_NUM, QuantTernVad, UltraBackyardLane, WUPZ_ABI_VERSION,
     WUPZ_DEFAULT_WINDOW_SIZE, WUPZ_MAGIC, WUPZ_PLAN_VERSION, WupzBlockDesc, WupzSectionDesc,
-    fold_to_quant_tern_pq, quant_tern_encode_vad_pq, quant_tern_pack_into, quant_tern_trit_pq,
-    quant_tern_unpack_into, wupz_bitplane_diff_u64, wupz_bitplane_popcount_u64, wupz_byte_diff,
-    wupz_changed_sections_into, wupz_pack_plan_into, wupz_plan_digest, wupz_plan_image_len,
-    wupz_popcount, wupz_seal_frame_into, wupz_section_from_bytes, wupz_verify_frame_seal,
-    wupz_xor_fold, wupz_xor_fold_u64,
+    fold_to_quant_tern_pq, kompress_super_ultra_lossless_decode_into,
+    kompress_super_ultra_lossless_encode_into, quant_tern_encode_vad_pq, quant_tern_pack_into,
+    quant_tern_trit_pq, quant_tern_unpack_into, ternary_and_gate, ternary_nand_gate,
+    ultrabackyard_fanout_into, wupz_bitplane_and_nand_u64, wupz_bitplane_diff_u64,
+    wupz_bitplane_popcount_u64, wupz_byte_diff, wupz_changed_sections_into, wupz_gcd_i64,
+    wupz_pack_plan_into, wupz_plan_digest, wupz_plan_image_len, wupz_popcount,
+    wupz_seal_frame_into, wupz_section_from_bytes, wupz_verify_frame_seal, wupz_xor_fold,
+    wupz_xor_fold_u64,
 };

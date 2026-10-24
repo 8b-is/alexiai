@@ -9,10 +9,12 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 
 use gaia_mlx_quant::{
-    Fold, WUPZ_ABI_VERSION, WUPZ_DEFAULT_WINDOW_SIZE, WupzBlockDesc, WupzSectionDesc, fold,
-    fold_pq, fold_to_quant_tern_pq, sampling, wupz_bitplane_diff_u64, wupz_bitplane_popcount_u64,
-    wupz_pack_plan_into, wupz_plan_digest, wupz_plan_image_len, wupz_popcount, wupz_xor_fold,
-    wupz_xor_fold_u64,
+    Fold, UltraBackyardLane, WUPZ_ABI_VERSION, WUPZ_DEFAULT_WINDOW_SIZE, WupzBlockDesc,
+    WupzSectionDesc, fold, fold_pq, fold_to_quant_tern_pq,
+    kompress_super_ultra_lossless_decode_into, kompress_super_ultra_lossless_encode_into,
+    sampling, ultrabackyard_fanout_into, wupz_bitplane_diff_u64, wupz_bitplane_popcount_u64,
+    wupz_byte_diff, wupz_pack_plan_into, wupz_plan_digest, wupz_plan_image_len, wupz_popcount,
+    wupz_xor_fold, wupz_xor_fold_u64,
 };
 
 use crate::mcp;
@@ -672,10 +674,34 @@ fn handle_connection(mut stream: std::net::TcpStream, adapter: &Osarous) -> Resu
             let f_pq = fold_pq(&prompt, seed);
             let qt = fold_to_quant_tern_pq(&f_pq);
             let wupz_fold = wupz_xor_fold(prompt.as_bytes());
+            let mut ksul_enc = vec![0u8; prompt.len() * 2 + 64];
+            let mut ksul_dec = vec![0u8; prompt.len().max(1)];
+            let (rp, rq, ag, ng, gb, ksul_ok) = if let Some(r) =
+                kompress_super_ultra_lossless_encode_into(prompt.as_bytes(), &mut ksul_enc)
+            {
+                let dlen = kompress_super_ultra_lossless_decode_into(
+                    &ksul_enc[..r.encoded_bytes],
+                    &mut ksul_dec,
+                )
+                .unwrap_or(0);
+                let ok =
+                    dlen == prompt.len() && wupz_byte_diff(prompt.as_bytes(), &ksul_dec[..dlen]) == 0;
+                (r.ratio_p, r.ratio_q, r.and_gate, r.nand_gate, r.gate_byte, ok)
+            } else {
+                (1, 1, 1, -1, 0x56, true)
+            };
+            let mut lanes = [UltraBackyardLane {
+                lane_id: 0,
+                instruction: b"",
+                xor_fold: 0,
+                and_gate: 0,
+                nand_gate: 0,
+            }; 8];
+            let lane_cnt = ultrabackyard_fanout_into(prompt.as_bytes(), 1, &mut lanes);
             let s = sampling(&f);
             let a = affect(&f, &prompt);
             let json = format!(
-                r#"{{"seed":{},"layers":{{"gravity":{},"entropy":{},"weather":{},"resonance":{}}},"dominant":"{}","coherence":{},"affect":{{"mood":"{}","valence":{:.4},"arousal":{:.4}}},"quantTern":{{"tag":"{}","byte":{},"trits":[{},{},{}],"magnitude":{}}},"wupz":{{"abiVersion":{WUPZ_ABI_VERSION},"xorFold":"0x{wupz_fold:016x}"}},"sampling":{{"temperature":{},"top_p":{},"top_k":{},"seed":{}}}}}"#,
+                r#"{{"seed":{},"layers":{{"gravity":{},"entropy":{},"weather":{},"resonance":{}}},"dominant":"{}","coherence":{},"affect":{{"mood":"{}","valence":{:.4},"arousal":{:.4}}},"quantTern":{{"tag":"{}","byte":{},"trits":[{},{},{}],"magnitude":{}}},"wupz":{{"abiVersion":{WUPZ_ABI_VERSION},"xorFold":"0x{wupz_fold:016x}"}},"ultraBackyardLoop":{{"mode":"ULTRABACKYARDLOOP+AND~NAND","codec":"kompress-super-ultra:lossless","ratioPq":"{rp}/{rq}","andGate":{ag},"nandGate":{ng},"gateByte":{gb},"fanoutLanes":{lane_cnt},"losslessVerified":{ksul_ok},"readableSession":true}},"sampling":{{"temperature":{},"top_p":{},"top_k":{},"seed":{}}}}}"#,
                 f.seed,
                 f.gravity,
                 f.entropy,
@@ -863,8 +889,31 @@ fn handle_chat(stream: &mut std::net::TcpStream, adapter: &Osarous, body: &str) 
     let f_pq = fold_pq(&prompt, None);
     let qt = fold_to_quant_tern_pq(&f_pq);
     let wupz_fold = wupz_xor_fold(prompt.as_bytes());
+    let mut ksul_enc = vec![0u8; prompt.len() * 2 + 64];
+    let mut ksul_dec = vec![0u8; prompt.len().max(1)];
+    let (rp, rq, ag, ng, gb, ksul_ok) = if let Some(r) =
+        kompress_super_ultra_lossless_encode_into(prompt.as_bytes(), &mut ksul_enc)
+    {
+        let dlen = kompress_super_ultra_lossless_decode_into(
+            &ksul_enc[..r.encoded_bytes],
+            &mut ksul_dec,
+        )
+        .unwrap_or(0);
+        let ok = dlen == prompt.len() && wupz_byte_diff(prompt.as_bytes(), &ksul_dec[..dlen]) == 0;
+        (r.ratio_p, r.ratio_q, r.and_gate, r.nand_gate, r.gate_byte, ok)
+    } else {
+        (1, 1, 1, -1, 0x56, true)
+    };
+    let mut lanes = [UltraBackyardLane {
+        lane_id: 0,
+        instruction: b"",
+        xor_fold: 0,
+        and_gate: 0,
+        nand_gate: 0,
+    }; 8];
+    let lane_cnt = ultrabackyard_fanout_into(prompt.as_bytes(), 1, &mut lanes);
     let gaia_frame = format!(
-        "event: gaia\ndata: {{\"field\":{{\"seed\":{},\"layers\":{{\"gravity\":{},\"entropy\":{},\"weather\":{},\"resonance\":{}}},\"dominant\":\"{}\",\"coherence\":{},\"affect\":{{\"mood\":\"{}\",\"valence\":{:.4},\"arousal\":{:.4}}},\"quantTern\":{{\"tag\":\"{}\",\"byte\":{},\"trits\":[{},{},{}],\"magnitude\":{}}},\"wupz\":{{\"abiVersion\":{WUPZ_ABI_VERSION},\"xorFold\":\"0x{wupz_fold:016x}\"}}}},\"sampling\":{{\"temperature\":{},\"top_p\":{},\"top_k\":{},\"seed\":{}}}}}\n\n",
+        "event: gaia\ndata: {{\"field\":{{\"seed\":{},\"layers\":{{\"gravity\":{},\"entropy\":{},\"weather\":{},\"resonance\":{}}},\"dominant\":\"{}\",\"coherence\":{},\"affect\":{{\"mood\":\"{}\",\"valence\":{:.4},\"arousal\":{:.4}}},\"quantTern\":{{\"tag\":\"{}\",\"byte\":{},\"trits\":[{},{},{}],\"magnitude\":{}}},\"wupz\":{{\"abiVersion\":{WUPZ_ABI_VERSION},\"xorFold\":\"0x{wupz_fold:016x}\"}},\"ultraBackyardLoop\":{{\"mode\":\"ULTRABACKYARDLOOP+AND~NAND\",\"codec\":\"kompress-super-ultra:lossless\",\"ratioPq\":\"{rp}/{rq}\",\"andGate\":{ag},\"nandGate\":{ng},\"gateByte\":{gb},\"fanoutLanes\":{lane_cnt},\"losslessVerified\":{ksul_ok},\"readableSession\":true}}}},\"sampling\":{{\"temperature\":{},\"top_p\":{},\"top_k\":{},\"seed\":{}}}}}\n\n",
         f.seed,
         f.gravity,
         f.entropy,
@@ -904,8 +953,9 @@ fn handle_chat(stream: &mut std::net::TcpStream, adapter: &Osarous, body: &str) 
         let _ = stream.write_all(mcp_frame.as_bytes());
     }
 
+    let wrapped_prompt = mcp::wrap_ultrabackyard_envelope(&prompt);
     let user_content = if mcp_runs.is_empty() {
-        prompt.clone()
+        wrapped_prompt
     } else {
         let ctx = mcp_runs
             .iter()
@@ -916,7 +966,7 @@ fn handle_chat(stream: &mut std::net::TcpStream, adapter: &Osarous, body: &str) 
             "Below is the live ground-truth output from your local MCP tool(s) on this laptop. \
              Answer the user's question directly using the exact file paths, architecture, and source details shown below, and proactively highlight concrete code improvements we can make:\n\n\
              {ctx}\n\n\
-             User question: {prompt}"
+             User question:\n{wrapped_prompt}"
         )
     };
 

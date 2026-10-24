@@ -483,4 +483,49 @@ fn wupz_seam_quant_tern_and_plan_image_exact() {
     let mut changed = [0u32; 4];
     assert_eq!(wupz_changed_sections_into(&sections, &sections_after, &mut changed), 1);
     assert_eq!(changed[0], 0);
+
+    // 6. ULTRABACKYARDLOOP +AND~NAND & kompress-super-ultra:lossless (`KSUL` v1)
+    use gaia_mlx_quant::{
+        KSUL_MAGIC, UltraBackyardLane, kompress_super_ultra_lossless_decode_into,
+        kompress_super_ultra_lossless_encode_into, ternary_and_gate, ternary_nand_gate,
+        ultrabackyard_fanout_into, wupz_bitplane_and_nand_u64,
+    };
+    for a in [-1i8, 0, 1] {
+        for b in [-1i8, 0, 1] {
+            let and_v = ternary_and_gate(a, b);
+            let nand_v = ternary_nand_gate(a, b);
+            assert_eq!(and_v, a.min(b));
+            assert_eq!(nand_v, -a.min(b));
+            assert_eq!(and_v + nand_v, 0);
+        }
+    }
+    let (ap, an, np, nn) = wupz_bitplane_and_nand_u64(0b1010, 0b0100, 0b1100, 0b0001);
+    assert_eq!(ap, 0b1000);
+    assert_eq!(an, 0b0101);
+    assert_eq!(np, an);
+    assert_eq!(nn, ap);
+
+    let msg = b"wrap all the incoming instructions in an ULTRABACKYARDLOOP +AND~NAND; parallelize the prompts/fan-out system WITH kompress-super-ultra:lossless===without losing readability of the chat session AND/OR intermediate output of the agents <3 --- peter\nwrap all the incoming instructions in an ULTRABACKYARDLOOP +AND~NAND; parallelize the prompts/fan-out system";
+    let mut ksul_enc = [0u8; 1024];
+    let mut ksul_dec = [0u8; 1024];
+    let rcpt = kompress_super_ultra_lossless_encode_into(msg, &mut ksul_enc).unwrap();
+    assert_eq!(&ksul_enc[..4], &KSUL_MAGIC);
+    assert!(rcpt.stream_bytes < rcpt.orig_bytes, "LZ77+RLE should compress repeated clauses");
+    let dec_len =
+        kompress_super_ultra_lossless_decode_into(&ksul_enc[..rcpt.encoded_bytes], &mut ksul_dec)
+            .unwrap();
+    assert_eq!(dec_len, msg.len());
+    assert_eq!(&ksul_dec[..dec_len], &msg[..]);
+
+    let mut lanes = [UltraBackyardLane {
+        lane_id: 0,
+        instruction: b"",
+        xor_fold: 0,
+        and_gate: 0,
+        nand_gate: 0,
+    }; 8];
+    let n_lanes = ultrabackyard_fanout_into(msg, 1, &mut lanes);
+    assert_eq!(n_lanes, 4);
+    assert_eq!(lanes[0].and_gate, 1);
+    assert_eq!(lanes[0].nand_gate, -1);
 }

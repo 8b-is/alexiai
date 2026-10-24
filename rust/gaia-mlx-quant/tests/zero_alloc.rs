@@ -64,9 +64,11 @@ fn hot_paths_perform_zero_allocations() {
         ternary_bfp_i16_matmul_into, ternary_matmul, ternary_matmul_pq_i_major_into,
         ternary_matmul_pq_j_major_into, ternary_matmul_pq_planes_i_into, ternary_simd_i8_pq_into,
         ternary_simd_pq_matmul_into, ternary_transformer_step_into,
-        ternary_transformer_step_pq_into, unpack_ternary_into, wupz_bitplane_diff_u64,
-        wupz_bitplane_popcount_u64, wupz_byte_diff, wupz_pack_plan_into, wupz_plan_digest,
-        wupz_popcount, wupz_xor_fold, wupz_xor_fold_u64,
+        ternary_transformer_step_pq_into, ultrabackyard_fanout_into, unpack_ternary_into,
+        wupz_bitplane_and_nand_u64, wupz_bitplane_diff_u64, wupz_bitplane_popcount_u64,
+        wupz_byte_diff, wupz_pack_plan_into, wupz_plan_digest, wupz_popcount, wupz_xor_fold,
+        wupz_xor_fold_u64, UltraBackyardLane, kompress_super_ultra_lossless_decode_into,
+        kompress_super_ultra_lossless_encode_into,
     };
 
     const ROWS: usize = 64;
@@ -343,6 +345,20 @@ fn hot_paths_perform_zero_allocations() {
         let _ = wupz_xor_fold_u64(&w_pos_u64);
         let _ = wupz_bitplane_popcount_u64(&w_pos_u64, &w_neg_u64);
         let _ = wupz_bitplane_diff_u64(&w_pos_u64, &w_neg_u64, &w_pos_u64, &w_neg_u64);
+        let _ = wupz_bitplane_and_nand_u64(w_pos_u64[0], w_neg_u64[0], w_pos_u64[1], w_neg_u64[1]);
+        let mut ksul_enc = [0u8; 256];
+        let mut ksul_dec = [0u8; 128];
+        if let Some(rcpt) = kompress_super_ultra_lossless_encode_into(&packed[..64], &mut ksul_enc) {
+            let _ = kompress_super_ultra_lossless_decode_into(&ksul_enc[..rcpt.encoded_bytes], &mut ksul_dec);
+        }
+        let mut ub_lanes = [UltraBackyardLane {
+            lane_id: 0,
+            instruction: b"",
+            xor_fold: 0,
+            and_gate: 0,
+            nand_gate: 0,
+        }; 4];
+        let _ = ultrabackyard_fanout_into(b"lane one; lane two\nlane three", 1, &mut ub_lanes);
         let _ = fold_to_quant_tern_pq(&fpq1);
         std::hint::black_box((sampling(&f1), sampling(&f2), sampling_pq(&fpq1), sampling_pq(&fpq2)));
     }

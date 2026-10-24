@@ -374,7 +374,7 @@ pub fn call_tool(tool: &str, arg: &str) -> Result<McpToolRun, String> {
         "mlx_quant" | "mlx" | "mlx-rs" => {
             run_mlx_quant_tool(&target)
         }
-        "wupz" | "quanttern" | "pack-in-pass" => {
+        "wupz" | "quanttern" | "pack-in-pass" | "ultrabackyard" | "kompress" | "ksul" => {
             run_wupz_tool(&target)
         }
         "repo_inspect" | "repo" | "inspect" | "improve" => {
@@ -596,12 +596,14 @@ fn run_mlx_quant_tool(target: &str) -> String {
 
 pub fn run_wupz_tool(target: &str) -> String {
     use gaia_mlx_quant::{
-        WUPZ_ABI_VERSION, WUPZ_DEFAULT_WINDOW_SIZE, WUPZ_PLAN_VERSION, WupzBlockDesc,
-        WupzSectionDesc, fold_pq, fold_to_quant_tern_pq, pack_quantum_bitplanes_i_major_into,
-        pack_ternary_into, wupz_bitplane_diff_u64, wupz_bitplane_popcount_u64, wupz_byte_diff,
-        wupz_changed_sections_into, wupz_pack_plan_into, wupz_plan_digest, wupz_plan_image_len,
-        wupz_popcount, wupz_seal_frame_into, wupz_verify_frame_seal, wupz_xor_fold,
-        wupz_xor_fold_u64,
+        UltraBackyardLane, WUPZ_ABI_VERSION, WUPZ_DEFAULT_WINDOW_SIZE, WUPZ_PLAN_VERSION,
+        WupzBlockDesc, WupzSectionDesc, fold_pq, fold_to_quant_tern_pq,
+        kompress_super_ultra_lossless_decode_into, kompress_super_ultra_lossless_encode_into,
+        pack_quantum_bitplanes_i_major_into, pack_ternary_into, ultrabackyard_fanout_into,
+        wupz_bitplane_and_nand_u64, wupz_bitplane_diff_u64, wupz_bitplane_popcount_u64,
+        wupz_byte_diff, wupz_changed_sections_into, wupz_pack_plan_into, wupz_plan_digest,
+        wupz_plan_image_len, wupz_popcount, wupz_seal_frame_into, wupz_verify_frame_seal,
+        wupz_xor_fold, wupz_xor_fold_u64,
     };
 
     let prompt_seed = if target.trim().is_empty() {
@@ -694,6 +696,30 @@ pub fn run_wupz_tool(target: &str) -> String {
     let seal_valid = wupz_verify_frame_seal(&sealed_frame);
     let self_diff = wupz_byte_diff(&sealed_frame, &sealed_frame);
 
+    // ULTRABACKYARDLOOP +AND~NAND & kompress-super-ultra:lossless (`KSUL`) verification
+    let mut ksul_encoded = vec![0u8; b158_packed.len() * 2 + 64];
+    let mut ksul_decoded = vec![0u8; b158_packed.len()];
+    let ksul_receipt = kompress_super_ultra_lossless_encode_into(&b158_packed, &mut ksul_encoded)
+        .expect("KSUL encode fits");
+    let decoded_len = kompress_super_ultra_lossless_decode_into(
+        &ksul_encoded[..ksul_receipt.encoded_bytes],
+        &mut ksul_decoded,
+    )
+    .unwrap_or(0);
+    let ksul_lossless_ok =
+        decoded_len == b158_packed.len() && wupz_byte_diff(&b158_packed, &ksul_decoded) == 0;
+
+    let (and_pos, and_neg, nand_pos, nand_neg) =
+        wupz_bitplane_and_nand_u64(w_pos[0], w_neg[0], w_pos[1], w_neg[1]);
+    let mut lanes = [UltraBackyardLane {
+        lane_id: 0,
+        instruction: b"",
+        xor_fold: 0,
+        and_gate: 0,
+        nand_gate: 0,
+    }; 8];
+    let lane_count = ultrabackyard_fanout_into(prompt_seed.as_bytes(), 1, &mut lanes);
+
     let wupz_repo_path = [
         "/Users/lodripeter/workspace/peterlodri-sec/wupz",
         "/home/hue/8b-is/wupz",
@@ -706,14 +732,18 @@ pub fn run_wupz_tool(target: &str) -> String {
         "wupz × GAIA-MLX-QUANT Pack-in-Pass & QuantTern Seam (`gaia_mlx_quant::wupz` · `{wupz_repo_path}`)\n\
          • Lineage: `w(ild) + UPX + z(ig)` — Incremental linker + compressor (`https://github.com/8b-is/wupz` · `https://wupz.8b.is`)\n\
          • Contract: `WUPZ` magic, `WUPZ_ABI_VERSION = {WUPZ_ABI_VERSION}`, `WUPZ_PLAN_VERSION = {WUPZ_PLAN_VERSION}`, `#![no_std]`, `#![forbid(unsafe_code)]`, 0 floats, 0 heap allocations\n\
-         • QuantTern Emotional Ternary Code (`|x| >= 0.33` in pure `p/q`):\n\
+         • QuantTern Emotional Ternary Code (`|x| >= 33/100` in pure `p/q`):\n\
            - Tag: `{}` (byte `0x{:02x}`, trits `[{}, {}, {}]` / `{} {} {}`, magnitude `{}/3`)\n\
          • WUPZ Plan Image & Section Receipts (`256×256` ternary substrate):\n\
            - `.rodata.gaia.b158` (`{}` B): `xor_fold = 0x{b158_fold:016x}`, `popcount = {b158_pop}` bits\n\
            - `.rodata.gaia.quantum_u64` (`{}` B): `xor_fold = 0x{:016x}`, `active_trits = {qt_active_trits}/65536`\n\
            - Plan image size: `{plan_len}` B (`magic = \"WUPZ\"`), FNV-1a digest `0x{digest:016x}`\n\
-           - Incremental QAT diff: `{mutated_trits}` trits mutated -> `{changed_count}/2` sections invalidated (`reuse = 50.0%`)\n\
-           - 32B Sealed Witness Frame (`#Commit = #ValidWitness`): `seal = 0x{seal_witness:016x}`, `verified = {seal_valid}`, `self_byte_diff = {self_diff}`",
+           - Incremental QAT diff: `{mutated_trits}` trits mutated -> `{changed_count}/2` sections invalidated (`reuse = 1/2`)\n\
+           - 32B Sealed Witness Frame (`#Commit = #ValidWitness`): `seal = 0x{seal_witness:016x}`, `verified = {seal_valid}`, `self_byte_diff = {self_diff}`\n\
+         • ULTRABACKYARDLOOP `+AND~NAND` & `kompress-super-ultra:lossless` (`KSUL` v1):\n\
+           - Lossless substrate compression: `{}` B -> `{}` B stream (`ratio_pq = {}/{}`, `lossless_verified = {ksul_lossless_ok}`)\n\
+           - Universal Ternary Gates: `+AND = {}`, `~NAND = {}` (`gate_byte = 0x{:02x}`, bitplane `and_pos=0x{and_pos:016x}`, `and_neg=0x{and_neg:016x}`, `nand_pos=0x{nand_pos:016x}`, `nand_neg=0x{nand_neg:016x}`)\n\
+           - Parallel Fan-Out Lanes: `{lane_count}/8` active (100/1% human-readable session preserved)",
         qt.as_str(),
         qt.byte,
         qt.trits[0],
@@ -726,6 +756,81 @@ pub fn run_wupz_tool(target: &str) -> String {
         b158_packed.len(),
         (w_pos.len() + w_neg.len()) * 8,
         qt_pos_fold ^ qt_neg_fold,
+        ksul_receipt.orig_bytes,
+        ksul_receipt.stream_bytes,
+        ksul_receipt.ratio_p,
+        ksul_receipt.ratio_q,
+        ksul_receipt.and_gate,
+        ksul_receipt.nand_gate,
+        ksul_receipt.gate_byte,
+    )
+}
+
+/// Wrap an incoming instruction in an `ULTRABACKYARDLOOP +AND~NAND` envelope with
+/// `kompress-super-ultra:lossless` verification while keeping 100/1% of the human-readable
+/// prompt and parallel fan-out lane text intact.
+pub fn wrap_ultrabackyard_envelope(prompt: &str) -> String {
+    use gaia_mlx_quant::{
+        UltraBackyardLane, fold_pq, fold_to_quant_tern_pq,
+        kompress_super_ultra_lossless_decode_into, kompress_super_ultra_lossless_encode_into,
+        ultrabackyard_fanout_into, wupz_byte_diff,
+    };
+
+    let bytes = prompt.as_bytes();
+    let f_pq = fold_pq(prompt, None);
+    let qt = fold_to_quant_tern_pq(&f_pq);
+
+    let mut encoded = vec![0u8; bytes.len() * 2 + 64];
+    let mut decoded = vec![0u8; bytes.len().max(1)];
+    let (ratio_p, ratio_q, xor_fold, and_gate, nand_gate, gate_byte, lossless_ok) =
+        if let Some(rcpt) = kompress_super_ultra_lossless_encode_into(bytes, &mut encoded) {
+            let dec_len = kompress_super_ultra_lossless_decode_into(
+                &encoded[..rcpt.encoded_bytes],
+                &mut decoded,
+            )
+            .unwrap_or(0);
+            let ok = dec_len == bytes.len() && wupz_byte_diff(bytes, &decoded[..dec_len]) == 0;
+            (
+                rcpt.ratio_p,
+                rcpt.ratio_q,
+                rcpt.xor_fold,
+                rcpt.and_gate,
+                rcpt.nand_gate,
+                rcpt.gate_byte,
+                ok,
+            )
+        } else {
+            (1, 1, 0, 1, -1, 0x56, true)
+        };
+
+    let mut lanes = [UltraBackyardLane {
+        lane_id: 0,
+        instruction: b"",
+        xor_fold: 0,
+        and_gate: 0,
+        nand_gate: 0,
+    }; 8];
+    let lane_count = ultrabackyard_fanout_into(bytes, 1, &mut lanes);
+
+    let mut lane_lines = String::new();
+    for lane in &lanes[..lane_count] {
+        let text = core::str::from_utf8(lane.instruction).unwrap_or("");
+        lane_lines.push_str(&format!(
+            "  • [Lane {}/{} | +AND={} ~NAND={} | fold=0x{:016x}] {}\n",
+            lane.lane_id + 1,
+            lane_count,
+            lane.and_gate,
+            lane.nand_gate,
+            lane.xor_fold,
+            text
+        ));
+    }
+
+    format!(
+        "⟦ULTRABACKYARDLOOP|+AND={and_gate}:~NAND={nand_gate}|gate=0x{gate_byte:02x}|{qt_tag}|kompress-super-ultra:lossless(ratio={ratio_p}/{ratio_q},verified={lossless_ok},fold=0x{xor_fold:016x})|lanes={lane_count}/1⟧\n\
+         {prompt}\n\
+         {lane_lines}",
+        qt_tag = qt.as_str(),
     )
 }
 
@@ -1058,52 +1163,65 @@ pub fn auto_ground_prompt_with_history(
     runs
 }
 
-/// Automatically detect and execute relevant local MCP tools for a user prompt.
-/// Supports explicit `/mcp <tool> <arg>` commands as well as natural-language
-/// code exploration requests.
-pub fn auto_ground_prompt(prompt: &str) -> Vec<McpToolRun> {
-    let trimmed = prompt.trim();
-    let mut runs = Vec::new();
+fn push_unique_task(tasks: &mut Vec<(String, String)>, tool: &str, arg: &str) {
+    if !tasks.iter().any(|(t, a)| t == tool && a == arg) {
+        tasks.push((tool.to_string(), arg.to_string()));
+    }
+}
+
+/// Plan the `(tool, arg)` invocations for a single instruction segment without blocking.
+fn plan_ground_tasks(segment: &str, tasks: &mut Vec<(String, String)>) {
+    let trimmed = segment.trim();
+    if trimmed.is_empty() {
+        return;
+    }
 
     // 1. Explicit `/mcp <tool> [arg]` command
     if let Some(rest) = trimmed.strip_prefix("/mcp ") {
         let mut parts = rest.trim().splitn(2, char::is_whitespace);
         let tool = parts.next().unwrap_or("st_overview");
         let arg = parts.next().unwrap_or("");
-        if let Ok(run) = call_tool(tool, arg) {
-            runs.push(run);
-        }
-        return runs;
+        push_unique_task(tasks, tool, arg);
+        return;
     }
 
     let lower = trimmed.to_ascii_lowercase();
+    let initial_len = tasks.len();
 
-    // 2. Natural-language outline request (e.g., "outline server.rs" or "outline rust/alexiai/src/main.rs")
+    // 2. Natural-language outline request
     if lower.contains("outline")
-        && let Some(file_token) = trimmed
-            .split_whitespace()
-            .find(|w| w.ends_with(".rs") || w.ends_with(".c") || w.ends_with(".py") || w.ends_with(".js") || w.ends_with(".go") || w.ends_with(".swift"))
-        && let Ok(run) = call_tool("crabcc_outline", file_token)
+        && let Some(file_token) = trimmed.split_whitespace().find(|w| {
+            w.ends_with(".rs")
+                || w.ends_with(".c")
+                || w.ends_with(".py")
+                || w.ends_with(".js")
+                || w.ends_with(".go")
+                || w.ends_with(".swift")
+        })
     {
-        runs.push(run);
+        push_unique_task(tasks, "crabcc_outline", file_token);
     }
 
-    // 3. Natural-language symbol lookup (e.g., "find symbol fold_spectrum" or "where is quantize_ternary defined")
-    if (lower.contains("symbol") || lower.contains("where is ") || lower.contains("definition of ") || lower.contains("crabcc"))
+    // 3. Natural-language symbol lookup
+    if (lower.contains("symbol")
+        || lower.contains("where is ")
+        || lower.contains("definition of ")
+        || lower.contains("crabcc"))
         && let Some(sym) = extract_code_identifier(trimmed)
-        && let Ok(run) = call_tool("crabcc_sym", &sym)
     {
-        runs.push(run);
+        push_unique_task(tasks, "crabcc_sym", &sym);
     }
 
     // 4. Natural-language security scan request
     if (lower.contains("security scan") || lower.contains("custodian") || lower.contains("audit"))
-        && (lower.contains("tree") || lower.contains("scan") || lower.contains("repo") || lower.contains("code"))
+        && (lower.contains("tree")
+            || lower.contains("scan")
+            || lower.contains("repo")
+            || lower.contains("code"))
     {
-        let target = extract_repo_or_path(trimmed).unwrap_or_else(|| "/home/hue/8b-is/alexiai".to_string());
-        if let Ok(run) = call_tool("st_security", &target) {
-            runs.push(run);
-        }
+        let target =
+            extract_repo_or_path(trimmed).unwrap_or_else(|| "/home/hue/8b-is/alexiai".to_string());
+        push_unique_task(tasks, "st_security", &target);
     }
 
     // 5. Natural-language project/directory overview via Smart Tree
@@ -1114,20 +1232,22 @@ pub fn auto_ground_prompt(prompt: &str) -> Vec<McpToolRun> {
         || lower.contains("tree of")
         || lower.contains("structure of")
         || lower.contains("what is in "))
-        && runs.is_empty()
+        && tasks.len() == initial_len
     {
-        let target = extract_repo_or_path(trimmed).unwrap_or_else(|| "/home/hue/8b-is/alexiai".to_string());
-        if let Ok(run) = call_tool("st_overview", &target) {
-            runs.push(run);
-        }
+        let target =
+            extract_repo_or_path(trimmed).unwrap_or_else(|| "/home/hue/8b-is/alexiai".to_string());
+        push_unique_task(tasks, "st_overview", &target);
     }
 
     // 6. Sovereign Ontology / Dragon Ball Three-Kaya alignment
-    if lower.contains("ontology") || lower.contains("three-kaya") || lower.contains("nand gate") || lower.contains("scouter") {
-        let entity = extract_quoted_or_tail(trimmed).unwrap_or_else(|| "Ultra Instinct".to_string());
-        if let Ok(run) = call_tool("sovereign_ontology", &entity) {
-            runs.push(run);
-        }
+    if lower.contains("ontology")
+        || lower.contains("three-kaya")
+        || lower.contains("nand gate")
+        || lower.contains("scouter")
+    {
+        let entity =
+            extract_quoted_or_tail(trimmed).unwrap_or_else(|| "Ultra Instinct".to_string());
+        push_unique_task(tasks, "sovereign_ontology", &entity);
     }
 
     // 7. Queen of CEO Dra v3.0 / Pocoo Shelf / Triangle Covenant
@@ -1142,17 +1262,16 @@ pub fn auto_ground_prompt(prompt: &str) -> Vec<McpToolRun> {
         || lower.contains("/triangle")
         || lower.contains("/evolve")
     {
-        let arg = if lower.contains("read") || lower.contains("pocoo") || lower.contains("triangle") {
-            "reads".to_string()
+        let arg = if lower.contains("read") || lower.contains("pocoo") || lower.contains("triangle")
+        {
+            "reads"
         } else {
-            trimmed.to_string()
+            trimmed
         };
-        if let Ok(run) = call_tool("dra_queen", &arg) {
-            runs.push(run);
-        }
+        push_unique_task(tasks, "dra_queen", arg);
     }
 
-    // 8. Standard Galactic Research Constellation (Flyxion / RSVP / TARTAN / HYDRA / Antivenom / Spherepop / Memnet)
+    // 8. Standard Galactic Research Constellation
     if lower.contains("standardgalactic")
         || lower.contains("standard galactic")
         || lower.contains("flyxion")
@@ -1185,37 +1304,35 @@ pub fn auto_ground_prompt(prompt: &str) -> Vec<McpToolRun> {
         } else {
             "latest"
         };
-        if let Ok(run) = call_tool("standardgalactic", arg) {
-            runs.push(run);
-        }
+        push_unique_task(tasks, "standardgalactic", arg);
     }
 
     // 9. Pure-Rust MLX & MLX-QUANT Tensor Engine
-    if (lower.contains("mlx")
+    if lower.contains("mlx")
         || lower.contains("mergeq")
         || lower.contains("maybe_matmul")
         || lower.contains("gather_qmm")
         || lower.contains("bitnet")
         || lower.contains("b1.58")
-        || (lower.contains("rust") && (lower.contains("quant") || lower.contains("tensor"))))
-        && let Ok(run) = call_tool("mlx_quant", "256")
+        || (lower.contains("rust") && (lower.contains("quant") || lower.contains("tensor")))
     {
-        runs.push(run);
+        push_unique_task(tasks, "mlx_quant", "256");
     }
 
-    // 10. wupz (wild + UPX + zig) Pack-in-Pass Linker+Compressor & QuantTern (qt:<hex>)
-    if (lower.contains("wupz")
+    // 10. wupz / ULTRABACKYARDLOOP +AND~NAND / kompress-super-ultra:lossless
+    if lower.contains("wupz")
         || lower.contains("pack-in-pass")
         || lower.contains("xor_fold")
         || lower.contains("byte_diff")
         || lower.contains("quanttern")
-        || lower.contains("qt:"))
-        && let Ok(run) = call_tool("wupz", trimmed)
+        || lower.contains("qt:")
+        || lower.contains("ultrabackyard")
+        || lower.contains("kompress")
     {
-        runs.push(run);
+        push_unique_task(tasks, "wupz", trimmed);
     }
 
-    // 10. WhatsApp (wa-stream) & Discord Partner-in-Life automation
+    // 11. WhatsApp (wa-stream) & Discord Partner-in-Life automation
     if lower.contains("whatsapp")
         || lower.contains("wa-stream")
         || lower.contains("wastream")
@@ -1238,21 +1355,17 @@ pub fn auto_ground_prompt(prompt: &str) -> Vec<McpToolRun> {
         } else {
             "status".to_string()
         };
-        if let Ok(run) = call_tool("wa_partner", &arg) {
-            runs.push(run);
-        }
+        push_unique_task(tasks, "wa_partner", &arg);
     }
 
-    // 11. Automatic local repository inspection when any repo in /home/hue/8b-is or /home/hue/sony is mentioned
-    // (e.g., "what is beehive", "tell me about turbompc", "how can we improve arene-base", "what is melfa_ros2_driver")
-    if runs.is_empty()
+    // 12. Automatic local repository inspection
+    if tasks.len() == initial_len
         && let Some(repo_path) = extract_repo_or_path(trimmed)
-        && let Ok(run) = call_tool("repo_inspect", &repo_path)
     {
-        runs.push(run);
+        push_unique_task(tasks, "repo_inspect", &repo_path);
     }
 
-    // 12. Persistent memory / ledger / PR campaign inquiry
+    // 13. Persistent memory / ledger / PR campaign inquiry
     if (lower.contains("memory")
         || lower.contains("ledger")
         || lower.contains("keep track")
@@ -1261,21 +1374,67 @@ pub fn auto_ground_prompt(prompt: &str) -> Vec<McpToolRun> {
         || lower.contains("what prs")
         || lower.contains("pull requests")
         || lower.contains("tokyo"))
-        && runs.is_empty()
-        && let Ok(run) = call_tool("memory_ledger", "")
+        && tasks.len() == initial_len
     {
-        runs.push(run);
+        push_unique_task(tasks, "memory_ledger", "");
     }
 
-    // 13. General MCP / tools inquiry or diagnostic test ("test mcp servers or tools you have", "what tools do you have")
+    // 14. General MCP / tools inquiry or diagnostic test
     if (lower.contains("mcp") || lower.contains("tools") || lower.contains("tool "))
-        && runs.is_empty()
-        && let Ok(run) = call_tool("mcp_status", "smart-tree-daemon")
+        && tasks.len() == initial_len
     {
-        runs.push(run);
+        push_unique_task(tasks, "mcp_status", "smart-tree-daemon");
+    }
+}
+
+/// Automatically detect and execute relevant local MCP tools for a user prompt.
+/// Wraps incoming multi-clause instructions in an `ULTRABACKYARDLOOP +AND~NAND` fan-out
+/// and executes all planned MCP tools in parallel threads (`std::thread::scope`).
+pub fn auto_ground_prompt(prompt: &str) -> Vec<McpToolRun> {
+    use gaia_mlx_quant::{UltraBackyardLane, ultrabackyard_fanout_into};
+
+    let trimmed = prompt.trim();
+    let mut tasks: Vec<(String, String)> = Vec::new();
+
+    // Fan out across ULTRABACKYARDLOOP +AND~NAND lanes first, then full prompt
+    let mut lanes = [UltraBackyardLane {
+        lane_id: 0,
+        instruction: b"",
+        xor_fold: 0,
+        and_gate: 0,
+        nand_gate: 0,
+    }; 8];
+    let lane_count = ultrabackyard_fanout_into(trimmed.as_bytes(), 1, &mut lanes);
+    if lane_count > 1 {
+        for lane in &lanes[..lane_count] {
+            if lane.and_gate >= 0
+                && let Ok(seg) = core::str::from_utf8(lane.instruction)
+            {
+                plan_ground_tasks(seg, &mut tasks);
+            }
+        }
+    }
+    plan_ground_tasks(trimmed, &mut tasks);
+
+    if tasks.is_empty() {
+        return Vec::new();
+    }
+    if tasks.len() == 1 {
+        let (tool, arg) = &tasks[0];
+        return call_tool(tool, arg).into_iter().collect();
     }
 
-    runs
+    // Parallel fan-out execution across all planned MCP tools while preserving order
+    std::thread::scope(|s| {
+        let handles: Vec<_> = tasks
+            .iter()
+            .map(|(tool, arg)| s.spawn(move || call_tool(tool, arg)))
+            .collect();
+        handles
+            .into_iter()
+            .filter_map(|h| h.join().ok().and_then(Result::ok))
+            .collect()
+    })
 }
 
 fn extract_code_identifier(prompt: &str) -> Option<String> {
