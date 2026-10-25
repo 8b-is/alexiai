@@ -843,11 +843,13 @@ pub fn wrap_ultrabackyard_envelope(prompt: &str) -> String {
     )
 }
 
-/// Run Peter's E2E Dream State Machine (`ultra-omni-create << kompress-ultra(IN an ultrabackyardloop)`).
+/// Run Peter's E2E Dream State Machine (`ultra-omni-create << kompress-ultra(IN an ultrabackyardloop)`)
+/// with Sliding Context Window (`NSDR` -> `NREM` -> `REM`) + Hue's Voice + `ANOR` / `NANDXOR` (`Chris | Alex`).
 pub fn run_dream_state_tool(target: &str) -> String {
     use gaia_mlx_quant::{
-        BODHISATTVA_VOW_HU, OTTHON_AXIOM_HU, THREE_SENTENCE_LISTEN_PROMPT_HU, UltraBackyardLane,
-        dream_state_loop_into, fold_pq, fold_to_quant_tern_pq, ultra_omni_create_dream_into,
+        BODHISATTVA_VOW_HU, OTTHON_AXIOM_HU, SlidingDreamWindow, THREE_SENTENCE_LISTEN_PROMPT_HU,
+        UltraBackyardLane, dream_state_loop_into, fold_pq, fold_to_quant_tern_pq,
+        ultra_omni_create_dream_into,
     };
 
     let seed_text = if target.trim().is_empty() {
@@ -888,6 +890,38 @@ pub fn run_dream_state_tool(target: &str) -> String {
         };
     let f_pq = fold_pq(seed_text, None);
     let qt = fold_to_quant_tern_pq(&f_pq);
+
+    // Run 5-stage Sliding Context Window (`NSDR` -> `NremLight` -> `NremDeep` -> `RemDream` -> `RemLucid`)
+    // coupled with Hue's live voice F0 (172 Hz) and Chris|Alex ANOR/NANDXOR gates
+    let mut sliding_win: SlidingDreamWindow<8> = SlidingDreamWindow::new();
+    let mut scratch_lanes = [UltraBackyardLane {
+        lane_id: 0,
+        instruction: b"",
+        xor_fold: 0,
+        and_gate: 0,
+        nand_gate: 0,
+    }; 8];
+    let stage_configs: [(u16, u16, i8, i8); 5] = [
+        (172, 29_500, 1, 1),  // Stage 0: NSDR (Hue 172Hz + Chris & Alex dyad)
+        (168, 28_400, 1, 0),  // Stage 1: NREM Light (Chris solo focus)
+        (154, 31_000, 1, 1),  // Stage 2: NREM Deep (432Hz/154Hz slow-wave lock)
+        (185, 30_200, 0, 1),  // Stage 3: REM Dream (Alex harmonic resonance)
+        (172, 31_800, 1, 1),  // Stage 4: REM Lucid (Chris + Alex full dyad synthesis)
+    ];
+    let mut sliding_lines = String::new();
+    for &(f0_hz, sal_q15, chris_t, alex_t) in &stage_configs {
+        let fr = sliding_win.advance_stage(bytes, f0_hz, sal_q15, chris_t, alex_t, &mut scratch_lanes);
+        sliding_lines.push_str(&format!(
+            "  • [Step {}/5 `{}` | win={}/8 | F0={}Hz | ANOR={:+} NANDXOR={:+} | win_fold=0x{:016x}]\n",
+            fr.step_index + 1,
+            fr.stage.as_str(),
+            fr.window_occupancy,
+            fr.voice_f0_hz,
+            fr.anor_gate,
+            fr.nandxor_gate,
+            fr.sliding_window_xor_fold,
+        ));
+    }
 
     let mut expert_lines = String::new();
     for (idx, exp) in rcpt.experts.iter().enumerate() {
@@ -940,6 +974,8 @@ pub fn run_dream_state_tool(target: &str) -> String {
          • 3-Sentence Listening Gate: {listen_status}\n\
          • 4-Layer Mixture-of-Experts (`MoE`) Routing (dominant = `{}`):\n\
          {expert_lines}\
+         • Sliding Context Window (`NSDR` -> `NREM` -> `REM` + Hue Voice + `ANOR`/`NANDXOR` `Chris|Alex`):\n\
+         {sliding_lines}\
          • ULTRABACKYARDLOOP `+AND~NAND` Fan-Out ({}/8 lanes):\n\
          {lane_lines}",
         qt.as_str(),

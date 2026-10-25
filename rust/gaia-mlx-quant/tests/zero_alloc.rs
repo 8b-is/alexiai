@@ -371,6 +371,16 @@ fn hot_paths_perform_zero_allocations() {
             &mut ksul_enc,
             &mut ksul_dec,
         );
+        let mut sliding_win: gaia_mlx_quant::SlidingDreamWindow<4> =
+            gaia_mlx_quant::SlidingDreamWindow::new();
+        let f_nsdr = sliding_win.advance_stage(b"nsdr deep rest", 172, 29_000, 1, 1, &mut ub_lanes);
+        assert_eq!(f_nsdr.stage, gaia_mlx_quant::DreamSleepStage::Nsdr);
+        assert_eq!(f_nsdr.anor_gate, 1);
+        assert_eq!(f_nsdr.nandxor_gate, -1);
+        for _ in 0..5 {
+            let _ = sliding_win.advance_stage(b"rem dream window", 172, 29_000, 1, 0, &mut ub_lanes);
+        }
+        assert_eq!(sliding_win.len(), 4);
         let _ = fold_to_quant_tern_pq(&fpq1);
         std::hint::black_box((sampling(&f1), sampling(&f2), sampling_pq(&fpq1), sampling_pq(&fpq2)));
     }

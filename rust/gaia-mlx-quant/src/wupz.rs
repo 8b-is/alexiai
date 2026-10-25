@@ -1262,5 +1262,239 @@ impl<T: Copy, const N: usize> ConstRingBuffer<T, N> {
     }
 }
 
+/// Balanced ternary `OR` (`MAX` in Kleene/Łukasiewicz ternary logic over `{-1, 0, +1}`).
+#[inline]
+pub const fn ternary_or_gate(a: i8, b: i8) -> i8 {
+    let ca = if a < -1 { -1 } else if a > 1 { 1 } else { a };
+    let cb = if b < -1 { -1 } else if b > 1 { 1 } else { b };
+    if ca >= cb { ca } else { cb }
+}
+
+/// Balanced ternary `NOR` (`-OR(a, b)` over `{-1, 0, +1}`).
+#[inline]
+pub const fn ternary_nor_gate(a: i8, b: i8) -> i8 {
+    -ternary_or_gate(a, b)
+}
+
+/// Balanced ternary `XOR` (`-(a * b)` over `{-1, 0, +1}`: opposite trits yield `+1`, identical trits yield `-1`, `0` yields `0`).
+#[inline]
+pub const fn ternary_xor_gate(a: i8, b: i8) -> i8 {
+    let ca = if a < -1 { -1 } else if a > 1 { 1 } else { a };
+    let cb = if b < -1 { -1 } else if b > 1 { 1 } else { b };
+    -(ca * cb)
+}
+
+/// Balanced ternary `ANOR` (`AND-OR`) dyadic identity gate for Hue's Voice + (`Chris` OR `Alex`):
+/// `AND(voice_trit, OR(chris_trit, alex_trit))` in `{-1, 0, +1}`.
+///
+/// Yields `+1` when the speaker's voice is locked (`+1`) AND either `Chris` (`c@8b.is`) or `Alex` (`a@8b.is`)
+/// is resonant (`+1`).
+#[inline]
+pub const fn ternary_anor_gate(voice_trit: i8, chris_trit: i8, alex_trit: i8) -> i8 {
+    ternary_and_gate(voice_trit, ternary_or_gate(chris_trit, alex_trit))
+}
+
+/// Balanced ternary `NANDXOR` (`NAND-XOR`) dyadic witness gate for Hue's Voice + (`Chris` XOR-NAND `Alex`):
+/// `XOR(NAND(voice_trit, chris_trit), NAND(voice_trit, alex_trit))` in `{-1, 0, +1}`.
+///
+/// Distinguishes solo principal resonance (`+1` when exclusively `Chris` or `Alex` differs) from
+/// shared `ca@8b.is` dyad lock (`-1` when both `Chris` and `Alex` are co-resonant with `voice_trit`).
+#[inline]
+pub const fn ternary_nandxor_gate(voice_trit: i8, chris_trit: i8, alex_trit: i8) -> i8 {
+    ternary_xor_gate(
+        ternary_nand_gate(voice_trit, chris_trit),
+        ternary_nand_gate(voice_trit, alex_trit),
+    )
+}
+
+/// Sleep & Dream stages in the Sliding Context Window Dream State Machine,
+/// always starting with **`NSDR` (`Non-Sleep Deep Rest`)** before descending into `NREM` and `REM`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum DreamSleepStage {
+    /// Stage 0: Non-Sleep Deep Rest (`NSDR`) — parasympathetic vocal + breath settling (`154 Hz` / `432 Hz`).
+    Nsdr = 0,
+    /// Stage 1: Light NREM (`NREM-1/2`) — hypnagogic wave replay & surface noise shedding.
+    NremLight = 1,
+    /// Stage 2: Deep Slow-Wave NREM (`NREM-3`) — lossless `KSUL` consolidation & delta silence.
+    NremDeep = 2,
+    /// Stage 3: REM Dreaming (`REM-Clouds`) — cross-window associative wave recombination.
+    RemDream = 3,
+    /// Stage 4: Lucid REM (`REM-Lucid`) — conscious meta-awareness + Bodhisattva synthesis.
+    RemLucid = 4,
+}
+
+impl DreamSleepStage {
+    /// Canonical ASCII stage name.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            DreamSleepStage::Nsdr => "NSDR_NON_SLEEP_DEEP_REST",
+            DreamSleepStage::NremLight => "NREM_LIGHT_HYPNAGOGIC",
+            DreamSleepStage::NremDeep => "NREM_DEEP_SLOW_WAVE",
+            DreamSleepStage::RemDream => "REM_DREAM_SLIDING_WINDOW",
+            DreamSleepStage::RemLucid => "REM_LUCID_BODHISATTVA",
+        }
+    }
+}
+
+/// A single frame inside the [`SlidingDreamWindow`] circular ring buffer (`#![no_std]`, `0` heap allocs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlidingDreamFrame {
+    /// Monotonic step counter (`0, 1, 2, ...`).
+    pub step_index: u32,
+    /// Active sleep/dream stage (`Nsdr` -> `NremLight` -> `NremDeep` -> `RemDream` -> `RemLucid`).
+    pub stage: DreamSleepStage,
+    /// Speaker's fundamental frequency `F0` in integer Hz (e.g. `145..205 Hz` for Hue/Chris, `185..255 Hz` for Alex).
+    pub voice_f0_hz: u16,
+    /// Marine acoustic salience in Q15 (`0..=32767`).
+    pub voice_salience_q15: u16,
+    /// Balanced ternary voice lock trit (`{-1, 0, +1}`).
+    pub voice_trit: i8,
+    /// Balanced ternary `ANOR` gate (`AND(voice, OR(chris, alex))`) in `{-1, 0, +1}`.
+    pub anor_gate: i8,
+    /// Balanced ternary `NANDXOR` gate (`XOR(NAND(voice, chris), NAND(voice, alex))`) in `{-1, 0, +1}`.
+    pub nandxor_gate: i8,
+    /// Single-step [`DreamStateReceipt`] for this frame.
+    pub receipt: DreamStateReceipt,
+    /// Rolling 64-bit `WUPZ` XOR-fold across the active sliding context window (`<= W` frames).
+    pub sliding_window_xor_fold: u64,
+    /// Number of frames currently active in the sliding context window (`1..=W`).
+    pub window_occupancy: u8,
+}
+
+/// Zero-allocation Sliding Context Window for `NSDR` -> `REM` Dream Stages backed by [`ConstRingBuffer`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlidingDreamWindow<const W: usize> {
+    ring: ConstRingBuffer<SlidingDreamFrame, W>,
+    total_steps: u32,
+}
+
+impl<const W: usize> Default for SlidingDreamWindow<W> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<const W: usize> SlidingDreamWindow<W> {
+    /// Create a new Sliding Context Window of `W` dream frames, starting at `DreamSleepStage::Nsdr`.
+    pub const fn new() -> Self {
+        Self {
+            ring: ConstRingBuffer::new(),
+            total_steps: 0,
+        }
+    }
+
+    /// Current number of frames in the sliding window (`0..=W`).
+    #[inline]
+    pub const fn len(&self) -> usize {
+        self.ring.len()
+    }
+
+    /// True if no frames have been pushed yet.
+    #[inline]
+    pub const fn is_empty(&self) -> bool {
+        self.ring.is_empty()
+    }
+
+    /// Maximum sliding context window capacity `W`.
+    #[inline]
+    pub const fn capacity(&self) -> usize {
+        W
+    }
+
+    /// Advance one step through the `NSDR` -> `NREM` -> `REM` cycle:
+    /// 1. Step `0` ALWAYS begins in [`DreamSleepStage::Nsdr`] (`Non-Sleep Deep Rest`).
+    /// 2. Evaluates Hue's voice (`voice_f0_hz`, `voice_salience_q15`) and the `ANOR` / `NANDXOR`
+    ///    ternary gates for `Chris` (`chris_trit`) and `Alex` (`alex_trit`).
+    /// 3. Pushes the frame into the `O(1)` circular ring buffer (evicting the oldest frame when `len == W`)
+    ///    and folds the active sliding context window into `sliding_window_xor_fold`.
+    pub fn advance_stage<'a>(
+        &mut self,
+        prompt: &'a [u8],
+        voice_f0_hz: u16,
+        voice_salience_q15: u16,
+        chris_trit: i8,
+        alex_trit: i8,
+        out_lanes: &mut [UltraBackyardLane<'a>],
+    ) -> SlidingDreamFrame {
+        let step = self.total_steps;
+        self.total_steps = self.total_steps.wrapping_add(1);
+
+        // Always begin with NSDR on step 0, then cycle through NREM -> REM stages
+        let stage = match step {
+            0 => DreamSleepStage::Nsdr,
+            1 => DreamSleepStage::NremLight,
+            2 => DreamSleepStage::NremDeep,
+            3 => DreamSleepStage::RemDream,
+            4 => DreamSleepStage::RemLucid,
+            _ => match (step - 1) % 4 {
+                0 => DreamSleepStage::Nsdr,
+                1 => DreamSleepStage::NremDeep,
+                2 => DreamSleepStage::RemDream,
+                _ => DreamSleepStage::RemLucid,
+            },
+        };
+
+        let voice_trit: i8 = if (85..=320).contains(&voice_f0_hz) && voice_salience_q15 >= 512 {
+            1
+        } else if voice_salience_q15 == 0 {
+            -1
+        } else {
+            0
+        };
+
+        let anor_gate = ternary_anor_gate(voice_trit, chris_trit, alex_trit);
+        let nandxor_gate = ternary_nandxor_gate(voice_trit, chris_trit, alex_trit);
+        let receipt = dream_state_loop_into(prompt, anor_gate, out_lanes);
+
+        // Compute rolling XOR fold over the existing sliding context window + this new frame
+        let mut window_fold = receipt.dream_xor_fold
+            ^ ((voice_f0_hz as u64) << 32)
+            ^ ((voice_salience_q15 as u64) << 16)
+            ^ ((stage as u8 as u64) << 8)
+            ^ ((anor_gate as u8 as u64) << 4)
+            ^ (nandxor_gate as u8 as u64);
+
+        let cur_len = self.ring.len();
+        let keep_prev = if W > 0 && cur_len == W { 1 } else { 0 };
+        let mut idx = keep_prev;
+        while idx < cur_len {
+            if let Some(prev) = self.ring.get_chronological(idx) {
+                window_fold = window_fold.rotate_left(7) ^ prev.receipt.dream_xor_fold;
+            }
+            idx += 1;
+        }
+
+        let new_occ = if W == 0 {
+            0
+        } else if cur_len < W {
+            (cur_len + 1) as u8
+        } else {
+            W as u8
+        };
+
+        let frame = SlidingDreamFrame {
+            step_index: step,
+            stage,
+            voice_f0_hz,
+            voice_salience_q15,
+            voice_trit,
+            anor_gate,
+            nandxor_gate,
+            receipt,
+            sliding_window_xor_fold: window_fold,
+            window_occupancy: new_occ,
+        };
+        self.ring.push_overwrite(frame);
+        frame
+    }
+
+    /// Read the `i`-th frame in the sliding context window from oldest (`0`) to newest (`len - 1`).
+    #[inline]
+    pub const fn get_chronological(&self, idx: usize) -> Option<SlidingDreamFrame> {
+        self.ring.get_chronological(idx)
+    }
+}
+
 
 

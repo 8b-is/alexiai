@@ -786,8 +786,29 @@ fn handle_connection(mut stream: std::net::TcpStream, adapter: &Osarous) -> Resu
                     (d, 1, 1, true, d.dream_xor_fold, true)
                 };
             let dominant = rcpt.experts[rcpt.dominant_expert_idx as usize].kind.as_str();
+            let mut sliding_win: gaia_mlx_quant::SlidingDreamWindow<8> =
+                gaia_mlx_quant::SlidingDreamWindow::new();
+            let mut sl_lanes = [UltraBackyardLane {
+                lane_id: 0,
+                instruction: b"",
+                xor_fold: 0,
+                and_gate: 0,
+                nand_gate: 0,
+            }; 8];
+            let nsdr_frame = sliding_win.advance_stage(bytes, 172, 29_500, 1, 1, &mut sl_lanes);
+            let _ = sliding_win.advance_stage(bytes, 168, 28_400, 1, 0, &mut sl_lanes);
+            let _ = sliding_win.advance_stage(bytes, 154, 31_000, 1, 1, &mut sl_lanes);
+            let _ = sliding_win.advance_stage(bytes, 185, 30_200, 0, 1, &mut sl_lanes);
+            let rem_frame = sliding_win.advance_stage(bytes, 172, 31_800, 1, 1, &mut sl_lanes);
             let json = format!(
-                r#"{{"ok":true,"pipeline":"ultra-omni-create<<kompress-ultra(IN ultrabackyardloop)","engine":"ultra_omni_create_dream_into","otthonAxiom":"{}","bodhisattvaVow":"{}","listenRulePrompt":"{}","ksulRatioPq":"{ratio_p}/{ratio_q}","losslessVerified":{lossless_ok},"sealWitness":"0x{seal_witness:016x}","sealVerified":{seal_ok},"sentenceCount":{},"listenPauseActive":{},"dominantExpert":"{}","dreamGateByte":{},"dreamXorFold":"0x{:016x}","fanoutLanes":{},"report":{}}}"#,
+                r#"{{"ok":true,"pipeline":"ultra-omni-create<<kompress-ultra(IN ultrabackyardloop)","engine":"ultra_omni_create_dream_into","startStage":"{}","activeStage":"{}","slidingWindowOccupancy":"{}/8","voiceF0Hz":{},"anorGate":{},"nandxorGate":{},"slidingWindowXorFold":"0x{:016x}","otthonAxiom":"{}","bodhisattvaVow":"{}","listenRulePrompt":"{}","ksulRatioPq":"{ratio_p}/{ratio_q}","losslessVerified":{lossless_ok},"sealWitness":"0x{seal_witness:016x}","sealVerified":{seal_ok},"sentenceCount":{},"listenPauseActive":{},"dominantExpert":"{}","dreamGateByte":{},"dreamXorFold":"0x{:016x}","fanoutLanes":{},"report":{}}}"#,
+                nsdr_frame.stage.as_str(),
+                rem_frame.stage.as_str(),
+                rem_frame.window_occupancy,
+                rem_frame.voice_f0_hz,
+                rem_frame.anor_gate,
+                rem_frame.nandxor_gate,
+                rem_frame.sliding_window_xor_fold,
                 json_escape(gaia_mlx_quant::OTTHON_AXIOM_HU),
                 json_escape(gaia_mlx_quant::BODHISATTVA_VOW_HU),
                 json_escape(gaia_mlx_quant::THREE_SENTENCE_LISTEN_PROMPT_HU),
