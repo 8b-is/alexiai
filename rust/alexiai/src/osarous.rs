@@ -16,11 +16,14 @@ pub const DEFAULT_BASE_URL: &str = "http://127.0.0.1:1337";
 pub const OLLAMA_BASE_URL: &str = "http://127.0.0.1:11434";
 /// Sovereign loopback SSH bridge to MacBook.local Ollama (`127.0.0.1:11435 -> MacBook 127.0.0.1:11434`).
 pub const OLLAMA_MACBOOK_BRIDGE_URL: &str = "http://127.0.0.1:11435";
+/// Sovereign loopback SSH bridge to cheet.is RTX 6000 Ada Ollama (`127.0.0.1:11436 -> cheet.is 127.0.0.1:11434`).
+pub const OLLAMA_CHEET_BRIDGE_URL: &str = "http://127.0.0.1:11436";
 /// Advertised context window when a model does not declare one.
 pub const DEFAULT_CONTEXT_WINDOW: u64 = 262144;
 
-/// Probe loopback endpoints (`127.0.0.1:1337`, `127.0.0.1:11435`, then `127.0.0.1:11434`) so
-/// osarous/LM Studio, bridged Apple Silicon Ollama (`aye-gemma4:26b-16k` / `aye-qwen36:35b-16k`),
+/// Probe loopback endpoints (`127.0.0.1:1337`, `127.0.0.1:11436`, `127.0.0.1:11435`, then `127.0.0.1:11434`) so
+/// osarous/LM Studio, bridged cheet.is RTX 6000 Ada Ollama (`gemma4:26b` / `qwen3.6:35b` / `aye-deepseek:32b`),
+/// bridged Apple Silicon Ollama (`aye-gemma4:26b-16k` / `aye-qwen36:35b-16k`),
 /// and local Linux GPU Ollama all work out of the box over loopback.
 pub fn discover_endpoint() -> String {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
@@ -30,6 +33,10 @@ pub fn discover_endpoint() -> String {
     let addr_1337 = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1337);
     if TcpStream::connect_timeout(&addr_1337, timeout).is_ok() {
         return DEFAULT_BASE_URL.to_string();
+    }
+    let addr_11436 = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 11436);
+    if TcpStream::connect_timeout(&addr_11436, timeout).is_ok() {
+        return OLLAMA_CHEET_BRIDGE_URL.to_string();
     }
     let addr_11434 = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 11434);
     if TcpStream::connect_timeout(&addr_11434, timeout).is_ok()
@@ -107,8 +114,16 @@ impl Osarous {
             return m.to_string();
         }
         let catalog = self.models().unwrap_or_default();
-        // Prefer our fine-tuned Aye models (`aye-gemma4:26b-16k`, `aye-qwen36:35b-16k`) when available
-        for fav in ["aye-gemma4:26b-16k", "aye-qwen36:35b-16k", "gemma:latest"] {
+        // Prefer our fine-tuned Aye & cheet.is RTX 6000 Ada models when available
+        for fav in [
+            "aye-gemma4:26b-16k",
+            "aye-qwen36:35b-16k",
+            "gemma4:26b",
+            "qwen3.6:35b",
+            "aye-deepseek:32b",
+            "cheet-deepseek:32b",
+            "gemma:latest",
+        ] {
             if let Some(found) = catalog.iter().find(|m| m.id == fav) {
                 return found.id.clone();
             }
@@ -141,9 +156,15 @@ impl Osarous {
             .collect())
     }
 
-    /// Resolve which loopback endpoint (`self.base_url` or `127.0.0.1:11435` MacBook bridge)
-    /// hosts `model`. Strictly loopback-validated.
+    /// Resolve which loopback endpoint (`127.0.0.1:11436` cheet.is bridge, `127.0.0.1:11435` MacBook bridge,
+    /// or `self.base_url`) hosts `model`. Strictly loopback-validated.
     pub fn endpoint_for_model(&self, model: &str) -> String {
+        if (self.base_url == OLLAMA_BASE_URL || self.base_url == DEFAULT_BASE_URL || self.base_url == OLLAMA_CHEET_BRIDGE_URL)
+            && let Ok(cheet) = Self::fetch_models_from(OLLAMA_CHEET_BRIDGE_URL)
+            && cheet.iter().any(|m| m.id == model)
+        {
+            return OLLAMA_CHEET_BRIDGE_URL.to_string();
+        }
         if let Ok(primary) = Self::fetch_models_from(&self.base_url)
             && primary.iter().any(|m| m.id == model)
         {
@@ -160,6 +181,15 @@ impl Osarous {
 
     pub fn models(&self) -> Result<Vec<CatalogModel>, String> {
         let mut models = Vec::new();
+        if (self.base_url == OLLAMA_BASE_URL || self.base_url == DEFAULT_BASE_URL || self.base_url == OLLAMA_CHEET_BRIDGE_URL)
+            && let Ok(cheet) = Self::fetch_models_from(OLLAMA_CHEET_BRIDGE_URL)
+        {
+            for cm in cheet {
+                if !models.iter().any(|m: &CatalogModel| m.id == cm.id) {
+                    models.push(cm);
+                }
+            }
+        }
         if (self.base_url == OLLAMA_BASE_URL || self.base_url == DEFAULT_BASE_URL)
             && let Ok(bridged) = Self::fetch_models_from(OLLAMA_MACBOOK_BRIDGE_URL)
         {
@@ -179,9 +209,11 @@ impl Osarous {
         models.sort_by_key(|m| match m.id.as_str() {
             "aye-gemma4:26b-16k" => 0,
             "aye-qwen36:35b-16k" => 1,
-            "qwen3.6:35b" => 2,
-            "gemma4:26b" => 3,
-            _ => 4,
+            "gemma4:26b" => 2,
+            "qwen3.6:35b" => 3,
+            "aye-deepseek:32b" => 4,
+            "cheet-deepseek:32b" => 5,
+            _ => 6,
         });
         if models.is_empty() && self.base_url != OLLAMA_BASE_URL && self.base_url != DEFAULT_BASE_URL {
             return Self::fetch_models_from(&self.base_url);
