@@ -40,9 +40,9 @@ pub fn request_with_headers(
     extra_headers: &[(&str, &str)],
     body: Option<&str>,
 ) -> Result<Response, String> {
-    let (host, port) = assert_loopback(url)?; // the guard: before any socket
+    let address = assert_loopback(url)?; // the guard: before any socket
     let path = path_of(url);
-    let mut stream = connect_raw(&host, port)?;
+    let mut stream = connect_raw(address)?;
     write_head_with_headers(&mut stream, method, &path, extra_headers, body)?;
 
     // One reader for the whole exchange: a duplicated fd would lose bytes
@@ -54,8 +54,8 @@ pub fn request_with_headers(
     Ok(Response { status, body: body_bytes })
 }
 
-fn connect_raw(host: &str, port: u16) -> Result<TcpStream, String> {
-    let stream = TcpStream::connect((host, port)).map_err(|e| format!("connect {host}:{port}: {e}"))?;
+fn connect_raw(address: std::net::SocketAddr) -> Result<TcpStream, String> {
+    let stream = TcpStream::connect(address).map_err(|e| format!("connect {address}: {e}"))?;
     stream
         .set_read_timeout(Some(Duration::from_secs(120)))
         .map_err(|e| e.to_string())?;
@@ -219,9 +219,9 @@ pub struct SseEvent {
 
 /// Stream Server-Sent Events from an endpoint.
 pub fn sse(url: &str, method: &str, body: Option<&str>) -> Result<SseStream, String> {
-    let (host, port) = assert_loopback(url)?;
+    let address = assert_loopback(url)?;
     let path = path_of(url);
-    let mut stream = connect_raw(&host, port)?;
+    let mut stream = connect_raw(address)?;
     write_head(&mut stream, method, &path, body)?;
 
     // Same single-reader rule as `request`: parse the head from the same
@@ -302,6 +302,23 @@ impl Iterator for SseStream {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn buffered_and_streaming_requests_reject_invalid_destinations_before_connecting() {
+        for url in [
+            "http://localhost.localdomain:1/api",
+            "http://0.0.0.0:1/api",
+            "http://[::1]:invalid/api",
+            "https://127.0.0.1:1/api",
+            "http://user@127.0.0.1:1/api",
+            "http://192.0.2.1:1/api",
+        ] {
+            let buffered_error = request(url, "GET", None).expect_err("guard must reject");
+            let streaming_error = sse(url, "GET", None).err().expect("guard must reject");
+            assert!(buffered_error.starts_with("sovereignty violation:"), "{buffered_error}");
+            assert!(streaming_error.starts_with("sovereignty violation:"), "{streaming_error}");
+        }
+    }
 
     fn chunked_parse(input: &[u8]) -> Vec<u8> {
         let mut reader = BufReader::new(Cursor::new(input.to_vec()));

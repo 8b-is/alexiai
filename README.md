@@ -63,6 +63,14 @@ point: the transport validates the host against the loopback vocabulary
 *before a socket opens*. There is no vendor allowlist, no env-var escape
 hatch, no "but this one is fine". Loopback or nothing.
 
+The Rust HTTP transport accepts literal IPv4 loopback addresses and bracketed
+IPv6 loopback URLs, for example `http://[::1]:11434`. `localhost` is mapped
+directly to `127.0.0.1`; no DNS or hosts-file lookup is used. Other hostname
+aliases, unspecified addresses (`0.0.0.0` / `::`), credentials, malformed ports,
+and non-HTTP schemes are rejected before connecting. Both buffered and streaming
+requests connect using the validated socket address. HTTPS is rejected because
+this dependency-free transport does not implement TLS.
+
 ```bash
 $ cargo run --release -p alexiai -- doctor
   sovereignty

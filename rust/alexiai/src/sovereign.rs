@@ -6,7 +6,7 @@
 //! the loopback vocabulary *before* a connection exists, so a non-local
 //! endpoint is unreachable by construction, not by convention.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 /// Thrown whenever a non-loopback endpoint is attempted.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,7 +26,11 @@ impl SovereigntyViolation {
 
 impl std::fmt::Display for SovereigntyViolation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "sovereignty violation: {} — {}", self.target, self.reason)
+        write!(
+            f,
+            "sovereignty violation: {} — {}",
+            self.target, self.reason
+        )
     }
 }
 
@@ -36,51 +40,74 @@ impl From<SovereigntyViolation> for String {
     }
 }
 
-/// Loopback hosts by name.
-const LOOPBACK_NAMES: &[&str] = &[
-    "localhost",
-    "localhost.localdomain",
-    "ip6-localhost",
-    "ip6-loopback",
-];
+/// The only hostname alias accepted; it is mapped without DNS or hosts-file lookup.
+const LOOPBACK_NAMES: &[&str] = &["localhost"];
 
-/// Is this host (name or literal) loopback?
-///
-/// `0.0.0.0` is included: connecting to it on macOS and Linux resolves to
-/// the local machine, so it is local by construction — the same vocabulary
-/// the JS reference enforced.
-pub fn is_loopback(host: &str) -> bool {
-    let host = host.trim().trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase();
-    if LOOPBACK_NAMES.contains(&host.as_str()) || host == "0.0.0.0" {
-        return true;
+/// Resolve a loopback literal or the explicitly normalized localhost alias.
+fn loopback_ip(host: &str) -> Option<IpAddr> {
+    if host.eq_ignore_ascii_case("localhost") {
+        return Some(IpAddr::V4(Ipv4Addr::LOCALHOST));
     }
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        return ip.is_loopback();
-    }
-    false
-}
-
-/// Parse `scheme://host[:port][/path]` and assert the host is loopback.
-/// No DNS is ever consulted — the check is lexical plus `IpAddr::is_loopback`.
-pub fn assert_loopback(url: &str) -> Result<(String, u16), SovereigntyViolation> {
-    let (host, port) = parse_host_port(url).ok_or_else(|| SovereigntyViolation::new(url, "not a parseable loopback URL"))?;
-    if !is_loopback(&host) {
-        return Err(SovereigntyViolation::new(url, &format!("{host} is not loopback")));
-    }
-    Ok((host, port))
-}
-
-/// Extract host and port from `scheme://host[:port][/anything]`.
-fn parse_host_port(url: &str) -> Option<(String, u16)> {
-    let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
-    let authority = rest.split('/').next().unwrap_or(rest);
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((h, p)) if !h.contains(']') && !h.is_empty() => (h.to_string(), p.parse().ok()?),
-        Some((h, _)) => (h.to_string(), 80), // [::1] style: no port given
-        None => (authority.to_string(), 80),
+    let host = if host.starts_with('[') {
+        let inner = host.strip_prefix('[')?.strip_suffix(']')?;
+        return inner
+            .parse::<std::net::Ipv6Addr>()
+            .ok()
+            .filter(|ip| ip.is_loopback())
+            .map(IpAddr::V6);
+    } else {
+        host
     };
-    let host = host.trim_start_matches('[').trim_end_matches(']');
-    Some((host.to_string(), port))
+    host.parse::<IpAddr>().ok().filter(|ip| ip.is_loopback())
+}
+
+/// Validate plain HTTP and return a literal socket address, never a DNS name.
+pub fn assert_loopback(url: &str) -> Result<SocketAddr, SovereigntyViolation> {
+    parse_loopback_url(url).ok_or_else(|| {
+        SovereigntyViolation::new(
+            url,
+            "expected http://loopback[:port] (localhost is normalized to 127.0.0.1)",
+        )
+    })
+}
+
+fn parse_loopback_url(url: &str) -> Option<SocketAddr> {
+    // This transport speaks HTTP, not TLS. Reject ambiguous authorities and
+    // controls before any socket opens, including credentials and scoped IPv6.
+    if url.chars().any(|c| c.is_whitespace() || c.is_control()) || url.contains(['\\', '#']) {
+        return None;
+    }
+    let rest = url.strip_prefix("http://")?;
+    let authority = rest.split(['/', '?']).next()?;
+    let (host, port_text) = if authority.starts_with('[') {
+        let end = authority.find(']')?;
+        let host = &authority[..=end];
+        let suffix = &authority[end + 1..];
+        (
+            host,
+            if suffix.is_empty() {
+                None
+            } else {
+                Some(suffix.strip_prefix(':')?)
+            },
+        )
+    } else {
+        match authority.split_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (authority, None),
+        }
+    };
+    let port = match port_text {
+        Some(text) if !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()) => {
+            text.parse::<u16>().ok()?
+        }
+        Some(_) => return None,
+        None => 80,
+    };
+    if port == 0 {
+        return None;
+    }
+    Some(SocketAddr::new(loopback_ip(host)?, port))
 }
 
 /// The attestation, printed by `doctor` and echoed by `/api/health`.
@@ -103,8 +130,8 @@ mod tests {
 
     #[test]
     fn loopback_names_and_literals_pass() {
-        for host in ["localhost", "127.0.0.1", "127.1.2.3", "::1", "[::1]", "0.0.0.0"] {
-            assert!(is_loopback(host), "{host} should be loopback");
+        for host in ["localhost", "127.0.0.1", "127.1.2.3", "::1", "[::1]"] {
+            assert!(loopback_ip(host).is_some(), "{host} should be loopback");
         }
     }
 
@@ -118,9 +145,16 @@ mod tests {
             "8.8.8.8",
             "169.254.169.254",
             "localhost.evil.com",
+            "localhost.localdomain",
+            "ip6-localhost",
+            "ip6-loopback",
+            "0.0.0.0",
+            "::",
+            "[[::1]]",
+            "[127.0.0.1]",
             "",
         ] {
-            assert!(!is_loopback(host), "{host} must not be loopback");
+            assert!(loopback_ip(host).is_none(), "{host} must not be loopback");
         }
     }
 
@@ -133,7 +167,53 @@ mod tests {
 
     #[test]
     fn loopback_urls_parse() {
-        assert_eq!(assert_loopback("http://127.0.0.1:1337").unwrap(), ("127.0.0.1".to_string(), 1337));
-        assert_eq!(assert_loopback("http://localhost:8787/api").unwrap().1, 8787);
+        for (url, address) in [
+            ("http://127.0.0.1:1337", "127.0.0.1:1337"),
+            ("http://LOCALHOST:8787/api", "127.0.0.1:8787"),
+            ("http://127.1.2.3", "127.1.2.3:80"),
+            ("http://[::1]:11434/api", "[::1]:11434"),
+            ("http://[::1]", "[::1]:80"),
+            ("http://[0:0:0:0:0:0:0:1]:65535", "[::1]:65535"),
+        ] {
+            assert_eq!(
+                assert_loopback(url).unwrap(),
+                address.parse::<SocketAddr>().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn ambiguous_and_non_http_urls_are_refused() {
+        for url in [
+            "https://127.0.0.1:443",
+            "ftp://localhost",
+            "localhost:8787",
+            "http://0.0.0.0:80",
+            "http://localhost.localdomain:80",
+            "http://ip6-localhost:80",
+            "http://ip6-loopback:80",
+            "http://127.0.0.1@8.8.8.8",
+            "http://user@127.0.0.1",
+            "http://127.0.0.1:",
+            "http://127.0.0.1:+80",
+            "http://127.0.0.1:0",
+            "http://127.0.0.1:65536",
+            "http://127.0.0.1:80:90",
+            "http://[::1]:invalid",
+            "http://[::1]:",
+            "http://[::1]suffix",
+            "http://::1",
+            "http://[::]",
+            "http://[[::1]]",
+            "http://[127.0.0.1]",
+            "http://[::1%lo]:80",
+            "http://[::ffff:127.0.0.1]",
+            "http://127.0.0.1\\@8.8.8.8",
+            "http://127.0.0.1/#fragment",
+            "http://127.0.0.1/\r\nHost: remote",
+            "http://127.0.0.1 /",
+        ] {
+            assert!(assert_loopback(url).is_err(), "accepted {url:?}");
+        }
     }
 }
