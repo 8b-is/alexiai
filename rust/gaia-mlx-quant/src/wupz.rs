@@ -1496,5 +1496,162 @@ impl<const W: usize> SlidingDreamWindow<W> {
     }
 }
 
+// ============================================================================
+// UNIFIED 128-BYTE `.SNAP` HEADER + CASTAGNOLI CRC32C + WIGLE CUSTODIAN WAL
+// ============================================================================
+
+/// Magic bytes for the unified 128-byte `.snap` header (`"ASNP0062"`).
+pub const WUPZ_SNAP_MAGIC: [u8; 8] = *b"ASNP0062";
+/// Fixed 128-byte binary header size baking `MANIFEST` metadata directly into `.snap`.
+pub const WUPZ_SNAP_HEADER_LEN: usize = 128;
+/// Castagnoli reflected CRC32C polynomial (`0x82F6_3B78`).
+pub const CRC32C_POLY: u32 = 0x82F6_3B78;
+
+/// Compute Castagnoli `CRC32C` (`0x82F63B78`) in pure `core` with zero heap allocations.
+pub const fn wupz_crc32c(bytes: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        crc ^= bytes[i] as u32;
+        let mut bit = 0;
+        while bit < 8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (CRC32C_POLY & mask);
+            bit += 1;
+        }
+        i += 1;
+    }
+    !crc
+}
+
+/// Zero-float `p/q` + `BFP-64` state record for WiGLE DataBomb v3.0 (`Record != Admit != Commit`),
+/// ESP32-S3 MEDUSA telemetry, and AlexAI/Aurora WAL checkpoints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WupzWalStateRecord {
+    pub epoch: u64,
+    pub lsn: u64,
+    pub prev_hash: [u8; 32],
+    /// Zero-float rational salience numerator (`salience_p / salience_q`).
+    pub salience_p: i64,
+    /// Zero-float rational salience denominator (`> 0`).
+    pub salience_q: u32,
+    /// Custodian stage trit: `-1` (`Record`), `0` (`Admit`), `+1` (`Commit`).
+    pub custodian_trit: i8,
+    /// Gate byte (`0x62`).
+    pub gate: u8,
+    /// Quantization mask byte (`0x55`).
+    pub qt: u8,
+    /// Reserved alignment byte (`0x01` ABI v1).
+    pub abi_version: u8,
+    /// Decoupled `LocationFix` latitude (`lat * 1e7`).
+    pub lat_e7: i32,
+    /// Decoupled `LocationFix` longitude (`lon * 1e7`).
+    pub lon_e7: i32,
+    /// Disjoint positive `BFP-64` bitplane (`pos & neg == 0`).
+    pub bfp64_pos: u64,
+    /// Disjoint negative `BFP-64` bitplane (`pos & neg == 0`).
+    pub bfp64_neg: u64,
+    /// Cumulative `Record` (`-1`), `Admit` (`0`), and `Commit` (`+1`) counts.
+    pub custodian_counts: [u32; 3],
+}
+
+/// Encode `WupzWalStateRecord` into a 128-byte unified `.snap` binary header (`out[..128]`),
+/// sealing bytes `0..116` with both `wupz_crc32c` (`116..120`) and `wupz_xor_fold` (`120..128`).
+pub fn wupz_encode_snap_header_128_into(rec: &WupzWalStateRecord, out: &mut [u8]) -> Option<u32> {
+    if out.len() < WUPZ_SNAP_HEADER_LEN || rec.salience_q == 0 || (rec.bfp64_pos & rec.bfp64_neg) != 0 {
+        return None;
+    }
+    out[..WUPZ_SNAP_HEADER_LEN].fill(0);
+    out[0..8].copy_from_slice(&WUPZ_SNAP_MAGIC);
+    out[8..16].copy_from_slice(&rec.epoch.to_le_bytes());
+    out[16..24].copy_from_slice(&rec.lsn.to_le_bytes());
+    out[24..56].copy_from_slice(&rec.prev_hash);
+    out[56..64].copy_from_slice(&rec.salience_p.to_le_bytes());
+    out[64..68].copy_from_slice(&rec.salience_q.to_le_bytes());
+    out[68] = rec.custodian_trit as u8;
+    out[69] = rec.gate;
+    out[70] = rec.qt;
+    out[71] = rec.abi_version;
+    out[72..76].copy_from_slice(&rec.lat_e7.to_le_bytes());
+    out[76..80].copy_from_slice(&rec.lon_e7.to_le_bytes());
+    out[80..88].copy_from_slice(&rec.bfp64_pos.to_le_bytes());
+    out[88..96].copy_from_slice(&rec.bfp64_neg.to_le_bytes());
+    out[96..100].copy_from_slice(&rec.custodian_counts[0].to_le_bytes());
+    out[100..104].copy_from_slice(&rec.custodian_counts[1].to_le_bytes());
+    out[104..108].copy_from_slice(&rec.custodian_counts[2].to_le_bytes());
+    // Bytes 108..116: codec density 407/389 (u32 LE p=407, q=389)
+    out[108..112].copy_from_slice(&407u32.to_le_bytes());
+    out[112..116].copy_from_slice(&389u32.to_le_bytes());
+
+    let crc = wupz_crc32c(&out[0..116]);
+    out[116..120].copy_from_slice(&crc.to_le_bytes());
+    let fold = wupz_xor_fold(&out[0..120]);
+    out[120..128].copy_from_slice(&fold.to_le_bytes());
+    Some(crc)
+}
+
+/// Verify and decode a 128-byte unified `.snap` header (`buf[..128]`), rejecting any bit flip,
+/// torn write, zero denominator, or `BFP-64` bitplane overlap.
+pub fn wupz_decode_snap_header_128(buf: &[u8]) -> Option<WupzWalStateRecord> {
+    if buf.len() < WUPZ_SNAP_HEADER_LEN || buf[0..8] != WUPZ_SNAP_MAGIC {
+        return None;
+    }
+    let crc_expected = u32::from_le_bytes([buf[116], buf[117], buf[118], buf[119]]);
+    if wupz_crc32c(&buf[0..116]) != crc_expected {
+        return None;
+    }
+    let fold_expected = u64::from_le_bytes([
+        buf[120], buf[121], buf[122], buf[123], buf[124], buf[125], buf[126], buf[127],
+    ]);
+    if wupz_xor_fold(&buf[0..120]) != fold_expected {
+        return None;
+    }
+
+    let epoch = u64::from_le_bytes([buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15]]);
+    let lsn = u64::from_le_bytes([buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23]]);
+    let mut prev_hash = [0u8; 32];
+    prev_hash.copy_from_slice(&buf[24..56]);
+    let salience_p = i64::from_le_bytes([buf[56], buf[57], buf[58], buf[59], buf[60], buf[61], buf[62], buf[63]]);
+    let salience_q = u32::from_le_bytes([buf[64], buf[65], buf[66], buf[67]]);
+    if salience_q == 0 {
+        return None;
+    }
+    let custodian_trit = buf[68] as i8;
+    if !(-1..=1).contains(&custodian_trit) {
+        return None;
+    }
+    let gate = buf[69];
+    let qt = buf[70];
+    let abi_version = buf[71];
+    let lat_e7 = i32::from_le_bytes([buf[72], buf[73], buf[74], buf[75]]);
+    let lon_e7 = i32::from_le_bytes([buf[76], buf[77], buf[78], buf[79]]);
+    let bfp64_pos = u64::from_le_bytes([buf[80], buf[81], buf[82], buf[83], buf[84], buf[85], buf[86], buf[87]]);
+    let bfp64_neg = u64::from_le_bytes([buf[88], buf[89], buf[90], buf[91], buf[92], buf[93], buf[94], buf[95]]);
+    if (bfp64_pos & bfp64_neg) != 0 {
+        return None;
+    }
+    let c0 = u32::from_le_bytes([buf[96], buf[97], buf[98], buf[99]]);
+    let c1 = u32::from_le_bytes([buf[100], buf[101], buf[102], buf[103]]);
+    let c2 = u32::from_le_bytes([buf[104], buf[105], buf[106], buf[107]]);
+
+    Some(WupzWalStateRecord {
+        epoch,
+        lsn,
+        prev_hash,
+        salience_p,
+        salience_q,
+        custodian_trit,
+        gate,
+        qt,
+        abi_version,
+        lat_e7,
+        lon_e7,
+        bfp64_pos,
+        bfp64_neg,
+        custodian_counts: [c0, c1, c2],
+    })
+}
+
+
 
 
