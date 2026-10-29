@@ -1784,7 +1784,9 @@ pub struct AurSnapHeader64 {
 }
 
 /// 32-byte `AURSNAP1` Zero-Copy Node Index Entry using a zero-float `p/q` fixed-point pair
-/// (`salience_p: i32`, `salience_q: u32`) instead of `f64`.
+/// (`salience_p: i32`, `salience_q: u32`) and an 8-byte zero-padded Big-Endian `key_prefix: u64`
+/// at offset `+24..+32` so single-register integer `<` / `>` comparisons are strictly isomorphic
+/// to UTF-8 lexicographical `memcmp`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AurSnapNodeEntry32 {
     pub salience_p: i32,
@@ -1795,7 +1797,36 @@ pub struct AurSnapNodeEntry32 {
     pub id_len: u16,
     pub scope_id: u8,
     pub pinned: u8,
+    /// 8-byte zero-padded Big-Endian UTF-8 prefix (`prefix_u64(K) = sum_{i=0}^{min(|K|,8)-1} K[i] * 256^{7-i}`).
     pub digest_prefix: u64,
+}
+
+/// Pack the first `min(|key|, 8)` UTF-8 bytes of `key` into a 64-bit unsigned integer using
+/// Big-Endian byte order (`0x00`-padded on the right), making single-register `u64` comparisons
+/// strictly order-isomorphic to byte-wise `memcmp`.
+#[inline]
+pub const fn wupz_key_prefix_be_u64(key: &[u8]) -> u64 {
+    let mut buf = [0u8; 8];
+    let n = if key.len() < 8 { key.len() } else { 8 };
+    let mut i = 0usize;
+    while i < n {
+        buf[i] = key[i];
+        i += 1;
+    }
+    u64::from_be_bytes(buf)
+}
+
+/// Compute a 64-bit Big-Endian mask isolating the top `min(prefix_len, 8)` bytes of a `key_prefix: u64`.
+#[inline]
+pub const fn wupz_prefix_mask_be_u64(prefix_len: usize) -> u64 {
+    let k = if prefix_len < 8 { prefix_len } else { 8 };
+    if k == 0 {
+        0
+    } else if k == 8 {
+        u64::MAX
+    } else {
+        !0u64 << ((8 - k) * 8)
+    }
 }
 
 /// Encode `AurSnapHeader64` into a 64-byte buffer (`out[..64]`), sealing bytes `0..56`
@@ -1846,9 +1877,10 @@ pub fn wupz_decode_aursnap1_header_64(buf: &[u8]) -> Option<AurSnapHeader64> {
     })
 }
 
-/// Encode a 32-byte `AurSnapNodeEntry32` (`salience_p / salience_q` zero-float `p/q` pair) into `out[..32]`.
+/// Encode a 32-byte `AurSnapNodeEntry32` (`salience_p / salience_q` zero-float `p/q` pair and
+/// Big-Endian `digest_prefix` / `key_prefix` at `+24..+32`) into `out[..32]`.
 pub fn wupz_encode_aursnap1_node_32_into(entry: &AurSnapNodeEntry32, out: &mut [u8]) -> Option<()> {
-    if out.len() < AURSNAP1_NODE_ENTRY_LEN || entry.salience_q == 0 {
+    if out.len() < AURSNAP1_NODE_ENTRY_LEN || entry.salience_q == 0 || entry.scope_id >= 4 || entry.pinned > 1 {
         return None;
     }
     out[0..4].copy_from_slice(&entry.salience_p.to_le_bytes());
@@ -1859,7 +1891,7 @@ pub fn wupz_encode_aursnap1_node_32_into(entry: &AurSnapNodeEntry32, out: &mut [
     out[20..22].copy_from_slice(&entry.id_len.to_le_bytes());
     out[22] = entry.scope_id;
     out[23] = entry.pinned;
-    out[24..32].copy_from_slice(&entry.digest_prefix.to_le_bytes());
+    out[24..32].copy_from_slice(&entry.digest_prefix.to_be_bytes());
     Some(())
 }
 
@@ -1870,14 +1902,18 @@ pub fn wupz_decode_aursnap1_node_32(buf: &[u8], arena_len: u32) -> Option<AurSna
     }
     let salience_p = i32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
     let salience_q = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
-    if salience_q == 0 {
+    if salience_q == 0 || salience_p < 0 {
         return None;
     }
     let payload_off = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
     let payload_len = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
     let id_off = u32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]);
     let id_len = u16::from_le_bytes([buf[20], buf[21]]);
-    if payload_off.checked_add(payload_len)? > arena_len
+    let scope_id = buf[22];
+    let pinned = buf[23];
+    if scope_id >= 4
+        || pinned > 1
+        || payload_off.checked_add(payload_len)? > arena_len
         || id_off.checked_add(id_len as u32)? > arena_len
     {
         return None;
@@ -1889,13 +1925,285 @@ pub fn wupz_decode_aursnap1_node_32(buf: &[u8], arena_len: u32) -> Option<AurSna
         payload_len,
         id_off,
         id_len,
-        scope_id: buf[22],
-        pinned: buf[23],
-        digest_prefix: u64::from_le_bytes([
+        scope_id,
+        pinned,
+        digest_prefix: u64::from_be_bytes([
             buf[24], buf[25], buf[26], buf[27], buf[28], buf[29], buf[30], buf[31],
         ]),
     })
 }
+
+/// Zero-copy decoded view of an `AURSNAP1` node backed directly by the immutable byte slice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AurSnapDecodedNode<'a> {
+    pub node_id: &'a str,
+    pub payload: &'a str,
+    pub scope_id: u8,
+    pub pinned: bool,
+    pub salience_p: i32,
+    pub salience_q: u32,
+    pub key_prefix: u64,
+}
+
+/// Zero-copy, `#![no_std]`, zero-allocation `AURSNAP1` Index & String Arena View implementing
+/// the Single-Register Lexicographical Ordering Algebra (`O(log N)` register-first binary search
+/// + `O(log N + K)` prefix scan with spoof-resistant arena verification).
+#[derive(Debug, Clone, Copy)]
+pub struct AurSnapIndexView<'a> {
+    pub header: AurSnapHeader64,
+    index_table: &'a [u8],
+    arena: &'a [u8],
+}
+
+impl<'a> AurSnapIndexView<'a> {
+    /// Open and envelope-verify an `AURSNAP1` snapshot byte slice (`64B Header` + `32B * N Index` + `UTF-8 Arena`).
+    pub fn open(data: &'a [u8]) -> Option<Self> {
+        let header = wupz_decode_aursnap1_header_64(data)?;
+        if header.version != 1 || header.expected_file_size != (data.len() as u64) {
+            return None;
+        }
+        let index_bytes = header.node_count.checked_mul(AURSNAP1_NODE_ENTRY_LEN as u64)?;
+        let expected_arena_off = (AURSNAP1_HEADER_LEN as u64).checked_add(index_bytes)?;
+        if header.string_arena_offset != expected_arena_off
+            || expected_arena_off > header.expected_file_size
+        {
+            return None;
+        }
+        let arena_len_u64 = header.expected_file_size - expected_arena_off;
+        if arena_len_u64 > (u32::MAX as u64) || header.node_count > (usize::MAX as u64) {
+            return None;
+        }
+        let arena_off = expected_arena_off as usize;
+        Some(Self {
+            header,
+            index_table: &data[AURSNAP1_HEADER_LEN..arena_off],
+            arena: &data[arena_off..],
+        })
+    }
+
+    /// Number of indexed nodes in the snapshot.
+    #[inline]
+    pub const fn node_count(&self) -> usize {
+        self.header.node_count as usize
+    }
+
+    /// Decode and verify the `index`-th node entry, enforcing arena bounds, UTF-8 validity,
+    /// and `wupz_key_prefix_be_u64(node_id) == entry.digest_prefix` (spoof defense).
+    pub fn decode_node_at(&self, index: usize) -> Option<AurSnapDecodedNode<'a>> {
+        if index >= self.node_count() {
+            return None;
+        }
+        let off = index * AURSNAP1_NODE_ENTRY_LEN;
+        let entry = wupz_decode_aursnap1_node_32(
+            &self.index_table[off..off + AURSNAP1_NODE_ENTRY_LEN],
+            self.arena.len() as u32,
+        )?;
+        let id_start = entry.id_off as usize;
+        let id_end = id_start.checked_add(entry.id_len as usize)?;
+        let pay_start = entry.payload_off as usize;
+        let pay_end = pay_start.checked_add(entry.payload_len as usize)?;
+        let id_bytes = self.arena.get(id_start..id_end)?;
+        let pay_bytes = self.arena.get(pay_start..pay_end)?;
+        if wupz_key_prefix_be_u64(id_bytes) != entry.digest_prefix {
+            return None;
+        }
+        let node_id = core::str::from_utf8(id_bytes).ok()?;
+        let payload = core::str::from_utf8(pay_bytes).ok()?;
+        Some(AurSnapDecodedNode {
+            node_id,
+            payload,
+            scope_id: entry.scope_id,
+            pinned: entry.pinned != 0,
+            salience_p: entry.salience_p,
+            salience_q: entry.salience_q,
+            key_prefix: entry.digest_prefix,
+        })
+    }
+
+    /// Compare `entry[mid]` against `(target, target_prefix)` using the 3-case Single-Register
+    /// Lexicographical Ordering Algebra:
+    /// 1. `entry_prefix != target_prefix` -> 1-instruction `u64` compare (`0` arena reads).
+    /// 2. `|A| <= 8 && |B| <= 8` -> length tie-break (`0` arena reads).
+    /// 3. `max(|A|, |B|) > 8` -> arena suffix comparison `A[8..].cmp(&B[8..])` + spoof check.
+    fn compare_entry_at(
+        &self,
+        mid: usize,
+        target: &[u8],
+        target_prefix: u64,
+    ) -> Option<core::cmp::Ordering> {
+        let off = mid.checked_mul(AURSNAP1_NODE_ENTRY_LEN)?;
+        let row = self.index_table.get(off..off + AURSNAP1_NODE_ENTRY_LEN)?;
+        let entry_prefix = u64::from_be_bytes([
+            row[24], row[25], row[26], row[27], row[28], row[29], row[30], row[31],
+        ]);
+        let id_len = u16::from_le_bytes([row[20], row[21]]) as usize;
+
+        if entry_prefix != target_prefix {
+            return Some(entry_prefix.cmp(&target_prefix));
+        }
+        if id_len <= 8 && target.len() <= 8 {
+            return Some(id_len.cmp(&target.len()));
+        }
+        let id_off = u32::from_le_bytes([row[16], row[17], row[18], row[19]]) as usize;
+        let id_end = id_off.checked_add(id_len)?;
+        let id_bytes = self.arena.get(id_off..id_end)?;
+        if wupz_key_prefix_be_u64(id_bytes) != entry_prefix {
+            return None;
+        }
+        let a_suf = &id_bytes[id_bytes.len().min(8)..];
+        let b_suf = &target[target.len().min(8)..];
+        Some(a_suf.cmp(b_suf))
+    }
+
+    /// Register-first binary search for the first index `i` where `node_id[i] >= target`.
+    pub fn lower_bound(&self, target: &[u8]) -> Option<usize> {
+        let target_prefix = wupz_key_prefix_be_u64(target);
+        let mut lo = 0usize;
+        let mut hi = self.node_count();
+        while lo < hi {
+            let mid = lo + ((hi - lo) >> 1);
+            match self.compare_entry_at(mid, target, target_prefix)? {
+                core::cmp::Ordering::Less => lo = mid + 1,
+                core::cmp::Ordering::Equal | core::cmp::Ordering::Greater => hi = mid,
+            }
+        }
+        Some(lo)
+    }
+
+    /// Zero-allocation `O(log N)` exact lookup by `target_key`.
+    pub fn get_by_id(&self, target_key: &str) -> Option<AurSnapDecodedNode<'a>> {
+        let target = target_key.as_bytes();
+        let target_prefix = wupz_key_prefix_be_u64(target);
+        let mut lo = 0usize;
+        let mut hi = self.node_count();
+        while lo < hi {
+            let mid = lo + ((hi - lo) >> 1);
+            match self.compare_entry_at(mid, target, target_prefix)? {
+                core::cmp::Ordering::Less => lo = mid + 1,
+                core::cmp::Ordering::Greater => hi = mid,
+                core::cmp::Ordering::Equal => {
+                    let node = self.decode_node_at(mid)?;
+                    if node.node_id.as_bytes() == target {
+                        return Some(node);
+                    }
+                    return None;
+                }
+            }
+        }
+        None
+    }
+
+    /// Zero-allocation prefix range scan (`O(log N + K)`), writing matching nodes into `out`
+    /// and returning the number of matched nodes.
+    pub fn scan_prefix_into(
+        &self,
+        prefix: &str,
+        out: &mut [AurSnapDecodedNode<'a>],
+    ) -> Option<usize> {
+        let p_bytes = prefix.as_bytes();
+        let start_idx = self.lower_bound(p_bytes)?;
+        let p_u64 = wupz_key_prefix_be_u64(p_bytes);
+        let mask = wupz_prefix_mask_be_u64(p_bytes.len());
+        let mut count = 0usize;
+        let mut idx = start_idx;
+        while idx < self.node_count() {
+            let off = idx * AURSNAP1_NODE_ENTRY_LEN;
+            let row = self.index_table.get(off..off + AURSNAP1_NODE_ENTRY_LEN)?;
+            let entry_prefix = u64::from_be_bytes([
+                row[24], row[25], row[26], row[27], row[28], row[29], row[30], row[31],
+            ]);
+            let id_len = u16::from_le_bytes([row[20], row[21]]) as usize;
+            if (entry_prefix & mask) != p_u64 || id_len < p_bytes.len() {
+                break;
+            }
+            let node = self.decode_node_at(idx)?;
+            if p_bytes.len() > 8 && !node.node_id.as_bytes().starts_with(p_bytes) {
+                break;
+            }
+            if count < out.len() {
+                out[count] = node;
+            }
+            count += 1;
+            idx += 1;
+        }
+        Some(count)
+    }
+}
+
+/// Zero-allocation builder that packs a slice of pre-sorted `(node_id, payload, salience_p, salience_q, scope_id, pinned)`
+/// tuples into a canonical `AURSNAP1` image inside `out` and returns the written slice length.
+#[allow(clippy::type_complexity)]
+pub fn wupz_build_aursnap1_image_into(
+    epoch: u64,
+    sorted_nodes: &[(&str, &str, i32, u32, u8, bool)],
+    out: &mut [u8],
+) -> Option<usize> {
+    let n = sorted_nodes.len();
+    let index_bytes = n.checked_mul(AURSNAP1_NODE_ENTRY_LEN)?;
+    let arena_off = AURSNAP1_HEADER_LEN.checked_add(index_bytes)?;
+    let mut arena_len = 0usize;
+    let mut i = 0usize;
+    while i < n {
+        if i > 0 && sorted_nodes[i - 1].0.as_bytes() >= sorted_nodes[i].0.as_bytes() {
+            return None;
+        }
+        let id_b = sorted_nodes[i].0.as_bytes();
+        let pay_b = sorted_nodes[i].1.as_bytes();
+        if id_b.len() > (u16::MAX as usize) {
+            return None;
+        }
+        arena_len = arena_len.checked_add(id_b.len())?.checked_add(pay_b.len())?;
+        i += 1;
+    }
+    let total_size = arena_off.checked_add(arena_len)?;
+    if out.len() < total_size || arena_len > (u32::MAX as usize) {
+        return None;
+    }
+
+    let hdr = AurSnapHeader64 {
+        version: 1,
+        flags: 0x62,
+        epoch,
+        node_count: n as u64,
+        expected_file_size: total_size as u64,
+        string_arena_offset: arena_off as u64,
+    };
+    wupz_encode_aursnap1_header_64_into(&hdr, &mut out[..AURSNAP1_HEADER_LEN])?;
+
+    let mut cur_arena_off = 0usize;
+    let mut idx = 0usize;
+    while idx < n {
+        let (node_id, payload, sal_p, sal_q, scope_id, pinned) = sorted_nodes[idx];
+        let id_b = node_id.as_bytes();
+        let pay_b = payload.as_bytes();
+        let id_off = cur_arena_off;
+        out[arena_off + id_off..arena_off + id_off + id_b.len()].copy_from_slice(id_b);
+        cur_arena_off += id_b.len();
+        let pay_off = cur_arena_off;
+        out[arena_off + pay_off..arena_off + pay_off + pay_b.len()].copy_from_slice(pay_b);
+        cur_arena_off += pay_b.len();
+
+        let entry = AurSnapNodeEntry32 {
+            salience_p: sal_p,
+            salience_q: sal_q,
+            payload_off: pay_off as u32,
+            payload_len: pay_b.len() as u32,
+            id_off: id_off as u32,
+            id_len: id_b.len() as u16,
+            scope_id,
+            pinned: u8::from(pinned),
+            digest_prefix: wupz_key_prefix_be_u64(id_b),
+        };
+        let entry_off = AURSNAP1_HEADER_LEN + idx * AURSNAP1_NODE_ENTRY_LEN;
+        wupz_encode_aursnap1_node_32_into(
+            &entry,
+            &mut out[entry_off..entry_off + AURSNAP1_NODE_ENTRY_LEN],
+        )?;
+        idx += 1;
+    }
+    Some(total_size)
+}
+
 
 
 

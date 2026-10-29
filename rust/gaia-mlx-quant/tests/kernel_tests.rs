@@ -652,3 +652,293 @@ fn ternary_activation_kernel_costs_more_error_than_four_bit() {
         "ternary-activation error ({ppm_tern} ppm) must exceed 4-bit ({ppm_i4} ppm)"
     );
 }
+
+#[test]
+fn quantum_bfp64_hybrid_reaches_weight_only_floor_and_reachtion_seals() {
+    use gaia_mlx_quant::{
+        KERNEL_PQ_Q, dense_matmul_pq_into, pack_quantum_bitplanes_i_major_into,
+        quantize_quantum_bfp64_bitplanes_pq_into, quantize_quantum_bitplane_i4_pq_into,
+        quantize_ternary_pq_into, quantum_bfp64_hybrid_matmul_pq_into,
+        quantum_bitplane_i4_matmul_pq_into, relative_error_pq_ppm, wupz_seal_reachtion_packet,
+        wupz_verify_reachtion_packet,
+    };
+
+    let rows = 128usize;
+    let cols = 128usize;
+    let q = KERNEL_PQ_Q;
+    let w_p = weights_pq_fixed(rows * cols, 0x5eed);
+    let x_p = weights_pq_fixed(rows, 0xc0ffee);
+
+    let mut trits = vec![0i8; rows * cols];
+    let mut scales_p = vec![0i32; rows];
+    quantize_ternary_pq_into(&w_p, rows, cols, q, &mut trits, &mut scales_p);
+
+    let mut dense_pq = vec![0i64; cols];
+    dense_matmul_pq_into(&w_p, rows, cols, &x_p, &mut dense_pq);
+
+    let x_p_scaled: Vec<i32> = x_p
+        .iter()
+        .zip(scales_p.iter())
+        .map(|(&xv, &sv)| (((xv as i64) * (sv as i64)) / (q as i64)) as i32)
+        .collect();
+
+    let words = rows.div_ceil(64);
+    let mut w_pos = vec![0u64; cols * words];
+    let mut w_neg = vec![0u64; cols * words];
+    pack_quantum_bitplanes_i_major_into(&trits, rows, cols, &mut w_pos, &mut w_neg);
+
+    let mut x_sign_i4 = vec![0u64; words];
+    let mut x_b0 = vec![0u64; words];
+    let mut x_b1 = vec![0u64; words];
+    let mut x_b2 = vec![0u64; words];
+    let mut scale_i4 = vec![0i32; words];
+    quantize_quantum_bitplane_i4_pq_into(
+        &x_p_scaled,
+        &mut x_sign_i4,
+        &mut x_b0,
+        &mut x_b1,
+        &mut x_b2,
+        &mut scale_i4,
+    );
+
+    let mut x_sign_bfp = vec![0u64; words];
+    let mut x_planes_bfp = vec![[0u64; 7]; words];
+    let mut scale_bfp = vec![0i32; words];
+    quantize_quantum_bfp64_bitplanes_pq_into(
+        &x_p_scaled,
+        &mut x_sign_bfp,
+        &mut x_planes_bfp,
+        &mut scale_bfp,
+    );
+
+    let mut out_i4 = vec![0i64; cols];
+    quantum_bitplane_i4_matmul_pq_into(
+        &w_pos,
+        &w_neg,
+        rows,
+        cols,
+        &x_sign_i4,
+        &x_b0,
+        &x_b1,
+        &x_b2,
+        &scale_i4,
+        &mut out_i4,
+    );
+
+    let mut out_bfp = vec![0i64; cols];
+    quantum_bfp64_hybrid_matmul_pq_into(
+        &w_pos,
+        &w_neg,
+        rows,
+        cols,
+        &x_sign_bfp,
+        &x_planes_bfp,
+        &scale_bfp,
+        &mut out_bfp,
+    );
+
+    let to_q2 = |v: &[i64]| -> Vec<i64> { v.iter().map(|&x| x * (q as i64)).collect() };
+    let ppm_i4 = relative_error_pq_ppm(&to_q2(&out_i4), &dense_pq);
+    let ppm_bfp = relative_error_pq_ppm(&to_q2(&out_bfp), &dense_pq);
+    assert!(
+        ppm_bfp <= ppm_i4,
+        "BFP-64 7-plane hybrid ({ppm_bfp} ppm) must be at least as accurate as 4-bit ({ppm_i4} ppm)"
+    );
+
+    let mut wire = [0u8; 64];
+    let pkt = wupz_seal_reachtion_packet(
+        0x2026_1029_0062,
+        0b1111,
+        0x55,
+        8,
+        b"thought->reaction->bfp64-witness",
+        407,
+        389,
+        *b"PETER_DRA_CHRIS_",
+        &mut wire,
+    );
+    assert_eq!(pkt.thought_bfp64_pos & pkt.thought_bfp64_neg, 0);
+    let decoded = wupz_verify_reachtion_packet(&wire).unwrap();
+    assert_eq!(decoded, pkt);
+    wire[63] ^= 0x01;
+    assert!(wupz_verify_reachtion_packet(&wire).is_none());
+}
+
+#[test]
+fn aursnap1_single_register_lexicographical_oracle_and_adversarial_fuzzer() {
+    use gaia_mlx_quant::{
+        AURSNAP1_HEADER_LEN, AURSNAP1_NODE_ENTRY_LEN, AurSnapDecodedNode, AurSnapHeader64,
+        AurSnapIndexView, AurSnapNodeEntry32, wupz_build_aursnap1_image_into,
+        wupz_encode_aursnap1_header_64_into, wupz_encode_aursnap1_node_32_into,
+        wupz_key_prefix_be_u64, wupz_prefix_mask_be_u64,
+    };
+    use std::collections::BTreeMap;
+
+    // 1. Key corpus exercising short keys (<= 8B), exact 8B keys, long keys sharing 8B prefixes,
+    //    and multi-byte UTF-8 keys (Hungarian + Japanese + emoji).
+    let raw_entries: &[(&str, &str, i32, u32, u8, bool)] = &[
+        ("a", "short-1", 100_000, 1_000_000, 0, false),
+        ("ab", "short-2", 200_000, 1_000_000, 1, true),
+        ("abcdefgh", "exact-8", 300_000, 1_000_000, 2, false),
+        ("abcdefgh1", "long-9-a", 400_000, 1_000_000, 3, false),
+        ("abcdefgh12", "long-10-b", 500_000, 1_000_000, 0, true),
+        ("abcdefgh2", "long-9-c", 600_000, 1_000_000, 1, false),
+        ("aurora:core:0", "core-zero", 700_000, 1_000_000, 0, true),
+        ("aurora:core:1", "core-one", 750_000, 1_000_000, 0, false),
+        ("aurora:mem:ep1", "mem-ep-1", 800_000, 1_000_000, 2, false),
+        ("aurora:mem:sem1", "mem-sem-1", 850_000, 1_000_000, 3, true),
+        ("család:otthon", "minden-ahol-otthon", 950_000, 1_000_000, 3, true),
+        ("大黒天:mahakala", "protector-of-hearth", 990_000, 1_000_000, 0, true),
+    ];
+
+    let mut oracle: BTreeMap<&str, (&str, i32, u32, u8, bool)> = BTreeMap::new();
+    for &(k, p, sp, sq, sc, pin) in raw_entries {
+        oracle.insert(k, (p, sp, sq, sc, pin));
+    }
+    let sorted_vec: Vec<(&str, &str, i32, u32, u8, bool)> = oracle
+        .iter()
+        .map(|(&k, &(p, sp, sq, sc, pin))| (k, p, sp, sq, sc, pin))
+        .collect();
+
+    // Verify single-register big-endian prefix isomorphism on all pairs with distinct 8B prefixes
+    for i in 0..sorted_vec.len() {
+        for j in (i + 1)..sorted_vec.len() {
+            let ka = sorted_vec[i].0.as_bytes();
+            let kb = sorted_vec[j].0.as_bytes();
+            let pa = wupz_key_prefix_be_u64(ka);
+            let pb = wupz_key_prefix_be_u64(kb);
+            assert!(pa <= pb, "big-endian u64 prefix must be monotonic with memcmp");
+            if ka[..ka.len().min(8)] != kb[..kb.len().min(8)] {
+                assert!(pa < pb);
+            }
+        }
+    }
+    assert_eq!(wupz_prefix_mask_be_u64(0), 0);
+    assert_eq!(wupz_prefix_mask_be_u64(1), 0xFF00_0000_0000_0000);
+    assert_eq!(wupz_prefix_mask_be_u64(8), u64::MAX);
+    assert_eq!(wupz_prefix_mask_be_u64(15), u64::MAX);
+
+    let mut snap_buf = vec![0u8; 4096];
+    let img_len = wupz_build_aursnap1_image_into(7, &sorted_vec, &mut snap_buf).unwrap();
+    let view = AurSnapIndexView::open(&snap_buf[..img_len]).unwrap();
+    assert_eq!(view.node_count(), sorted_vec.len());
+
+    // Property 1: Exact Lookup Equivalence against BTreeMap Oracle
+    for (&k, &(pay, sp, sq, sc, pin)) in &oracle {
+        let found = view.get_by_id(k).unwrap();
+        assert_eq!(found.node_id, k);
+        assert_eq!(found.payload, pay);
+        assert_eq!(found.salience_p, sp);
+        assert_eq!(found.salience_q, sq);
+        assert_eq!(found.scope_id, sc);
+        assert_eq!(found.pinned, pin);
+    }
+
+    // Property 2: Boundary Miss Safety (< min, > max, short/long prefix collisions)
+    let misses = [
+        "",
+        "0",
+        "aa",
+        "abcdefg",
+        "abcdefgh0",
+        "abcdefgh11",
+        "abcdefgh123",
+        "abcdefgh9",
+        "aurora:core:",
+        "aurora:core:00",
+        "aurora:zzz",
+        "zzzzzzzzzzzz",
+        "大黒天:mahakal",
+        "大黒天:mahakalaz",
+    ];
+    for miss in misses {
+        assert!(
+            view.get_by_id(miss).is_none(),
+            "unexpected hit on missing key {miss:?}"
+        );
+    }
+
+    // Property 3: Prefix Range Equivalence (`scan_prefix_into`) against BTreeMap Oracle
+    let prefixes = [
+        "",
+        "a",
+        "ab",
+        "abcdefgh",
+        "abcdefgh1",
+        "aurora:",
+        "aurora:core:",
+        "aurora:mem:",
+        "család",
+        "大黒天",
+        "nonexistent",
+    ];
+    let dummy_node = AurSnapDecodedNode {
+        node_id: "",
+        payload: "",
+        scope_id: 0,
+        pinned: false,
+        salience_p: 0,
+        salience_q: 1,
+        key_prefix: 0,
+    };
+    for pfx in prefixes {
+        let mut out_scan = [dummy_node; 32];
+        let count = view.scan_prefix_into(pfx, &mut out_scan).unwrap();
+        let expected: Vec<&str> = oracle
+            .keys()
+            .copied()
+            .filter(|k| k.starts_with(pfx))
+            .collect();
+        let actual: Vec<&str> = out_scan[..count].iter().map(|n| n.node_id).collect();
+        assert_eq!(actual, expected, "prefix scan mismatch for {pfx:?}");
+    }
+
+    // Property 4A (Branch 1): Unstructured Raw Byte Stream Fuzzing (never panics)
+    let mut rng = 0xCAFE_BABE_u32;
+    for len in [0usize, 7, 63, 64, 95, 96, 128, 256] {
+        let mut raw = vec![0u8; len];
+        for b in &mut raw {
+            rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
+            *b = (rng >> 24) as u8;
+        }
+        let _ = AurSnapIndexView::open(&raw);
+    }
+
+    // Property 4B (Branch 2): Header-Stamped Adversarial Fuzzing (corrupted offsets & spoofed key_prefix)
+    // Case B1: Spoofed `key_prefix` in node descriptor (claims "abcdefgh" but arena has "zzzzzzzz")
+    let mut spoof_buf = snap_buf[..img_len].to_vec();
+    let entry0_off = AURSNAP1_HEADER_LEN;
+    spoof_buf[entry0_off + 24..entry0_off + 32].copy_from_slice(&u64::MAX.to_be_bytes());
+    let spoof_view = AurSnapIndexView::open(&spoof_buf).unwrap();
+    assert!(
+        spoof_view.decode_node_at(0).is_none(),
+        "spoofed key_prefix must be rejected by decode_node_at"
+    );
+
+    // Case B2: Out-of-bounds `id_off + id_len` (`u32::MAX`) in descriptor
+    let mut oob_buf = [0u8; 128];
+    let hdr = AurSnapHeader64 {
+        version: 1,
+        flags: 0x62,
+        epoch: 1,
+        node_count: 1,
+        expected_file_size: 128,
+        string_arena_offset: (AURSNAP1_HEADER_LEN + AURSNAP1_NODE_ENTRY_LEN) as u64,
+    };
+    wupz_encode_aursnap1_header_64_into(&hdr, &mut oob_buf[..64]).unwrap();
+    let bad_entry = AurSnapNodeEntry32 {
+        salience_p: 100,
+        salience_q: 1000,
+        payload_off: 0,
+        payload_len: 4,
+        id_off: u32::MAX - 2,
+        id_len: 16,
+        scope_id: 0,
+        pinned: 0,
+        digest_prefix: wupz_key_prefix_be_u64(b"test"),
+    };
+    wupz_encode_aursnap1_node_32_into(&bad_entry, &mut oob_buf[64..96]).unwrap();
+    let oob_view = AurSnapIndexView::open(&oob_buf).unwrap();
+    assert!(oob_view.decode_node_at(0).is_none());
+    assert!(oob_view.get_by_id("test_long_key").is_none());
+}
