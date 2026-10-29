@@ -2227,6 +2227,321 @@ pub fn wupz_build_aursnap1_image_into(
     Some(total_size)
 }
 
+/// Header flag indicating 1-Based Eytzinger (BFS Implicit Binary Search Tree) layout (`0x0100 | 0x62 = 0x0162`)
+/// with a 32-byte zeroed sentinel at slot `k = 0` (`bytes 64..96`) so every sibling pair `(2k, 2k+1)`
+/// shares a single 64-byte CPU cache line (`ByteOffset(2k) = 64 * (k + 1)`).
+pub const AURSNAP1_FLAG_EYTZINGER: u32 = 0x0100;
+
+/// Return the 1-based Eytzinger index `k` of the lexicographically smallest element (`sorted_idx = 0`)
+/// in a tree of `n` elements (`0` if `n == 0`).
+#[inline]
+pub const fn wupz_eytzinger_first(n: usize) -> usize {
+    if n == 0 {
+        return 0;
+    }
+    let mut k = 1usize;
+    while (k << 1) <= n {
+        k <<= 1;
+    }
+    k
+}
+
+/// Stackless `O(1)` in-order successor in a 1-based Eytzinger tree of `n` elements (`1..=n`).
+/// Returns `0` when `k` is the maximum element in the tree.
+#[inline]
+pub const fn wupz_eytzinger_next(mut k: usize, n: usize) -> usize {
+    if k == 0 || n == 0 {
+        return 0;
+    }
+    if (k << 1) < n {
+        k = (k << 1) + 1;
+        while (k << 1) <= n {
+            k <<= 1;
+        }
+        k
+    } else {
+        let shift = (!k).trailing_zeros() + 1;
+        if shift >= usize::BITS {
+            0
+        } else {
+            k >> shift
+        }
+    }
+}
+
+/// Zero-copy, `#![no_std]`, zero-allocation **1-Based Eytzinger (BFS) `AURSNAP1` Index View**
+/// where slot `k = 0` (`bytes 64..96`) is a 32-byte sentinel and `k in 1..=node_count` stores the
+/// implicit binary search tree with sibling pairs `(2k, 2k+1)` co-located inside a single 64-byte cache line.
+#[derive(Debug, Clone, Copy)]
+pub struct AurSnapEytzingerView<'a> {
+    pub header: AurSnapHeader64,
+    /// Slice of `(node_count + 1) * 32` bytes (`slot 0` sentinel + `1..=node_count` Eytzinger nodes).
+    index_table: &'a [u8],
+    arena: &'a [u8],
+}
+
+impl<'a> AurSnapEytzingerView<'a> {
+    /// Open and envelope-verify a 1-based Eytzinger `AURSNAP1` snapshot byte slice.
+    pub fn open(data: &'a [u8]) -> Option<Self> {
+        let header = wupz_decode_aursnap1_header_64(data)?;
+        if header.version != 1
+            || (header.flags & AURSNAP1_FLAG_EYTZINGER) == 0
+            || header.expected_file_size != (data.len() as u64)
+        {
+            return None;
+        }
+        let slots = header.node_count.checked_add(1)?;
+        let index_bytes = slots.checked_mul(AURSNAP1_NODE_ENTRY_LEN as u64)?;
+        let expected_arena_off = (AURSNAP1_HEADER_LEN as u64).checked_add(index_bytes)?;
+        if header.string_arena_offset != expected_arena_off
+            || expected_arena_off > header.expected_file_size
+        {
+            return None;
+        }
+        let arena_len_u64 = header.expected_file_size - expected_arena_off;
+        if arena_len_u64 > (u32::MAX as u64) || header.node_count > ((usize::MAX - 1) as u64) {
+            return None;
+        }
+        let arena_off = expected_arena_off as usize;
+        Some(Self {
+            header,
+            index_table: &data[AURSNAP1_HEADER_LEN..arena_off],
+            arena: &data[arena_off..],
+        })
+    }
+
+    /// Number of indexed nodes (`1..=node_count`).
+    #[inline]
+    pub const fn node_count(&self) -> usize {
+        self.header.node_count as usize
+    }
+
+    /// Decode and verify the node at 1-based Eytzinger slot `k` (`1 <= k <= node_count`).
+    pub fn decode_node_at_k(&self, k: usize) -> Option<AurSnapDecodedNode<'a>> {
+        if k == 0 || k > self.node_count() {
+            return None;
+        }
+        let off = k * AURSNAP1_NODE_ENTRY_LEN;
+        let entry = wupz_decode_aursnap1_node_32(
+            &self.index_table[off..off + AURSNAP1_NODE_ENTRY_LEN],
+            self.arena.len() as u32,
+        )?;
+        let id_start = entry.id_off as usize;
+        let id_end = id_start.checked_add(entry.id_len as usize)?;
+        let pay_start = entry.payload_off as usize;
+        let pay_end = pay_start.checked_add(entry.payload_len as usize)?;
+        let id_bytes = self.arena.get(id_start..id_end)?;
+        let pay_bytes = self.arena.get(pay_start..pay_end)?;
+        if wupz_key_prefix_be_u64(id_bytes) != entry.digest_prefix {
+            return None;
+        }
+        let node_id = core::str::from_utf8(id_bytes).ok()?;
+        let payload = core::str::from_utf8(pay_bytes).ok()?;
+        Some(AurSnapDecodedNode {
+            node_id,
+            payload,
+            scope_id: entry.scope_id,
+            pinned: entry.pinned != 0,
+            salience_p: entry.salience_p,
+            salience_q: entry.salience_q,
+            key_prefix: entry.digest_prefix,
+        })
+    }
+
+    #[inline]
+    fn compare_entry_at_k(
+        &self,
+        k: usize,
+        target: &[u8],
+        target_prefix: u64,
+    ) -> Option<core::cmp::Ordering> {
+        let off = k.checked_mul(AURSNAP1_NODE_ENTRY_LEN)?;
+        let row = self.index_table.get(off..off + AURSNAP1_NODE_ENTRY_LEN)?;
+        let entry_prefix = u64::from_be_bytes([
+            row[24], row[25], row[26], row[27], row[28], row[29], row[30], row[31],
+        ]);
+        let id_len = u16::from_le_bytes([row[20], row[21]]) as usize;
+
+        if entry_prefix != target_prefix {
+            return Some(entry_prefix.cmp(&target_prefix));
+        }
+        if id_len <= 8 && target.len() <= 8 {
+            return Some(id_len.cmp(&target.len()));
+        }
+        let id_off = u32::from_le_bytes([row[16], row[17], row[18], row[19]]) as usize;
+        let id_end = id_off.checked_add(id_len)?;
+        let id_bytes = self.arena.get(id_off..id_end)?;
+        if wupz_key_prefix_be_u64(id_bytes) != entry_prefix {
+            return None;
+        }
+        let a_suf = &id_bytes[id_bytes.len().min(8)..];
+        let b_suf = &target[target.len().min(8)..];
+        Some(a_suf.cmp(b_suf))
+    }
+
+    /// 1-Based Eytzinger lower-bound search returning the 1-based slot `k_match` (`0` if all keys `< target`),
+    /// using `k >> ((!k).trailing_zeros() + 1)` bitwise ancestor recovery.
+    pub fn lower_bound_k(&self, target: &[u8]) -> Option<usize> {
+        let n = self.node_count();
+        if n == 0 {
+            return Some(0);
+        }
+        let target_prefix = wupz_key_prefix_be_u64(target);
+        let mut k = 1usize;
+        while k <= n {
+            let cmp = self.compare_entry_at_k(k, target, target_prefix)?;
+            let go_right = usize::from(cmp == core::cmp::Ordering::Less);
+            k = (k << 1) | go_right;
+        }
+        let shift = (!k).trailing_zeros() + 1;
+        let k_match = if shift >= usize::BITS { 0 } else { k >> shift };
+        Some(k_match)
+    }
+
+    /// `O(log N)` Eytzinger exact lookup by `target_key`.
+    pub fn get_by_id(&self, target_key: &str) -> Option<AurSnapDecodedNode<'a>> {
+        let target = target_key.as_bytes();
+        let n = self.node_count();
+        let target_prefix = wupz_key_prefix_be_u64(target);
+        let mut k = 1usize;
+        while k <= n {
+            match self.compare_entry_at_k(k, target, target_prefix)? {
+                core::cmp::Ordering::Less => k = (k << 1) | 1,
+                core::cmp::Ordering::Greater => k <<= 1,
+                core::cmp::Ordering::Equal => {
+                    let node = self.decode_node_at_k(k)?;
+                    if node.node_id.as_bytes() == target {
+                        return Some(node);
+                    }
+                    return None;
+                }
+            }
+        }
+        None
+    }
+
+    /// `O(log N + K)` stackless Eytzinger prefix range scan using `wupz_eytzinger_next(k, n)`
+    /// and register bitmask termination `(entry_prefix & mask) == p_u64`.
+    pub fn scan_prefix_into(
+        &self,
+        prefix: &str,
+        out: &mut [AurSnapDecodedNode<'a>],
+    ) -> Option<usize> {
+        let p_bytes = prefix.as_bytes();
+        let n = self.node_count();
+        let mut k = self.lower_bound_k(p_bytes)?;
+        let p_u64 = wupz_key_prefix_be_u64(p_bytes);
+        let mask = wupz_prefix_mask_be_u64(p_bytes.len());
+        let mut count = 0usize;
+
+        while k != 0 {
+            let off = k * AURSNAP1_NODE_ENTRY_LEN;
+            let row = self.index_table.get(off..off + AURSNAP1_NODE_ENTRY_LEN)?;
+            let entry_prefix = u64::from_be_bytes([
+                row[24], row[25], row[26], row[27], row[28], row[29], row[30], row[31],
+            ]);
+            let id_len = u16::from_le_bytes([row[20], row[21]]) as usize;
+            if (entry_prefix & mask) != p_u64 || id_len < p_bytes.len() {
+                break;
+            }
+            let node = self.decode_node_at_k(k)?;
+            if p_bytes.len() > 8 && !node.node_id.as_bytes().starts_with(p_bytes) {
+                break;
+            }
+            if count < out.len() {
+                out[count] = node;
+            }
+            count += 1;
+            k = wupz_eytzinger_next(k, n);
+        }
+        Some(count)
+    }
+}
+
+/// Zero-allocation, stackless builder that packs pre-sorted `(node_id, payload, salience_p, salience_q, scope_id, pinned)`
+/// tuples into a **1-Based Eytzinger `AURSNAP1` image** inside `out` using `wupz_eytzinger_first` + `wupz_eytzinger_next`
+/// (`0` recursion, `0` heap allocations).
+#[allow(clippy::type_complexity)]
+pub fn wupz_build_aursnap1_eytzinger_into(
+    epoch: u64,
+    sorted_nodes: &[(&str, &str, i32, u32, u8, bool)],
+    out: &mut [u8],
+) -> Option<usize> {
+    let n = sorted_nodes.len();
+    let slots = n.checked_add(1)?;
+    let index_bytes = slots.checked_mul(AURSNAP1_NODE_ENTRY_LEN)?;
+    let arena_off = AURSNAP1_HEADER_LEN.checked_add(index_bytes)?;
+    let mut arena_len = 0usize;
+    let mut i = 0usize;
+    while i < n {
+        if i > 0 && sorted_nodes[i - 1].0.as_bytes() >= sorted_nodes[i].0.as_bytes() {
+            return None;
+        }
+        let id_b = sorted_nodes[i].0.as_bytes();
+        let pay_b = sorted_nodes[i].1.as_bytes();
+        if id_b.len() > (u16::MAX as usize) {
+            return None;
+        }
+        arena_len = arena_len.checked_add(id_b.len())?.checked_add(pay_b.len())?;
+        i += 1;
+    }
+    let total_size = arena_off.checked_add(arena_len)?;
+    if out.len() < total_size || arena_len > (u32::MAX as usize) {
+        return None;
+    }
+
+    let hdr = AurSnapHeader64 {
+        version: 1,
+        flags: 0x62 | AURSNAP1_FLAG_EYTZINGER,
+        epoch,
+        node_count: n as u64,
+        expected_file_size: total_size as u64,
+        string_arena_offset: arena_off as u64,
+    };
+    wupz_encode_aursnap1_header_64_into(&hdr, &mut out[..AURSNAP1_HEADER_LEN])?;
+    // Zero-fill 32-byte sentinel at slot k = 0 (bytes 64..96)
+    out[AURSNAP1_HEADER_LEN..AURSNAP1_HEADER_LEN + AURSNAP1_NODE_ENTRY_LEN].fill(0);
+
+    let mut cur_arena_off = 0usize;
+    let mut k = wupz_eytzinger_first(n);
+    let mut idx = 0usize;
+    while idx < n {
+        if k == 0 || k > n {
+            return None;
+        }
+        let (node_id, payload, sal_p, sal_q, scope_id, pinned) = sorted_nodes[idx];
+        let id_b = node_id.as_bytes();
+        let pay_b = payload.as_bytes();
+        let id_off = cur_arena_off;
+        out[arena_off + id_off..arena_off + id_off + id_b.len()].copy_from_slice(id_b);
+        cur_arena_off += id_b.len();
+        let pay_off = cur_arena_off;
+        out[arena_off + pay_off..arena_off + pay_off + pay_b.len()].copy_from_slice(pay_b);
+        cur_arena_off += pay_b.len();
+
+        let entry = AurSnapNodeEntry32 {
+            salience_p: sal_p,
+            salience_q: sal_q,
+            payload_off: pay_off as u32,
+            payload_len: pay_b.len() as u32,
+            id_off: id_off as u32,
+            id_len: id_b.len() as u16,
+            scope_id,
+            pinned: u8::from(pinned),
+            digest_prefix: wupz_key_prefix_be_u64(id_b),
+        };
+        let entry_off = AURSNAP1_HEADER_LEN + k * AURSNAP1_NODE_ENTRY_LEN;
+        wupz_encode_aursnap1_node_32_into(
+            &entry,
+            &mut out[entry_off..entry_off + AURSNAP1_NODE_ENTRY_LEN],
+        )?;
+        k = wupz_eytzinger_next(k, n);
+        idx += 1;
+    }
+    Some(total_size)
+}
+
+
 
 
 

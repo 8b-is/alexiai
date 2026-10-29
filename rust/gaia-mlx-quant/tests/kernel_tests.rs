@@ -941,4 +941,50 @@ fn aursnap1_single_register_lexicographical_oracle_and_adversarial_fuzzer() {
     let oob_view = AurSnapIndexView::open(&oob_buf).unwrap();
     assert!(oob_view.decode_node_at(0).is_none());
     assert!(oob_view.get_by_id("test_long_key").is_none());
+
+    // Property 5: 1-Based Eytzinger (BFS Implicit Binary Search Tree) Exact Lookup, Misses & Stackless Prefix Scan
+    use gaia_mlx_quant::{
+        AurSnapEytzingerView, wupz_build_aursnap1_eytzinger_into, wupz_eytzinger_first,
+        wupz_eytzinger_next,
+    };
+    let mut eytz_order = Vec::new();
+    let mut cur_k = wupz_eytzinger_first(7);
+    while cur_k != 0 {
+        eytz_order.push(cur_k);
+        cur_k = wupz_eytzinger_next(cur_k, 7);
+    }
+    assert_eq!(eytz_order, vec![4, 2, 5, 1, 6, 3, 7]);
+
+    let mut eytz_buf = vec![0u8; 4096];
+    let eytz_len =
+        wupz_build_aursnap1_eytzinger_into(9, &sorted_vec, &mut eytz_buf).unwrap();
+    let eytz_view = AurSnapEytzingerView::open(&eytz_buf[..eytz_len]).unwrap();
+    assert_eq!(eytz_view.node_count(), sorted_vec.len());
+
+    for (&k, &(pay, sp, sq, sc, pin)) in &oracle {
+        let found = eytz_view.get_by_id(k).unwrap();
+        assert_eq!(found.node_id, k);
+        assert_eq!(found.payload, pay);
+        assert_eq!(found.salience_p, sp);
+        assert_eq!(found.salience_q, sq);
+        assert_eq!(found.scope_id, sc);
+        assert_eq!(found.pinned, pin);
+    }
+    for miss in misses {
+        assert!(
+            eytz_view.get_by_id(miss).is_none(),
+            "unexpected Eytzinger hit on missing key {miss:?}"
+        );
+    }
+    for pfx in prefixes {
+        let mut out_scan = [dummy_node; 32];
+        let count = eytz_view.scan_prefix_into(pfx, &mut out_scan).unwrap();
+        let expected: Vec<&str> = oracle
+            .keys()
+            .copied()
+            .filter(|k| k.starts_with(pfx))
+            .collect();
+        let actual: Vec<&str> = out_scan[..count].iter().map(|n| n.node_id).collect();
+        assert_eq!(actual, expected, "Eytzinger prefix scan mismatch for {pfx:?}");
+    }
 }

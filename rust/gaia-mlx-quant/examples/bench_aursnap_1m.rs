@@ -14,9 +14,10 @@ use std::hint::black_box;
 use std::time::Instant;
 
 use gaia_mlx_quant::{
-    AURSNAP1_HEADER_LEN, AURSNAP1_NODE_ENTRY_LEN, AurSnapDecodedNode, AurSnapHeader64,
-    AurSnapIndexView, AurSnapNodeEntry32, wupz_encode_aursnap1_header_64_into,
-    wupz_encode_aursnap1_node_32_into, wupz_key_prefix_be_u64,
+    AURSNAP1_FLAG_EYTZINGER, AURSNAP1_HEADER_LEN, AURSNAP1_NODE_ENTRY_LEN, AurSnapDecodedNode,
+    AurSnapEytzingerView, AurSnapHeader64, AurSnapIndexView, AurSnapNodeEntry32,
+    wupz_encode_aursnap1_header_64_into, wupz_encode_aursnap1_node_32_into, wupz_eytzinger_first,
+    wupz_eytzinger_next, wupz_key_prefix_be_u64,
 };
 
 const NODE_COUNT: usize = 1_000_000;
@@ -112,6 +113,38 @@ fn build_1m_snapshot(clustered: bool) -> Vec<u8> {
     buf
 }
 
+/// Convert a sorted 1,000,000-node `AURSNAP1` snapshot into a 1-based Eytzinger `AURSNAP1` snapshot
+/// in O(N) time by permuting the 32-byte index entries via `wupz_eytzinger_first` / `wupz_eytzinger_next`.
+fn to_eytzinger_snapshot(sorted_snap: &[u8]) -> Vec<u8> {
+    let index_bytes = NODE_COUNT * AURSNAP1_NODE_ENTRY_LEN;
+    let sorted_arena_off = AURSNAP1_HEADER_LEN + index_bytes;
+    let eyt_arena_off = sorted_arena_off + AURSNAP1_NODE_ENTRY_LEN; // +32B for slot 0 sentinel
+    let total_size = sorted_snap.len() + AURSNAP1_NODE_ENTRY_LEN;
+
+    let mut out = vec![0u8; total_size];
+    let hdr = AurSnapHeader64 {
+        version: 1,
+        flags: 0x62 | AURSNAP1_FLAG_EYTZINGER,
+        epoch: 2026,
+        node_count: NODE_COUNT as u64,
+        expected_file_size: total_size as u64,
+        string_arena_offset: eyt_arena_off as u64,
+    };
+    wupz_encode_aursnap1_header_64_into(&hdr, &mut out[..AURSNAP1_HEADER_LEN]).unwrap();
+
+    let mut k = wupz_eytzinger_first(NODE_COUNT);
+    for sorted_idx in 0..NODE_COUNT {
+        let src_off = AURSNAP1_HEADER_LEN + sorted_idx * AURSNAP1_NODE_ENTRY_LEN;
+        let dst_off = AURSNAP1_HEADER_LEN + k * AURSNAP1_NODE_ENTRY_LEN;
+        out[dst_off..dst_off + AURSNAP1_NODE_ENTRY_LEN]
+            .copy_from_slice(&sorted_snap[src_off..src_off + AURSNAP1_NODE_ENTRY_LEN]);
+        k = wupz_eytzinger_next(k, NODE_COUNT);
+    }
+    assert_eq!(k, 0);
+    out[eyt_arena_off..].copy_from_slice(&sorted_snap[sorted_arena_off..]);
+    out
+}
+
 fn main() {
     println!(
         "AURSNAP1 1,000,000-Node Zero-Copy Binary Search Benchmark (32 MB Index + 88 MB Arena = 120 MB)"
@@ -127,7 +160,9 @@ fn main() {
 
     // ── Workload 1: Distinct 8-Byte Prefixes (1,000,000 nodes) ───────────────
     let snap_distinct = build_1m_snapshot(false);
+    let snap_distinct_eyt = to_eytzinger_snapshot(&snap_distinct);
     let view_distinct = AurSnapIndexView::open(&snap_distinct).unwrap();
+    let view_distinct_eyt = AurSnapEytzingerView::open(&snap_distinct_eyt).unwrap();
     let queries_distinct: Vec<String> = query_indices
         .iter()
         .map(|&idx| {
@@ -141,7 +176,9 @@ fn main() {
     for q in &queries_distinct {
         let a = view_distinct.get_by_id(q).unwrap();
         let b = view_distinct.get_by_id_arena_only(q).unwrap();
+        let c = view_distinct_eyt.get_by_id(q).unwrap();
         assert_eq!(a.node_id, b.node_id);
+        assert_eq!(a.node_id, c.node_id);
     }
 
     let rounds = 8usize;
@@ -153,6 +190,14 @@ fn main() {
     }
     let inline_distinct_ns = t0.elapsed().as_nanos() / ((rounds * QUERY_BATCH) as u128);
 
+    let t0_eyt = Instant::now();
+    for _ in 0..rounds {
+        for q in &queries_distinct {
+            black_box(view_distinct_eyt.get_by_id(black_box(q)).unwrap());
+        }
+    }
+    let eyt_distinct_ns = t0_eyt.elapsed().as_nanos() / ((rounds * QUERY_BATCH) as u128);
+
     let t1 = Instant::now();
     for _ in 0..rounds {
         for q in &queries_distinct {
@@ -163,7 +208,9 @@ fn main() {
 
     // ── Workload 2: Clustered 8-Byte Prefixes (16 keys/cluster, 1,000,000 nodes) ──
     let snap_clustered = build_1m_snapshot(true);
+    let snap_clustered_eyt = to_eytzinger_snapshot(&snap_clustered);
     let view_clustered = AurSnapIndexView::open(&snap_clustered).unwrap();
+    let view_clustered_eyt = AurSnapEytzingerView::open(&snap_clustered_eyt).unwrap();
     let queries_clustered: Vec<String> = query_indices
         .iter()
         .map(|&idx| {
@@ -176,7 +223,9 @@ fn main() {
     for q in &queries_clustered {
         let a = view_clustered.get_by_id(q).unwrap();
         let b = view_clustered.get_by_id_arena_only(q).unwrap();
+        let c = view_clustered_eyt.get_by_id(q).unwrap();
         assert_eq!(a.node_id, b.node_id);
+        assert_eq!(a.node_id, c.node_id);
     }
 
     let t2 = Instant::now();
@@ -186,6 +235,14 @@ fn main() {
         }
     }
     let inline_clustered_ns = t2.elapsed().as_nanos() / ((rounds * QUERY_BATCH) as u128);
+
+    let t2_eyt = Instant::now();
+    for _ in 0..rounds {
+        for q in &queries_clustered {
+            black_box(view_clustered_eyt.get_by_id(black_box(q)).unwrap());
+        }
+    }
+    let eyt_clustered_ns = t2_eyt.elapsed().as_nanos() / ((rounds * QUERY_BATCH) as u128);
 
     let t3 = Instant::now();
     for _ in 0..rounds {
@@ -227,16 +284,20 @@ fn main() {
     let scan_16_ns = t4.elapsed().as_nanos() / ((rounds * QUERY_BATCH) as u128);
 
     let speedup_distinct = (arena_distinct_ns as f64) / (inline_distinct_ns.max(1) as f64);
+    let speedup_eyt_distinct = (arena_distinct_ns as f64) / (eyt_distinct_ns.max(1) as f64);
     let speedup_clustered = (arena_clustered_ns as f64) / (inline_clustered_ns.max(1) as f64);
+    let speedup_eyt_clustered = (arena_clustered_ns as f64) / (eyt_clustered_ns.max(1) as f64);
 
-    println!("  workload                             inline_be_u64   arena_pointer   speedup");
     println!(
-        "  1M distinct 8B prefixes (get_by_id)     {:>7} ns      {:>7} ns     {:>5.2}x",
-        inline_distinct_ns, arena_distinct_ns, speedup_distinct
+        "  workload                             eytzinger_u64   sorted_be_u64   arena_pointer   speedup (eyt / sorted)"
     );
     println!(
-        "  1M 16-key 8B collisions (get_by_id)     {:>7} ns      {:>7} ns     {:>5.2}x",
-        inline_clustered_ns, arena_clustered_ns, speedup_clustered
+        "  1M distinct 8B prefixes (get_by_id)     {:>7} ns      {:>7} ns      {:>7} ns     {:>5.2}x / {:>5.2}x",
+        eyt_distinct_ns, inline_distinct_ns, arena_distinct_ns, speedup_eyt_distinct, speedup_distinct
+    );
+    println!(
+        "  1M 16-key 8B collisions (get_by_id)     {:>7} ns      {:>7} ns      {:>7} ns     {:>5.2}x / {:>5.2}x",
+        eyt_clustered_ns, inline_clustered_ns, arena_clustered_ns, speedup_eyt_clustered, speedup_clustered
     );
     println!(
         "  1M prefix scan (16-node cluster)        {:>7} ns/scan (bitmask termination)",
