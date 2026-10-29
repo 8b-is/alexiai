@@ -551,3 +551,104 @@ fn wupz_seam_quant_tern_and_plan_image_exact() {
     assert!(uoc.seal_verified);
     assert_eq!(&uoc.sealed_frame[..4], b"WUPZ");
 }
+
+/// Deterministic pure-integer generator in `[-q, +q]` (`q = 2^20`), zero floats.
+/// Mirrors the bench so the pinned errors are the published errors.
+fn weights_pq_fixed(n: usize, seed: u32) -> Vec<i32> {
+    use gaia_mlx_quant::PQ_DEFAULT_Q;
+    let mut s = seed;
+    (0..n)
+        .map(|_| {
+            s = s.wrapping_add(0x6d2b79f5);
+            let mut t = s;
+            t = (t ^ (t >> 15)).wrapping_mul(t | 1);
+            t ^= t.wrapping_add((t ^ (t >> 7)).wrapping_mul(t | 61));
+            let u20 = ((t ^ (t >> 14)) >> 12) as i32;
+            (u20 << 1) - (PQ_DEFAULT_Q as i32)
+        })
+        .collect()
+}
+
+/// The fastest kernel is also the least accurate one, and that must stay true.
+///
+/// `quantum-b158-u64` ternary-quantizes the activations *as well as* the
+/// weights, so it composes two lossy projections; `quantum-bitplane4` keeps
+/// 4-bit activations and sits near the weight-only floor. The bench publishes
+/// `0.5818` vs `0.3590` at `256x256`. This pins the ordering and the gap at a
+/// smaller shape so a future kernel change cannot silently invert it.
+#[test]
+fn ternary_activation_kernel_costs_more_error_than_four_bit() {
+    use gaia_mlx_quant::{
+        KERNEL_PQ_Q, dense_matmul_pq_into, pack_quantum_bitplanes_i_major_into,
+        quantize_quantum_bitplane_i4_pq_into, quantize_quantum_ternary_act_pq_into,
+        quantize_ternary_pq_into, quantum_bitplane_i4_matmul_pq_into,
+        quantum_ternary_matmul_pq_into, relative_error_pq_ppm,
+    };
+
+    let rows = 128usize;
+    let cols = 128usize;
+    let q = KERNEL_PQ_Q;
+
+    let w_p = weights_pq_fixed(rows * cols, 0x5eed);
+    let x_p = weights_pq_fixed(rows, 0xc0ffee);
+
+    let mut trits = vec![0i8; rows * cols];
+    let mut scales_p = vec![0i32; rows];
+    quantize_ternary_pq_into(&w_p, rows, cols, q, &mut trits, &mut scales_p);
+
+    let mut dense_pq = vec![0i64; cols];
+    dense_matmul_pq_into(&w_p, rows, cols, &x_p, &mut dense_pq);
+
+    // Activations pre-fused with the row scales, exactly as the bench does.
+    let x_p_scaled: Vec<i32> = x_p
+        .iter()
+        .zip(scales_p.iter())
+        .map(|(&xv, &sv)| (((xv as i64) * (sv as i64)) / (q as i64)) as i32)
+        .collect();
+
+    let mut w_pos = vec![0u64; cols * rows.div_ceil(64)];
+    let mut w_neg = vec![0u64; cols * rows.div_ceil(64)];
+    pack_quantum_bitplanes_i_major_into(&trits, rows, cols, &mut w_pos, &mut w_neg);
+
+    let words = rows.div_ceil(64);
+    let mut x_pos = vec![0u64; words];
+    let mut x_neg = vec![0u64; words];
+    let scale_tern = quantize_quantum_ternary_act_pq_into(&x_p_scaled, &mut x_pos, &mut x_neg);
+
+    let mut x_sign = vec![0u64; words];
+    let mut x_b0 = vec![0u64; words];
+    let mut x_b1 = vec![0u64; words];
+    let mut x_b2 = vec![0u64; words];
+    let mut scale_i4 = vec![0i32; words];
+    quantize_quantum_bitplane_i4_pq_into(
+        &x_p_scaled,
+        &mut x_sign,
+        &mut x_b0,
+        &mut x_b1,
+        &mut x_b2,
+        &mut scale_i4,
+    );
+
+    let to_q2 = |v: &[i64]| -> Vec<i64> { v.iter().map(|&x| x * (q as i64)).collect() };
+
+    let mut out_tern = vec![0i64; cols];
+    quantum_ternary_matmul_pq_into(
+        &w_pos, &w_neg, rows, cols, &x_pos, &x_neg, scale_tern, None, q, &mut out_tern,
+    );
+    let mut out_i4 = vec![0i64; cols];
+    quantum_bitplane_i4_matmul_pq_into(
+        &w_pos, &w_neg, rows, cols, &x_sign, &x_b0, &x_b1, &x_b2, &scale_i4, &mut out_i4,
+    );
+
+    let ppm_tern = relative_error_pq_ppm(&to_q2(&out_tern), &dense_pq);
+    let ppm_i4 = relative_error_pq_ppm(&to_q2(&out_i4), &dense_pq);
+
+    // Both are lossy on adversarial random weights; neither may be exact.
+    assert!(ppm_tern > 100_000, "ternary activations: {ppm_tern} ppm");
+    assert!(ppm_i4 > 100_000, "4-bit activations: {ppm_i4} ppm");
+    // The ordering is the published claim: two ternary projections cost more.
+    assert!(
+        ppm_tern > ppm_i4,
+        "ternary-activation error ({ppm_tern} ppm) must exceed 4-bit ({ppm_i4} ppm)"
+    );
+}

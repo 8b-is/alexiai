@@ -179,7 +179,7 @@ fn main() {
         rows,
         cols,
         &m_x_pq_i8,
-        None,
+        Some(&scale_x_pq_i8),
         &mut pq_omni_bfp_i8,
     );
     ternary_bfp_i8_matmul_into(
@@ -253,7 +253,7 @@ fn main() {
             rows,
             cols,
             black_box(&m_x_pq_i8),
-            None,
+            Some(black_box(&scale_x_pq_i8)),
             black_box(&mut pq_omni_bfp_i8),
         );
     });
@@ -366,18 +366,109 @@ fn main() {
     let wupz_fold = wupz_xor_fold(&packed_i);
     let wupz_pop = wupz_popcount(&packed_i);
     let wupz_qt_active = wupz_bitplane_popcount_u64(&w_pos_u64, &w_neg_u64);
-    let pq_b158_scaled: Vec<i64> = pq_b158_i
-        .iter()
-        .map(|&v| v * (KERNEL_PQ_Q as i64))
-        .collect();
-    let err_ppm = relative_error_pq_ppm(&pq_b158_scaled, &dense_pq);
-    let speedup_quantum_u64 = (dense_ns as f64) / (quantum_u64_ns.max(1) as f64);
-    let speedup_quantum_i4 = (dense_ns as f64) / (quantum_i4_ns.max(1) as f64);
-    let speedup_omni_bfp = (dense_ns as f64) / (omni_bfp_i8_ns.max(1) as f64);
-    let speedup_bfp_i8 = (dense_ns as f64) / (bfp_i8_ns.max(1) as f64);
-    let speedup_simd = (dense_ns as f64) / (pq_simd_ns.max(1) as f64);
 
-    println!("GAIA-MLX-QUANT v0.3.0 bench — ULTRA-SUPER-OMNI-Quantum Ternary, wupz & p/q pure-integer");
+    // ---- references -------------------------------------------------------
+    // `dense` (f64) and `dense_pq` (i64, Q^2 units) cover the (rows x cols) -> cols
+    // orientation. `pq-group64` is the transposed orientation
+    // (`p_out[n] = sum_g scales[n,g] * dot(codes, x)`), so it needs its own reference.
+    let mut dense_g64_pq = vec![0i64; rows];
+    for r in 0..rows {
+        let mut acc: i128 = 0;
+        for c in 0..aligned_cols {
+            acc += (w_p_al[r * aligned_cols + c] as i128) * (x_p_al[c] as i128);
+        }
+        dense_g64_pq[r] = acc as i64;
+    }
+
+    let q_scale = KERNEL_PQ_Q as i64;
+    let to_q2 = |v: &[i64]| -> Vec<i64> { v.iter().map(|&x| x * q_scale).collect() };
+    let rel_pq = |v: &[i64], reference: &[i64]| -> f64 {
+        relative_error_pq_ppm(&to_q2(v), reference) as f64 / 1_000_000.0
+    };
+
+    // Every timed kernel reports a measured error against the reference it is
+    // actually comparable to. No row is permitted to report speed alone: a
+    // speedup without an accuracy figure is a cherry-pick.
+    let table: Vec<(&str, u128, f64, &str)> = vec![
+        ("dense", dense_ns, 0.0, "f64, auto-vectorized reference"),
+        (
+            "quantum-b158-u64",
+            quantum_u64_ns,
+            rel_pq(&pq_quantum_u64, &dense_pq),
+            "64-trit POPCNT 8-col, 0 floats, ternary W x TERNARY A (hence the higher error)",
+        ),
+        (
+            "quantum-bitplane4",
+            quantum_i4_ns,
+            rel_pq(&pq_quantum_i4, &dense_pq),
+            "W1.58 x A4-bitplane POPCNT 4-col, 0 floats, ternary W x 4-bit A",
+        ),
+        (
+            "omni-bfp-i8-pq",
+            omni_bfp_i8_ns,
+            rel_pq(&pq_omni_bfp_i8, &dense_pq),
+            "i8xi8->i16 4-col SIMD, 0 floats, block scales applied",
+        ),
+        (
+            "bfp-i8-4col",
+            bfp_i8_ns,
+            relative_error(&bfp_i8_out, &dense),
+            "i8xi8->i16 64-group 4-col BFP-64 SIMD",
+        ),
+        (
+            "pq-simd-i8",
+            pq_simd_ns,
+            rel_pq(&pq_simd, &dense_pq),
+            "i8xi32->i32 4-col NEON/AVX2 SIMD, 0 floats",
+        ),
+        (
+            "pq-planes",
+            pq_planes_ns,
+            rel_pq(&pq_planes, &dense_pq),
+            "i8 sign-planes 4-col p/q integer, 0 floats",
+        ),
+        (
+            "pq-group64",
+            pq_g64_ns,
+            relative_error_pq_ppm(&pq_g64, &dense_g64_pq) as f64 / 1_000_000.0,
+            "16-trit/u32 4-row MLX_BYTE_TRITS_I32, 0 floats, transposed",
+        ),
+        (
+            "pq-b158-i",
+            pq_b158_i_ns,
+            rel_pq(&pq_b158_i, &dense_pq),
+            "5-trits/byte 4-col BYTE_TRITS_I32, 0 floats",
+        ),
+        (
+            "pq-b158-j",
+            pq_b158_j_ns,
+            rel_pq(&pq_b158_j, &dense_pq),
+            "5-trits/byte j-major BYTE_TRITS_I32, 0 floats",
+        ),
+        (
+            "planes",
+            planes_ns,
+            relative_error(&ternary_p, &dense),
+            "i8 sign planes, pre-fused row scales",
+        ),
+        (
+            "packed-i",
+            ternary_i_ns,
+            relative_error(&ternary_i, &dense),
+            "5-trits/byte LUT path, unguarded interior",
+        ),
+        (
+            "packed-j",
+            ternary_j_ns,
+            relative_error(&ternary, &dense),
+            "j-major, JS-parity layout",
+        ),
+    ];
+
+    println!(
+        "GAIA-MLX-QUANT v{} bench — ULTRA-SUPER-OMNI-Quantum Ternary, wupz & p/q pure-integer",
+        env!("CARGO_PKG_VERSION")
+    );
     println!(
         "  field             seed {} · dominant {:?} · coherence {:.4}",
         field.seed, field.dominant, field.coherence
@@ -400,31 +491,25 @@ fn main() {
         (w.len() * 8) as f64 / packed_i.len() as f64,
         MLX_GROUP64_COMPRESSION,
     );
-    println!("  dense             {dense_ns:>7} ns/iter  (f64, auto-vectorized reference)");
+    println!("  kernel             ns/iter  vs dense     rel-L2        ppm  notes");
+    let mut worst: (f64, &str) = (0.0, "dense");
+    for (name, ns, rel, note) in &table {
+        // The ratio is printed for every row, including the ones slower than the
+        // f64 dense reference. A table that only labels its wins is not honest.
+        let ratio = (dense_ns as f64) / (*ns as f64).max(1.0);
+        let ppm = (rel * 1_000_000.0).round() as u64;
+        println!(
+            "  {:<17}{:>9}  {:>8.2}x  {:>8.4}  {:>9}  {}",
+            name, ns, ratio, rel, ppm, note
+        );
+        if *rel > worst.0 {
+            worst = (*rel, name);
+        }
+    }
     println!(
-        "  quantum-b158-u64  {quantum_u64_ns:>7} ns/iter  (64-trit POPCNT 8-col 512 MACs/step, 0 floats, {speedup_quantum_u64:.2}x vs dense)"
-    );
-    println!(
-        "  quantum-bitplane4 {quantum_i4_ns:>7} ns/iter  (W1.58×A4-bitplane POPCNT 4-col, 0 floats, {speedup_quantum_i4:.2}x vs dense)"
-    );
-    println!(
-        "  omni-bfp-i8-pq    {omni_bfp_i8_ns:>7} ns/iter  (i8×i8->i16 256-chunk 4-col SIMD, 0 floats, {speedup_omni_bfp:.2}x vs dense)"
-    );
-    println!(
-        "  bfp-i8-4col       {bfp_i8_ns:>7} ns/iter  (i8×i8->i16 64-group 4-col BFP-64 SIMD, {speedup_bfp_i8:.2}x vs dense)"
-    );
-    println!(
-        "  pq-simd-i8        {pq_simd_ns:>7} ns/iter  (i8×i32->i32 4-col NEON/AVX2 SIMD, 0 floats, {speedup_simd:.2}x vs dense)"
-    );
-    println!("  pq-planes         {pq_planes_ns:>7} ns/iter  (i8 sign-planes 4-col p/q integer, 0 floats)");
-    println!("  pq-group64        {pq_g64_ns:>7} ns/iter  (16-trit/u32 4-row MLX_BYTE_TRITS_I32, 0 floats)");
-    println!("  pq-b158-i         {pq_b158_i_ns:>7} ns/iter  (5-trits/byte 4-col BYTE_TRITS_I32, 0 floats)");
-    println!("  pq-b158-j         {pq_b158_j_ns:>7} ns/iter  (5-trits/byte j-major BYTE_TRITS_I32, 0 floats)");
-    println!("  planes            {planes_ns:>7} ns/iter  (i8 sign planes, pre-fused row scales)");
-    println!("  packed-i          {ternary_i_ns:>7} ns/iter  (5-trits/byte LUT path, unguarded interior)");
-    println!("  packed-j          {ternary_j_ns:>7} ns/iter  (j-major, JS-parity layout)");
-    println!(
-        "  error             {:.4} relative L2 vs dense ({err_ppm} ppm pure-integer isqrt_u128)",
-        relative_error(&ternary_p, &dense)
+        "  worst-case        {:.4} relative L2 ({} ppm) on `{}` — the largest reconstruction error of any kernel above",
+        worst.0,
+        (worst.0 * 1_000_000.0).round() as u64,
+        worst.1
     );
 }

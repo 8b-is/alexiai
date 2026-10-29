@@ -44,11 +44,15 @@ cargo test --manifest-path rust/Cargo.toml   # 64 Rust tests: core + pure-intege
 go test ./...                                # the Go lane (go/)
 make -C c test bench                         # C99 + NEON/SSE4.1 integer SIMD asm (c/)
 swift test --package-path swift              # Swift kernel + CoreMIDI (swift/)
+#   on a CommandLineTools-only host there is no XCTest.framework, so SwiftPM falls
+#   through to swift-testing and needs its macro plugin path spelled out:
+#   swift test --package-path swift -Xswiftc -plugin-path \
+#     -Xswiftc /Library/Developer/CommandLineTools/usr/lib/swift/host/plugins/testing
 ```
 
 | lane | role | guarantees |
 |---|---|---|
-| `rust/` | the app + the core (`v0.3.0`) | `#![forbid(unsafe_code)]`, `no_std` core, **ULTRA-SUPER-OMNI-Quantum Ternary (`0.88 µs` at `256×256`, `11.87×`–`14.11×` over dense FP64) & 100% float-free `p/q` integer substrate (`q = 2^20`)**, zero-alloc proven by a counting allocator |
+| `rust/` | the app + the core (`v0.5.0`) | `#![forbid(unsafe_code)]`, `no_std` core, **ULTRA-SUPER-OMNI-Quantum Ternary (`0.88 µs` at `256×256`, `11.87×`–`14.11×` over dense FP64) & 100% float-free `p/q` integer substrate (`q = 2^20`)**, zero-alloc proven by a counting allocator |
 | `go/` | the glue + a second opinion | stdlib-only supervisor, allocation-lean `p/q` integer, ternary & 64-trit quantum bitplane (`math/bits.OnesCount64`) kernel |
 | `c/` | C99 + inline assembly | NEON (`cnt`/`smlal` + `sxtl` + `mla.4s`) and SSE4.1 (`popcnt`/`pmullw` + `pmulld`) **integer & quantum bitplane SIMD (`0` floats, up to `17.63×` vs dense FP64)**, proven against the C reference |
 | `swift/` | OS-agnostic kernel + macOS CoreMIDI | pure-Swift `p/q` integer, ternary & quantum bitplane (`.nonzeroBitCount`) core runs on Linux; the CoreMIDI lane ports the OpenXTalk-Apple-CoreMIDI surface |
@@ -126,7 +130,7 @@ is the honesty of this project: on adversarial random weights, ternary
 reconstruction is lossy by design; on the ternary-shaped weights a trained
 b1.58 model actually has, the projection is tight (`< 0.34`, pinned by test).
 
-## 🦀 The Rust lane — `rust/gaia-mlx-quant` (`v0.3.0` · ULTRA-SUPER-OMNI-Quantum Ternary & Pure-Integer `p/q` Substrate)
+## 🦀 The Rust lane — `rust/gaia-mlx-quant` (`v0.5.0` · ULTRA-SUPER-OMNI-Quantum Ternary & Pure-Integer `p/q` Substrate)
 
 The same substrate, native: **SOTA bleeding-edge Rust, zero `unsafe`, zero
 allocations, zero floating-point operations in the quantum bitplane & `p/q` integer core, 100%
@@ -134,7 +138,7 @@ Linux + macOS** — every one of those words enforced, not asserted:
 
 ```bash
 cd rust
-cargo test                                    # 67 tests: round-trips, quantum bitplane + p/q kernels, zero-alloc proof
+cargo test                                    # 64 tests: round-trips, quantum bitplane + p/q kernels, zero-alloc proof
 cargo clippy --all-targets                    # zero warnings
 cargo build --no-default-features             # pure core: #![no_std], no deps at all
 cargo run --release --example bench -- --dim 256
@@ -154,18 +158,37 @@ cargo run --release --example bench -- --dim 1024
 
 By pairing **64-trit Quantum Bitplane Superposition (`quantum-b158-u64`)**, **4-Column `i8 × i8 -> i16` 16-Wide SIMD (`omni-bfp-i8-pq`)**, **W1.58 × A4-Bitplane Multi-Slice Contraction (`quantum-bitplane4`)**, and **32-bit Chunked Associative SIMD (`pq-simd-i8` / `bfp-i8-4col`)**, `gaia-mlx-quant` breaks through the traditional scalar/FMA ceiling in 100% safe `#![forbid(unsafe_code)]` Rust and C99 inline assembly — **reaching sub-microsecond `877 ns/iter` (`74.7 GMAC/s`, `11.87×` over dense FP64) in safe Rust and `758 ns/iter` (`86.5 GMAC/s`, `13.44×` over dense FP64 at `256×256`; `9,830 ns/iter`, `106.7 GMAC/s`, `17.63×` over dense FP64 at `1024×1024`) in C99 with zero floating-point operations**:
 
-| Kernel | `256×256` (`ns/iter`) | `512×512` (`ns/iter`) | `1024×1024` (`ns/iter`) | Floats | Peak Speedup vs Dense `f64` |
-|:---|---:|---:|---:|:---:|:---:|
-| `packed-j` (baseline 5-trits/byte `j`-major) | `35,480 ns` | `151,123 ns` | `1,001,671 ns` | `f64` | `0.29×` |
-| `dense` (`f64` auto-vectorized FMA reference) | `10,411 ns` | `41,196 ns` | `175,863 ns` | `f64` | `1.00×` |
-| **`quantum-b158-u64`** (`quantum_ternary_matmul_pq_into`, 64-trit POPCNT) | **`877 ns`** | **`2,920 ns`** | **`14,531 ns`** | **`0`** | **`14.11×` (`89.8 GMAC/s`)** |
-| **`omni-bfp-i8-pq`** (`omni_bfp_i8_simd_pq_into`, 4-col `i8×i8->i16` 16-wide SIMD) | **`1,014 ns`** | **`4,254 ns`** | **`16,762 ns`** | **`0`** | **`10.49×` (`64.6 GMAC/s`)** |
-| **`quantum-bitplane4`** (`quantum_bitplane_i4_matmul_pq_into`, W1.58×A4-bitplane POPCNT) | **`1,696 ns`** | **`6,107 ns`** | **`23,211 ns`** | **`0`** | **`7.58×` (`45.2 GMAC/s`)** |
-| **`bfp-i8-4col`** (`ternary_bfp_i8_matmul_into`, MEM\|8 BFP-64 `i8` + exp) | **`2,195 ns`** | **`9,472 ns`** | **`34,884 ns`** | **`0`** | **`5.04×`** |
-| **`pq-simd-i8`** (`ternary_simd_i8_pq_into`, 4-col 29-bit `i8×i32->i32` SIMD) | **`4,144 ns`** | **`16,000 ns`** | **`64,412 ns`** | **`0`** | **`2.73×`** |
-| **`c/bench` `cpu quantum-u64`** (`gmq_quantum_bitplane_matmul_pq`, 8-col POPCNT) | **`758 ns`** | — | **`9,830 ns`** | **`0`** | **`17.63×` (`106.7 GMAC/s`)** |
-| **`c/bench` `cpu omni-bfp-i8`** (`gmq_omni_bfp_i8_matmul_pq`, 4-col NEON `smlal`/`smlal2`) | **`892 ns`** | — | **`28,159 ns`** | **`0`** | **`11.42×` (`73.5 GMAC/s`)** |
-| **`c/bench` `cpu pq-simd`** (`gmq_ternary_matmul_pq_simd`, inline NEON/SSE4.1 `i8×i32`) | **`3,655 ns`** | — | **`75,479 ns`** | **`0`** | **`2.79×`** |
+| Kernel | `256×256` (`ns/iter`) | `512×512` (`ns/iter`) | `1024×1024` (`ns/iter`) | Floats | Peak Speedup vs Dense `f64` | Measured `rel-L2` vs dense |
+|:---|---:|---:|---:|:---:|:---:|---:|
+| `packed-j` (baseline 5-trits/byte `j`-major) | `35,480 ns` | `151,123 ns` | `1,001,671 ns` | `f64` | `0.29×` | `0.3550` |
+| `dense` (`f64` auto-vectorized FMA reference) | `10,411 ns` | `41,196 ns` | `175,863 ns` | `f64` | `1.00×` | `0` (reference) |
+| **`quantum-b158-u64`** (`quantum_ternary_matmul_pq_into`, 64-trit POPCNT) | **`877 ns`** | **`2,920 ns`** | **`14,531 ns`** | **`0`** | **`14.11×` (`89.8 GMAC/s`)** | **`0.5818`** ⚠︎ |
+| **`omni-bfp-i8-pq`** (`omni_bfp_i8_simd_pq_into`, 4-col `i8×i8->i16` 16-wide SIMD) | **`1,014 ns`** | **`4,254 ns`** | **`16,762 ns`** | **`0`** | **`10.49×` (`64.6 GMAC/s`)** | `0.3553` |
+| **`quantum-bitplane4`** (`quantum_bitplane_i4_matmul_pq_into`, W1.58×A4-bitplane POPCNT) | **`1,696 ns`** | **`6,107 ns`** | **`23,211 ns`** | **`0`** | **`7.58×` (`45.2 GMAC/s`)** | `0.3590` |
+| **`bfp-i8-4col`** (`ternary_bfp_i8_matmul_into`, MEM\|8 BFP-64 `i8` + exp) | **`2,195 ns`** | **`9,472 ns`** | **`34,884 ns`** | **`0`** | **`5.04×`** | `0.3552` |
+| **`pq-simd-i8`** (`ternary_simd_i8_pq_into`, 4-col 29-bit `i8×i32->i32` SIMD) | **`4,144 ns`** | **`16,000 ns`** | **`64,412 ns`** | **`0`** | **`2.73×`** | `0.3550` |
+| **`c/bench` `cpu quantum-u64`** (`gmq_quantum_bitplane_matmul_pq`, 8-col POPCNT) | **`758 ns`** | — | **`9,830 ns`** | **`0`** | **`17.63×` (`106.7 GMAC/s`)** | not measured in this pass |
+| **`c/bench` `cpu omni-bfp-i8`** (`gmq_omni_bfp_i8_matmul_pq`, 4-col NEON `smlal`/`smlal2`) | **`892 ns`** | — | **`28,159 ns`** | **`0`** | **`11.42×` (`73.5 GMAC/s`)** | not measured in this pass |
+| **`c/bench` `cpu pq-simd`** (`gmq_ternary_matmul_pq_simd`, inline NEON/SSE4.1 `i8×i32`) | **`3,655 ns`** | — | **`75,479 ns`** | **`0`** | **`2.79×`** | not measured in this pass |
+
+`rel-L2` is the whole point of the last column, and it is the column that does
+not move: the timing figures above are host-specific (they vary run to run with
+thermals and scheduler noise — the dense reference alone has been observed
+anywhere from `10.4 µs` to `28.8 µs` at `256×256` on this machine), while the
+error figures are **bit-identical on every run**, because they are pure integer
+arithmetic on fixed seeds. Reproduce them with
+`cargo run --release -p gaia-mlx-quant --example bench`, which now prints a
+ratio *and* a measured error for **every** kernel row plus the worst case, so no
+row can advertise speed alone.
+
+⚠︎ **`quantum-b158-u64` is the fastest kernel and the least accurate one.** It
+quantizes the *activations* to ternary as well as the weights
+(`quantize_quantum_ternary_act_pq_into`), so its `0.5818` is roughly
+`sqrt(0.355^2 + 0.355^2)` — the weight-only-ternary floor of `0.3550` composed
+with a second ternary projection. `quantum-bitplane4` keeps 4-bit activations
+and lands at `0.3590`, i.e. essentially the weight-only floor. Pick between them
+on accuracy budget, not on `ns/iter` alone: the `8×`–`14×` headline belongs to
+the kernel that costs `64%` more reconstruction error.
 
 The bithacks, in order of appearance:
 

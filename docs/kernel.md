@@ -39,13 +39,37 @@ float64 so long columns never drift.
 
 ## honesty
 
-The bench reports *measured* error, including the worst case. On adversarial
-random weights a single projection is lossy by design (≈ 0.4–0.5 relative
-error, uniform or Gaussian — this is true of one-shot absmean ternary, and it
-is why b1.58 models are *trained* into ternary-shaped weights rather than
-quantized once and shipped). On ternary-shaped weights the projection is
-tight (< 0.34, pinned by test). This document exists so the number is never
-misread as a marketing claim.
+The bench reports *measured* error for **every** kernel row, plus the worst
+case, and it prints a `vs dense` ratio for every row too — including the rows
+slower than the `f64` reference (`planes` at `0.21×`, `packed-i` at `0.13×`).
+A row is not allowed to advertise speed without an accuracy figure next to it.
+
+Measured at `256×256` on fixed seeds (`0x5eed` weights, `0xc0ffee`
+activations), these numbers are **bit-identical on every run** — they are pure
+integer arithmetic, so unlike `ns/iter` they do not drift with thermals:
+
+| what is quantized | measured `rel-L2` | kernels |
+|:---|---:|:---|
+| weights only (one ternary projection) | `0.3550` | `pq-b158-i/j`, `planes`, `packed-i/j`, `pq-simd-i8`, `pq-planes` |
+| weights + `i8` block-float activations | `0.3552`–`0.3553` | `bfp-i8-4col`, `omni-bfp-i8-pq` |
+| weights + 4-bit activations | `0.3590` | `quantum-bitplane4` |
+| weights + group-64 codes | `0.3788` | `pq-group64` |
+| **weights + ternary activations (two projections)** | **`0.5818`** | **`quantum-b158-u64`** |
+
+On adversarial random weights a single projection is lossy by design — this is
+true of one-shot absmean ternary, and it is why b1.58 models are *trained* into
+ternary-shaped weights rather than quantized once and shipped. On
+ternary-shaped weights the projection is tight (`< 0.34`, pinned by test).
+
+The row that needs the caveat is the fastest one. `quantum-b158-u64` carries
+the `8×`–`14×` headline **and** the worst error, because it ternary-quantizes
+the activations as well as the weights: `0.5818 ≈ sqrt(0.355² + 0.355²)`, i.e.
+the weight-only floor composed with a second ternary projection. If the accuracy
+budget does not allow that, `quantum-bitplane4` keeps 4-bit activations and
+lands at `0.3590` — essentially the weight-only floor — for roughly half the
+throughput. Choose on error, then on `ns/iter`; never the reverse.
+
+This document exists so the number is never misread as a marketing claim.
 
 ## the native lane
 
@@ -110,7 +134,7 @@ while ensuring exact trit assignment ($\{-1, 0, +1\}$) without rounding noise.
 ### 5. Four-Tier Quantum & Associative SIMD Hierarchy (`11.87×`–`17.63×` Over Dense FP64, `0` Floats)
 In safe Rust (`#![forbid(unsafe_code)]`), IEEE-754 non-associativity prevents
 LLVM from reordering floating-point additions, and ARM64 baseline NEON lacks a
-64-bit integer vector multiply (`mul.2d`). In `v0.3.0`, `gaia-mlx-quant` provides
+64-bit integer vector multiply (`mul.2d`). In `v0.5.0`, `gaia-mlx-quant` provides
 four complementary zero-float integer tiers:
 
 1. **Tier 0 — 64-Trit Quantum Bitplane Superposition (`quantum_ternary_matmul_pq_into` / `gmq_quantum_bitplane_matmul_pq`)**:
