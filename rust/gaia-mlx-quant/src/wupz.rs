@@ -1652,6 +1652,252 @@ pub fn wupz_decode_snap_header_128(buf: &[u8]) -> Option<WupzWalStateRecord> {
     })
 }
 
+// ============================================================================
+// REACHTION PACKET (`wa-stream` 64B Reactive Multi-Agent Graph) & `AURSNAP1`
+// ============================================================================
+
+/// 64-byte `wa-stream` Reactive Multi-Agent Graph packet (`ReachtionPacket`).
+///
+/// Packs the agent's thinking trace into disjoint `BFP-64` bitplanes and attaches
+/// a `p/q` rational cross-reaction latency + 64-bit `wupz_xor_fold` seal at gate `0x62`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReachtionPacket {
+    pub msg_id: u64,
+    pub participant_bits: u32,
+    pub qt_byte: u8,
+    pub gate: u8,
+    pub abi_version: u8,
+    pub lanes_active: u8,
+    pub thought_bfp64_pos: u64,
+    pub thought_bfp64_neg: u64,
+    pub reaction_latency_p: u32,
+    pub reaction_latency_q: u32,
+    pub reaction_matrix: [u8; 16],
+    pub seal: u64,
+}
+
+/// Seal a `ReachtionPacket` into a 64-byte wire buffer (`out[..64]`) so that
+/// `wupz_xor_fold(&out[..64]) == 0` (`#Commit = #ValidWitness`).
+#[allow(clippy::too_many_arguments)]
+pub fn wupz_seal_reachtion_packet(
+    msg_id: u64,
+    participant_bits: u32,
+    qt_byte: u8,
+    lanes_active: u8,
+    thought_bytes: &[u8],
+    reaction_latency_p: u32,
+    reaction_latency_q: u32,
+    reaction_matrix: [u8; 16],
+    out: &mut [u8; 64],
+) -> ReachtionPacket {
+    let thought_fold = wupz_xor_fold(thought_bytes);
+    let qt_mask = (qt_byte as u64).wrapping_mul(0x0101_0101_0101_0101);
+    let thought_bfp64_pos = thought_fold & qt_mask;
+    let thought_bfp64_neg = thought_fold & !qt_mask;
+    let q_safe = reaction_latency_q.max(1);
+
+    out[0..8].copy_from_slice(&msg_id.to_le_bytes());
+    out[8..12].copy_from_slice(&participant_bits.to_le_bytes());
+    out[12] = qt_byte;
+    out[13] = 0x62;
+    out[14] = WUPZ_ABI_VERSION as u8;
+    out[15] = lanes_active;
+    out[16..24].copy_from_slice(&thought_bfp64_pos.to_le_bytes());
+    out[24..32].copy_from_slice(&thought_bfp64_neg.to_le_bytes());
+    out[32..36].copy_from_slice(&reaction_latency_p.to_le_bytes());
+    out[36..40].copy_from_slice(&q_safe.to_le_bytes());
+    out[40..56].copy_from_slice(&reaction_matrix);
+    let seal = wupz_xor_fold(&out[0..56]);
+    out[56..64].copy_from_slice(&seal.to_le_bytes());
+
+    ReachtionPacket {
+        msg_id,
+        participant_bits,
+        qt_byte,
+        gate: 0x62,
+        abi_version: WUPZ_ABI_VERSION as u8,
+        lanes_active,
+        thought_bfp64_pos,
+        thought_bfp64_neg,
+        reaction_latency_p,
+        reaction_latency_q: q_safe,
+        reaction_matrix,
+        seal,
+    }
+}
+
+/// Verify and decode a 64-byte `ReachtionPacket` wire frame (`wupz_xor_fold(buf) == 0`).
+pub fn wupz_verify_reachtion_packet(buf: &[u8; 64]) -> Option<ReachtionPacket> {
+    if wupz_xor_fold(buf) != 0 || buf[13] != 0x62 {
+        return None;
+    }
+    let thought_bfp64_pos = u64::from_le_bytes([
+        buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23],
+    ]);
+    let thought_bfp64_neg = u64::from_le_bytes([
+        buf[24], buf[25], buf[26], buf[27], buf[28], buf[29], buf[30], buf[31],
+    ]);
+    if (thought_bfp64_pos & thought_bfp64_neg) != 0 {
+        return None;
+    }
+    let reaction_latency_q = u32::from_le_bytes([buf[36], buf[37], buf[38], buf[39]]);
+    if reaction_latency_q == 0 {
+        return None;
+    }
+    let mut reaction_matrix = [0u8; 16];
+    reaction_matrix.copy_from_slice(&buf[40..56]);
+    Some(ReachtionPacket {
+        msg_id: u64::from_le_bytes([buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]]),
+        participant_bits: u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]),
+        qt_byte: buf[12],
+        gate: buf[13],
+        abi_version: buf[14],
+        lanes_active: buf[15],
+        thought_bfp64_pos,
+        thought_bfp64_neg,
+        reaction_latency_p: u32::from_le_bytes([buf[32], buf[33], buf[34], buf[35]]),
+        reaction_latency_q,
+        reaction_matrix,
+        seal: u64::from_le_bytes([
+            buf[56], buf[57], buf[58], buf[59], buf[60], buf[61], buf[62], buf[63],
+        ]),
+    })
+}
+
+/// Magic bytes for the `AURSNAP1` Zero-Copy Flat Binary Snapshot Header (`"AURSNAP1"`).
+pub const AURSNAP1_MAGIC: [u8; 8] = *b"AURSNAP1";
+/// Fixed 64-byte header size for `AURSNAP1` zero-copy `mmap` snapshots.
+pub const AURSNAP1_HEADER_LEN: usize = 64;
+/// Fixed 32-byte node index entry size for `AURSNAP1` zero-copy `mmap` snapshots.
+pub const AURSNAP1_NODE_ENTRY_LEN: usize = 32;
+
+/// 64-byte `AURSNAP1` Zero-Copy Flat Binary Snapshot Header (`#![no_std]`, 0 floats).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AurSnapHeader64 {
+    pub version: u32,
+    pub flags: u32,
+    pub epoch: u64,
+    pub node_count: u64,
+    pub expected_file_size: u64,
+    pub string_arena_offset: u64,
+}
+
+/// 32-byte `AURSNAP1` Zero-Copy Node Index Entry using a zero-float `p/q` fixed-point pair
+/// (`salience_p: i32`, `salience_q: u32`) instead of `f64`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AurSnapNodeEntry32 {
+    pub salience_p: i32,
+    pub salience_q: u32,
+    pub payload_off: u32,
+    pub payload_len: u32,
+    pub id_off: u32,
+    pub id_len: u16,
+    pub scope_id: u8,
+    pub pinned: u8,
+    pub digest_prefix: u64,
+}
+
+/// Encode `AurSnapHeader64` into a 64-byte buffer (`out[..64]`), sealing bytes `0..56`
+/// with `wupz_xor_fold` in bytes `56..64`.
+pub fn wupz_encode_aursnap1_header_64_into(hdr: &AurSnapHeader64, out: &mut [u8]) -> Option<u64> {
+    if out.len() < AURSNAP1_HEADER_LEN {
+        return None;
+    }
+    out[..AURSNAP1_HEADER_LEN].fill(0);
+    out[0..8].copy_from_slice(&AURSNAP1_MAGIC);
+    out[8..12].copy_from_slice(&hdr.version.to_le_bytes());
+    out[12..16].copy_from_slice(&hdr.flags.to_le_bytes());
+    out[16..24].copy_from_slice(&hdr.epoch.to_le_bytes());
+    out[24..32].copy_from_slice(&hdr.node_count.to_le_bytes());
+    out[32..40].copy_from_slice(&hdr.expected_file_size.to_le_bytes());
+    out[40..48].copy_from_slice(&hdr.string_arena_offset.to_le_bytes());
+    let crc = wupz_crc32c(&out[0..48]);
+    out[48..52].copy_from_slice(&crc.to_le_bytes());
+    out[52] = 0x62;
+    out[53] = 0x55;
+    out[54] = 8;
+    out[55] = 8;
+    let fold = wupz_xor_fold(&out[0..56]);
+    out[56..64].copy_from_slice(&fold.to_le_bytes());
+    Some(fold)
+}
+
+/// Verify and decode a 64-byte `AURSNAP1` header (`buf[..64]`), enforcing pre-map envelope invariants.
+pub fn wupz_decode_aursnap1_header_64(buf: &[u8]) -> Option<AurSnapHeader64> {
+    if buf.len() < AURSNAP1_HEADER_LEN || buf[0..8] != AURSNAP1_MAGIC {
+        return None;
+    }
+    let crc_expected = u32::from_le_bytes([buf[48], buf[49], buf[50], buf[51]]);
+    if wupz_crc32c(&buf[0..48]) != crc_expected || wupz_xor_fold(&buf[0..64]) != 0 {
+        return None;
+    }
+    Some(AurSnapHeader64 {
+        version: u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]),
+        flags: u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]),
+        epoch: u64::from_le_bytes([buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23]]),
+        node_count: u64::from_le_bytes([buf[24], buf[25], buf[26], buf[27], buf[28], buf[29], buf[30], buf[31]]),
+        expected_file_size: u64::from_le_bytes([
+            buf[32], buf[33], buf[34], buf[35], buf[36], buf[37], buf[38], buf[39],
+        ]),
+        string_arena_offset: u64::from_le_bytes([
+            buf[40], buf[41], buf[42], buf[43], buf[44], buf[45], buf[46], buf[47],
+        ]),
+    })
+}
+
+/// Encode a 32-byte `AurSnapNodeEntry32` (`salience_p / salience_q` zero-float `p/q` pair) into `out[..32]`.
+pub fn wupz_encode_aursnap1_node_32_into(entry: &AurSnapNodeEntry32, out: &mut [u8]) -> Option<()> {
+    if out.len() < AURSNAP1_NODE_ENTRY_LEN || entry.salience_q == 0 {
+        return None;
+    }
+    out[0..4].copy_from_slice(&entry.salience_p.to_le_bytes());
+    out[4..8].copy_from_slice(&entry.salience_q.to_le_bytes());
+    out[8..12].copy_from_slice(&entry.payload_off.to_le_bytes());
+    out[12..16].copy_from_slice(&entry.payload_len.to_le_bytes());
+    out[16..20].copy_from_slice(&entry.id_off.to_le_bytes());
+    out[20..22].copy_from_slice(&entry.id_len.to_le_bytes());
+    out[22] = entry.scope_id;
+    out[23] = entry.pinned;
+    out[24..32].copy_from_slice(&entry.digest_prefix.to_le_bytes());
+    Some(())
+}
+
+/// Decode a 32-byte `AurSnapNodeEntry32` from `buf[..32]` and validate its arena bounds against `arena_len`.
+pub fn wupz_decode_aursnap1_node_32(buf: &[u8], arena_len: u32) -> Option<AurSnapNodeEntry32> {
+    if buf.len() < AURSNAP1_NODE_ENTRY_LEN {
+        return None;
+    }
+    let salience_p = i32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    let salience_q = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    if salience_q == 0 {
+        return None;
+    }
+    let payload_off = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+    let payload_len = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
+    let id_off = u32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]);
+    let id_len = u16::from_le_bytes([buf[20], buf[21]]);
+    if payload_off.checked_add(payload_len)? > arena_len
+        || id_off.checked_add(id_len as u32)? > arena_len
+    {
+        return None;
+    }
+    Some(AurSnapNodeEntry32 {
+        salience_p,
+        salience_q,
+        payload_off,
+        payload_len,
+        id_off,
+        id_len,
+        scope_id: buf[22],
+        pinned: buf[23],
+        digest_prefix: u64::from_le_bytes([
+            buf[24], buf[25], buf[26], buf[27], buf[28], buf[29], buf[30], buf[31],
+        ]),
+    })
+}
+
+
 
 
 

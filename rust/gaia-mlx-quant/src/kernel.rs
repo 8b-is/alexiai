@@ -1150,6 +1150,197 @@ pub fn quantum_bitplane_i4_matmul_pq_into(
     }
 }
 
+/// Quantize integer activation vector `p_x` (`rows` elements) into 64-wide **7-bit symmetric
+/// BFP-64 quantum bitplanes** (`x_sign_u64` and `x_mag_planes_u64: &mut [[u64; 7]]`, representing
+/// $m_k \in [-127, +127]$) plus per-64-element integer scale `p_block_scales[w] = (max_abs + 63) / 127`.
+///
+/// Preserves the full 8-bit BFP-64 activation dynamic range while decomposing each 64-element
+/// block into 7 binary magnitude planes ($2^0 \dots 2^6$) for `POPCNT` bitplane contraction.
+/// Zero floating-point operations and zero heap allocations.
+#[inline]
+pub fn quantize_quantum_bfp64_bitplanes_pq_into(
+    p_x: &[i32],
+    x_sign_u64: &mut [u64],
+    x_mag_planes_u64: &mut [[u64; 7]],
+    p_block_scales: &mut [i32],
+) {
+    let n = p_x.len();
+    let words = n.div_ceil(64);
+    debug_assert!(x_sign_u64.len() >= words);
+    debug_assert!(x_mag_planes_u64.len() >= words);
+    debug_assert!(p_block_scales.len() >= words);
+
+    for w in 0..words {
+        let j_start = w * 64;
+        let j_end = (j_start + 64).min(n);
+        let group = &p_x[j_start..j_end];
+        let mut max_abs: i64 = 0;
+        for &v in group {
+            let a = (v as i64).abs();
+            if a > max_abs {
+                max_abs = a;
+            }
+        }
+        if max_abs == 0 {
+            x_sign_u64[w] = 0;
+            x_mag_planes_u64[w] = [0u64; 7];
+            p_block_scales[w] = 0;
+            continue;
+        }
+        let step = ((max_abs + 63) / 127).max(1);
+        p_block_scales[w] = step.clamp(1, i32::MAX as i64) as i32;
+
+        let mut sign_mask: u64 = 0;
+        let mut planes = [0u64; 7];
+        let half = step >> 1;
+
+        for (bit_idx, &v_i32) in group.iter().enumerate() {
+            let v = v_i32 as i64;
+            let mag = ((v.abs() + half) / step).min(127) as u8;
+            if mag != 0 {
+                let bit = 1u64 << bit_idx;
+                if v < 0 {
+                    sign_mask |= bit;
+                }
+                let mut bit_p = 0usize;
+                while bit_p < 7 {
+                    if (mag & (1u8 << bit_p)) != 0 {
+                        planes[bit_p] |= bit;
+                    }
+                    bit_p += 1;
+                }
+            }
+        }
+        x_sign_u64[w] = sign_mask;
+        x_mag_planes_u64[w] = planes;
+    }
+}
+
+/// **Tier 1.5: `quantum_bfp64_hybrid_matmul_pq_into`** — W1.58 × A8 (`BFP-64`) Hybrid Bitplane
+/// Quantum Contraction (`0` floats, `0` inner-loop multipliers, `0.3553` weight-only L2 floor).
+///
+/// Contracts 64-trit weight bitplanes `(w_pos_u64, w_neg_u64)` against 7 binary magnitude bitplanes
+/// (`x_mag_planes_u64[w][0..7]`) and sign plane `x_sign_u64[w]` via hardware `count_ones()` (`POPCNT`)
+/// weighted by $2^0 \dots 2^6$ and scaled once per 64-element block by `p_block_scales[w]`.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub fn quantum_bfp64_hybrid_matmul_pq_into(
+    w_pos_u64: &[u64],
+    w_neg_u64: &[u64],
+    rows: usize,
+    cols: usize,
+    x_sign_u64: &[u64],
+    x_mag_planes_u64: &[[u64; 7]],
+    p_block_scales: &[i32],
+    p_out: &mut [i64],
+) {
+    let words = rows.div_ceil(64);
+    debug_assert!(w_pos_u64.len() >= cols * words);
+    debug_assert!(w_neg_u64.len() >= cols * words);
+    debug_assert!(x_sign_u64.len() >= words);
+    debug_assert!(x_mag_planes_u64.len() >= words);
+    debug_assert!(p_block_scales.len() >= words);
+    debug_assert!(p_out.len() >= cols);
+
+    let sc_slice = &p_block_scales[..words];
+    let s_slice = &x_sign_u64[..words];
+    let mp_slice = &x_mag_planes_u64[..words];
+
+    let mut i = 0usize;
+    while i + 4 <= cols {
+        let wp0 = &w_pos_u64[i * words..(i + 1) * words];
+        let wn0 = &w_neg_u64[i * words..(i + 1) * words];
+        let wp1 = &w_pos_u64[(i + 1) * words..(i + 2) * words];
+        let wn1 = &w_neg_u64[(i + 1) * words..(i + 2) * words];
+        let wp2 = &w_pos_u64[(i + 2) * words..(i + 3) * words];
+        let wn2 = &w_neg_u64[(i + 2) * words..(i + 3) * words];
+        let wp3 = &w_pos_u64[(i + 3) * words..(i + 4) * words];
+        let wn3 = &w_neg_u64[(i + 3) * words..(i + 4) * words];
+
+        let mut acc0: i64 = 0;
+        let mut acc1: i64 = 0;
+        let mut acc2: i64 = 0;
+        let mut acc3: i64 = 0;
+
+        for w in 0..words {
+            let scale = sc_slice[w] as i64;
+            if scale == 0 {
+                continue;
+            }
+            let s = s_slice[w];
+            let ns = !s;
+            let b = &mp_slice[w];
+
+            let ep0 = (wp0[w] & ns) | (wn0[w] & s);
+            let en0 = (wp0[w] & s) | (wn0[w] & ns);
+            let ep1 = (wp1[w] & ns) | (wn1[w] & s);
+            let en1 = (wp1[w] & s) | (wn1[w] & ns);
+            let ep2 = (wp2[w] & ns) | (wn2[w] & s);
+            let en2 = (wp2[w] & s) | (wn2[w] & ns);
+            let ep3 = (wp3[w] & ns) | (wn3[w] & s);
+            let en3 = (wp3[w] & s) | (wn3[w] & ns);
+
+            let mut d0: i32 = 0;
+            let mut d1: i32 = 0;
+            let mut d2: i32 = 0;
+            let mut d3: i32 = 0;
+
+            let mut bit = 0usize;
+            while bit < 7 {
+                let plane = b[bit];
+                d0 += (((ep0 & plane).count_ones() as i32) - ((en0 & plane).count_ones() as i32))
+                    << bit;
+                d1 += (((ep1 & plane).count_ones() as i32) - ((en1 & plane).count_ones() as i32))
+                    << bit;
+                d2 += (((ep2 & plane).count_ones() as i32) - ((en2 & plane).count_ones() as i32))
+                    << bit;
+                d3 += (((ep3 & plane).count_ones() as i32) - ((en3 & plane).count_ones() as i32))
+                    << bit;
+                bit += 1;
+            }
+
+            acc0 += (d0 as i64) * scale;
+            acc1 += (d1 as i64) * scale;
+            acc2 += (d2 as i64) * scale;
+            acc3 += (d3 as i64) * scale;
+        }
+
+        p_out[i] = acc0;
+        p_out[i + 1] = acc1;
+        p_out[i + 2] = acc2;
+        p_out[i + 3] = acc3;
+        i += 4;
+    }
+
+    while i < cols {
+        let wp = &w_pos_u64[i * words..(i + 1) * words];
+        let wn = &w_neg_u64[i * words..(i + 1) * words];
+        let mut col_acc: i64 = 0;
+        for w in 0..words {
+            let scale = sc_slice[w] as i64;
+            if scale == 0 {
+                continue;
+            }
+            let s = s_slice[w];
+            let ns = !s;
+            let ep = (wp[w] & ns) | (wn[w] & s);
+            let en = (wp[w] & s) | (wn[w] & ns);
+            let b = &mp_slice[w];
+            let mut d: i32 = 0;
+            let mut bit = 0usize;
+            while bit < 7 {
+                let plane = b[bit];
+                d += (((ep & plane).count_ones() as i32) - ((en & plane).count_ones() as i32))
+                    << bit;
+                bit += 1;
+            }
+            col_acc += (d as i64) * scale;
+        }
+        p_out[i] = col_acc;
+        i += 1;
+    }
+}
+
 /// **Tier 2: `omni_bfp_i8_simd_pq_into`** — 4-Column Register-Blocked `i8 × i8 -> i16`
 /// Pure-Integer SIMD Kernel (`0` floating-point operations, `0` heap allocations).
 ///

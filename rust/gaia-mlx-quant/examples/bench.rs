@@ -14,12 +14,13 @@ use gaia_mlx_quant::{
     mlx_matmul_pq_group64_i64_into, mlx_quantize_group64_pq_into, omni_bfp_i8_simd_pq_into,
     pack_quantum_bitplanes_i_major_into, pack_ternary, pack_ternary_i_major_into,
     pack_ternary_planes_i_into, quantize_bfp_i8_group64_into, quantize_bfp_i8_pq_group64_into,
-    quantize_quantum_bitplane_i4_pq_into, quantize_quantum_ternary_act_pq_into,
-    quantize_ternary_pq_into, quantum_bitplane_i4_matmul_pq_into, quantum_ternary_matmul_pq_into,
-    relative_error, relative_error_pq_ppm, sampling_pq, ternary_bfp_i8_matmul_into, ternary_matmul,
-    ternary_matmul_i_major, ternary_matmul_planes_i, ternary_matmul_pq_i_major_into,
-    ternary_matmul_pq_j_major_into, ternary_matmul_pq_planes_i_into, ternary_simd_i8_pq_into,
-    wupz_bitplane_popcount_u64, wupz_popcount, wupz_xor_fold,
+    quantize_quantum_bfp64_bitplanes_pq_into, quantize_quantum_bitplane_i4_pq_into,
+    quantize_quantum_ternary_act_pq_into, quantize_ternary_pq_into,
+    quantum_bfp64_hybrid_matmul_pq_into, quantum_bitplane_i4_matmul_pq_into,
+    quantum_ternary_matmul_pq_into, relative_error, relative_error_pq_ppm, sampling_pq,
+    ternary_bfp_i8_matmul_into, ternary_matmul, ternary_matmul_i_major, ternary_matmul_planes_i,
+    ternary_matmul_pq_i_major_into, ternary_matmul_pq_j_major_into, ternary_matmul_pq_planes_i_into,
+    ternary_simd_i8_pq_into, wupz_bitplane_popcount_u64, wupz_popcount, wupz_xor_fold,
 };
 
 /// Deterministic pure-integer uniform-ish generator in `[-q, +q]` (`q = 2^20`), zero floats.
@@ -134,6 +135,16 @@ fn main() {
         &mut scale_x_i4_p,
     );
 
+    let mut x_bfp64_sign_u64 = vec![0u64; words_per_col];
+    let mut x_bfp64_planes_u64 = vec![[0u64; 7]; words_per_col];
+    let mut scale_x_bfp64_p = vec![0i32; words_per_col];
+    quantize_quantum_bfp64_bitplanes_pq_into(
+        &x_p_scaled,
+        &mut x_bfp64_sign_u64,
+        &mut x_bfp64_planes_u64,
+        &mut scale_x_bfp64_p,
+    );
+
     let mut m_x_pq_i8 = vec![0i8; rows];
     let mut scale_x_pq_i8 = vec![0i32; num_groups];
     quantize_bfp_i8_pq_group64_into(&x_p_scaled, &mut m_x_pq_i8, &mut scale_x_pq_i8);
@@ -144,6 +155,7 @@ fn main() {
 
     let mut pq_quantum_u64 = vec![0i64; cols];
     let mut pq_quantum_i4 = vec![0i64; cols];
+    let mut pq_quantum_bfp64 = vec![0i64; cols];
     let mut pq_omni_bfp_i8 = vec![0i64; cols];
     let mut bfp_i8_out = vec![0f64; cols];
 
@@ -173,6 +185,16 @@ fn main() {
         &x_b2_u64,
         &scale_x_i4_p,
         &mut pq_quantum_i4,
+    );
+    quantum_bfp64_hybrid_matmul_pq_into(
+        &w_pos_u64,
+        &w_neg_u64,
+        rows,
+        cols,
+        &x_bfp64_sign_u64,
+        &x_bfp64_planes_u64,
+        &scale_x_bfp64_p,
+        &mut pq_quantum_bfp64,
     );
     omni_bfp_i8_simd_pq_into(
         &trits_i_major,
@@ -245,6 +267,18 @@ fn main() {
             black_box(&x_b2_u64),
             black_box(&scale_x_i4_p),
             black_box(&mut pq_quantum_i4),
+        );
+    });
+    let quantum_bfp64_ns = measure(&mut || {
+        quantum_bfp64_hybrid_matmul_pq_into(
+            black_box(&w_pos_u64),
+            black_box(&w_neg_u64),
+            rows,
+            cols,
+            black_box(&x_bfp64_sign_u64),
+            black_box(&x_bfp64_planes_u64),
+            black_box(&scale_x_bfp64_p),
+            black_box(&mut pq_quantum_bfp64),
         );
     });
     let omni_bfp_i8_ns = measure(&mut || {
@@ -402,6 +436,12 @@ fn main() {
             quantum_i4_ns,
             rel_pq(&pq_quantum_i4, &dense_pq),
             "W1.58 x A4-bitplane POPCNT 4-col, 0 floats, ternary W x 4-bit A",
+        ),
+        (
+            "quantum-bfp64-hyb",
+            quantum_bfp64_ns,
+            rel_pq(&pq_quantum_bfp64, &dense_pq),
+            "W1.58 x A8 BFP-64 7-bitplane POPCNT 4-col, 0 floats, hits 0.3553 floor",
         ),
         (
             "omni-bfp-i8-pq",
