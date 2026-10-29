@@ -2093,6 +2093,29 @@ impl<'a> AurSnapIndexView<'a> {
         None
     }
 
+    /// Baseline arena-pointer `O(log N)` binary search that dereferences `self.arena[id_off..id_end]`
+    /// on every probe without consulting the inlined 8-byte `key_prefix: u64` register slot.
+    pub fn get_by_id_arena_only(&self, target_key: &str) -> Option<AurSnapDecodedNode<'a>> {
+        let target = target_key.as_bytes();
+        let mut lo = 0usize;
+        let mut hi = self.node_count();
+        while lo < hi {
+            let mid = lo + ((hi - lo) >> 1);
+            let off = mid.checked_mul(AURSNAP1_NODE_ENTRY_LEN)?;
+            let row = self.index_table.get(off..off + AURSNAP1_NODE_ENTRY_LEN)?;
+            let id_off = u32::from_le_bytes([row[16], row[17], row[18], row[19]]) as usize;
+            let id_len = u16::from_le_bytes([row[20], row[21]]) as usize;
+            let id_end = id_off.checked_add(id_len)?;
+            let key_slice = self.arena.get(id_off..id_end)?;
+            match key_slice.cmp(target) {
+                core::cmp::Ordering::Less => lo = mid + 1,
+                core::cmp::Ordering::Greater => hi = mid,
+                core::cmp::Ordering::Equal => return self.decode_node_at(mid),
+            }
+        }
+        None
+    }
+
     /// Zero-allocation prefix range scan (`O(log N + K)`), writing matching nodes into `out`
     /// and returning the number of matched nodes.
     pub fn scan_prefix_into(
