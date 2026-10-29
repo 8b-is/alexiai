@@ -40,7 +40,7 @@ and it is a complete, fully offline assistant.
 ### the lanes, all speaking one math
 
 ```bash
-cargo test --manifest-path rust/Cargo.toml   # 64 Rust tests: core + pure-integer p/q + the app
+cargo test --manifest-path rust/Cargo.toml   # 67 Rust tests: core + pure-integer p/q + the app
 go test ./...                                # the Go lane (go/)
 make -C c test bench                         # C99 + NEON/SSE4.1 integer SIMD asm (c/)
 swift test --package-path swift              # Swift kernel + CoreMIDI (swift/)
@@ -138,7 +138,8 @@ Linux + macOS** — every one of those words enforced, not asserted:
 
 ```bash
 cd rust
-cargo test                                    # 64 tests: round-trips, quantum bitplane + p/q kernels, zero-alloc proof
+cargo test                                    # 67 tests (50 core + 17 app): round-trips, quantum
+                                              # bitplane + p/q kernels, zero-alloc proof, sovereignty
 cargo clippy --all-targets                    # zero warnings
 cargo build --no-default-features             # pure core: #![no_std], no deps at all
 cargo run --release --example bench -- --dim 256
