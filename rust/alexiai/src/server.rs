@@ -940,7 +940,86 @@ fn handle_connection(mut stream: std::net::TcpStream, adapter: &Osarous) -> Resu
             }
         }
         ("POST", "/api/chat") => handle_chat(&mut stream, adapter, &body),
+        ("POST", "/v1/chat/completions") => handle_v1_chat_completions(&mut stream, adapter, &body),
         _ => write_response(&mut stream, 404, "application/json", br#"{"error":"no route"}"#),
+    }
+}
+
+fn handle_v1_chat_completions(stream: &mut std::net::TcpStream, adapter: &Osarous, body: &str) -> Result<(), String> {
+    use crate::osarous::serde_json_lite::parse_json;
+    use crate::osarous::Message;
+
+    let parsed = parse_json(body).ok();
+    let requested_model = parsed
+        .as_ref()
+        .and_then(|v| v.get("model").and_then(|m| m.as_str()));
+    let model = adapter.resolve_model(requested_model);
+
+    let mut messages: Vec<Message> = parsed
+        .as_ref()
+        .and_then(|v| v.get("messages").and_then(|m| m.as_array()).cloned())
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|r| {
+                    Some(Message {
+                        role: r.get("role")?.as_str()?.to_string(),
+                        content: r.get("content")?.as_str()?.to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if messages.is_empty() {
+        let prompt = parsed
+            .as_ref()
+            .and_then(|v| v.get("prompt").and_then(|p| p.as_str()).map(String::from))
+            .unwrap_or_default();
+        messages.push(Message {
+            role: "user".into(),
+            content: prompt,
+        });
+    }
+
+    let last_user = messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .map(|m| m.content.clone())
+        .unwrap_or_default();
+    if let Ok(mem8_run) = mcp::call_tool("mem8_archive_recall", &last_user)
+        && let Some(last_msg) = messages.iter_mut().rev().find(|m| m.role == "user")
+    {
+        last_msg.content = format!(
+            "{}\n\n[MEM|8 Relevant Context (16384 window)]:\n{}",
+            last_msg.content, mem8_run.output
+        );
+    }
+
+    let f = fold(&last_user, None);
+    let s = sampling(&f);
+    let sampling_params = crate::osarous::SamplingParams {
+        temperature: s.temperature,
+        top_p: s.top_p,
+        top_k: s.top_k,
+        seed: s.seed,
+    };
+
+    match adapter.complete(&model, &messages, Some(sampling_params)) {
+        Ok((text, _usage, finish)) => {
+            let fin = if finish.is_empty() { "stop" } else { &finish };
+            let json = format!(
+                r#"{{"id":"chatcmpl-alexiai","object":"chat.completion","model":{},"choices":[{{"index":0,"message":{{"role":"assistant","content":{}}},"finish_reason":{}}}]}}"#,
+                json_escape_text(&model),
+                json_escape_text(&text),
+                json_escape_text(fin),
+            );
+            write_response(stream, 200, "application/json", json.as_bytes())
+        }
+        Err(e) => {
+            let json = format!(r#"{{"ok":false,"error":{}}}"#, json_escape_text(&e));
+            write_response(stream, 503, "application/json", json.as_bytes())
+        }
     }
 }
 

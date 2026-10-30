@@ -1567,19 +1567,35 @@ pub fn auto_ground_prompt_with_history(
     history: &[crate::osarous::Message],
 ) -> Vec<McpToolRun> {
     let mut runs = auto_ground_prompt(prompt);
-    if !runs.is_empty() {
-        return runs;
+    if runs.is_empty() {
+        // If current prompt didn't trigger a tool directly (e.g., "yes please", "go ahead",
+        // "how can we improve it?", "what should we fix in it?"), inspect recent history
+        // for any workspace repository or symbol mentioned in the last 4 messages!
+        for msg in history.iter().rev().take(4) {
+            if let Some(repo_path) = extract_repo_or_path(&msg.content)
+                && let Ok(run) = call_tool("repo_inspect", &repo_path)
+            {
+                runs.push(run);
+                break;
+            }
+        }
     }
 
-    // If current prompt didn't trigger a tool directly (e.g., "yes please", "go ahead",
-    // "how can we improve it?", "what should we fix in it?"), inspect recent history
-    // for any workspace repository or symbol mentioned in the last 4 messages!
-    for msg in history.iter().rev().take(4) {
-        if let Some(repo_path) = extract_repo_or_path(&msg.content)
-            && let Ok(run) = call_tool("repo_inspect", &repo_path)
+    // Keep the 16,384-token context relevant at all times using our 3 µs full-corpus MEM|8 recall
+    if !runs.iter().any(|r| r.tool == "mem8_archive_recall") {
+        let recall_query = if prompt.trim().len() >= 4 {
+            prompt.trim().to_string()
+        } else {
+            history
+                .iter()
+                .rev()
+                .find_map(|m| (m.content.trim().len() >= 4).then(|| m.content.trim().to_string()))
+                .unwrap_or_else(|| prompt.trim().to_string())
+        };
+        if !recall_query.is_empty()
+            && let Ok(mem8_run) = call_tool("mem8_archive_recall", &recall_query)
         {
-            runs.push(run);
-            return runs;
+            runs.push(mem8_run);
         }
     }
 

@@ -18,8 +18,8 @@ pub const OLLAMA_BASE_URL: &str = "http://127.0.0.1:11434";
 pub const OLLAMA_MACBOOK_BRIDGE_URL: &str = "http://127.0.0.1:11435";
 /// Sovereign loopback SSH bridge to cheet.is RTX 6000 Ada Ollama (`127.0.0.1:11436 -> cheet.is 127.0.0.1:11434`).
 pub const OLLAMA_CHEET_BRIDGE_URL: &str = "http://127.0.0.1:11436";
-/// Advertised context window when a model does not declare one.
-pub const DEFAULT_CONTEXT_WINDOW: u64 = 262144;
+/// Advertised context window when a model does not declare one (16,384 tokens kept relevant by MEM|8).
+pub const DEFAULT_CONTEXT_WINDOW: u64 = 16384;
 
 /// Probe loopback endpoints (`127.0.0.1:1337`, `127.0.0.1:11436`, `127.0.0.1:11435`, then `127.0.0.1:11434`) so
 /// osarous/LM Studio, bridged cheet.is RTX 6000 Ada Ollama (`gemma4:26b` / `qwen3.6:35b` / `aye-deepseek:32b`),
@@ -110,6 +110,8 @@ impl Osarous {
         if let Some(m) = preferred
             && !m.is_empty()
             && m != "local-model"
+            && m != "alexiai"
+            && m != "alexiai-gaia-b158"
         {
             return m.to_string();
         }
@@ -242,10 +244,11 @@ impl Osarous {
             .map(|m| format!(r#"{{"role":"{}","content":{}}}"#, m.role, json_escape(&m.content)))
             .collect();
         let mut body = format!(
-            r#"{{"model":"{}","messages":[{}],"stream":{}"#,
+            r#"{{"model":"{}","messages":[{}],"stream":{},"reasoning_effort":"none","options":{{"num_ctx":{}}}"#,
             model,
             msgs.join(","),
-            stream
+            stream,
+            DEFAULT_CONTEXT_WINDOW
         );
         if let Some(s) = sampling {
             body.push_str(&format!(
