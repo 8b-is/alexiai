@@ -2765,4 +2765,378 @@ pub fn ternary_bfp_adaptive_mem8_matmul_into(
     }
 }
 
+// =========================================================================
+// 8. MEM|8 ASSOCIATIVE WAVE SHADER: 24B WaveMemoryCell & 16B RationalWaveCell
+// =========================================================================
 
+/// 24-Byte Hybrid Continuous-Discrete Wave Memory Cell (`WaveMemoryCell`).
+///
+/// Combines a 12-byte continuous IEEE-754 wave manifold (`frequency`, `amplitude`, `phase`)
+/// with a 4-byte discrete visual/topological matrix (`color: [u8; 3]`, `shape: u8`) and a
+/// 1-byte balanced-ternary contraction gate (`quant: i8` in `{-1, 0, +1}`), aligned to
+/// 8 bytes (`24` bytes total, `2.66` structs per 64-byte cache line).
+#[repr(C, align(8))]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WaveMemoryCell {
+    /// Continuous wave frequency (4 bytes).
+    pub frequency: f32,
+    /// Continuous wave amplitude (4 bytes).
+    pub amplitude: f32,
+    /// Continuous wave phase offset in radians (4 bytes).
+    pub phase: f32,
+    /// RGB semantic sentiment & domain vector (3 bytes).
+    pub color: [u8; 3],
+    /// Topological envelope / morphological wave shape enum (1 byte).
+    pub shape: u8,
+    /// Balanced-ternary contraction weight `{-1, 0, +1}` (1 byte + 7 bytes alignment padding = 24 bytes).
+    pub quant: i8,
+}
+
+const _: () = assert!(core::mem::size_of::<WaveMemoryCell>() == 24);
+const _: () = assert!(core::mem::align_of::<WaveMemoryCell>() == 8);
+
+impl WaveMemoryCell {
+    /// Construct a 24-byte [`WaveMemoryCell`].
+    #[inline]
+    pub const fn new(
+        frequency: f32,
+        amplitude: f32,
+        phase: f32,
+        color: [u8; 3],
+        shape: u8,
+        quant: i8,
+    ) -> Self {
+        Self {
+            frequency,
+            amplitude,
+            phase,
+            color,
+            shape,
+            quant,
+        }
+    }
+}
+
+/// 16-Byte Pure-Integer `p/q` Rational Wave Memory Cell (`RationalWaveCell`).
+///
+/// Replaces IEEE-754 floats with `u16` rational pairs (`p/q`), packs RGB into 16-bit
+/// `RGB565`, and packs the 14-bit `shape` (8-bit `shape_id` + signed 6-bit `magnitude_octave`)
+/// alongside the 2-bit balanced-ternary `quant` gate (`{-1, 0, +1}`) into `shape_and_quant`.
+///
+/// Fits in a single 128-bit SIMD register (`16` bytes, `align(16)`, zero padding,
+/// `4.0` structs per 64-byte cache line).
+#[repr(C, align(16))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RationalWaveCell {
+    // 12 bytes: The p/q Wave Manifold (Numerators and Denominators)
+    pub freq_p: u16,
+    pub freq_q: u16,
+    pub amp_p: u16,
+    pub amp_q: u16,
+    pub phase_p: u16,
+    pub phase_q: u16,
+    // 2 bytes: RGB565 packed format (5 bits R, 6 bits G, 5 bits B)
+    pub color: u16,
+    // 2 bytes: [14 bits: Shape/Topology + Octave Magnitude] [2 bits: Quantizer {-1, 0, 1}]
+    pub shape_and_quant: u16,
+}
+
+const _: () = assert!(core::mem::size_of::<RationalWaveCell>() == 16);
+const _: () = assert!(core::mem::align_of::<RationalWaveCell>() == 16);
+
+impl RationalWaveCell {
+    /// Construct a 16-byte [`RationalWaveCell`] with explicit `shape` (`14`-bit) and `quant` (`{-1, 0, +1}`).
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new(
+        freq_p: u16,
+        freq_q: u16,
+        amp_p: u16,
+        amp_q: u16,
+        phase_p: u16,
+        phase_q: u16,
+        color: u16,
+        shape: u16,
+        quant: i8,
+    ) -> Self {
+        Self {
+            freq_p,
+            freq_q: if freq_q == 0 { 1 } else { freq_q },
+            amp_p,
+            amp_q: if amp_q == 0 { 1 } else { amp_q },
+            phase_p,
+            phase_q: if phase_q == 0 { 1 } else { phase_q },
+            color,
+            shape_and_quant: Self::pack_shape_quant(shape, quant),
+        }
+    }
+
+    /// Pack 8-bit `(r, g, b)` channels into 16-bit `RGB565` (`[15..11: R5][10..5: G6][4..0: B5]`).
+    #[inline(always)]
+    pub const fn pack_rgb565(r: u8, g: u8, b: u8) -> u16 {
+        let r5 = ((r as u16) >> 3) & 0x1F;
+        let g6 = ((g as u16) >> 2) & 0x3F;
+        let b5 = ((b as u16) >> 3) & 0x1F;
+        (r5 << 11) | (g6 << 5) | b5
+    }
+
+    /// Unpack 16-bit `RGB565` into 8-bit `(r, g, b)` channels with full-range bit replication.
+    #[inline(always)]
+    pub const fn unpack_rgb565(color: u16) -> (u8, u8, u8) {
+        let r5 = ((color >> 11) & 0x1F) as u8;
+        let g6 = ((color >> 5) & 0x3F) as u8;
+        let b5 = (color & 0x1F) as u8;
+        let r = (r5 << 3) | (r5 >> 2);
+        let g = (g6 << 2) | (g6 >> 4);
+        let b = (b5 << 3) | (b5 >> 2);
+        (r, g, b)
+    }
+
+    /// Pack a 14-bit `shape` (`0..=0x3FFF`) and balanced-ternary `quant` (`{-1, 0, +1}`) into `u16`.
+    /// Low 2 bits encode `quant`: `0b00 => 0`, `0b01 => +1`, `0b10 => -1`, `0b11 => 0`.
+    #[inline(always)]
+    pub const fn pack_shape_quant(shape: u16, quant: i8) -> u16 {
+        let q_bits: u16 = if quant > 0 {
+            0b01
+        } else if quant < 0 {
+            0b10
+        } else {
+            0b00
+        };
+        ((shape & 0x3FFF) << 2) | q_bits
+    }
+
+    /// Pack an 8-bit `shape` ID, a signed 6-bit `mag_octave` (`[-32, 31]`), and balanced-ternary `quant` (`{-1, 0, +1}`) into `u16`.
+    #[inline(always)]
+    pub const fn pack_shape_mag_quant(shape: u8, mag_octave: i8, quant: i8) -> u16 {
+        let clamped_oct = if mag_octave < -32 {
+            -32
+        } else if mag_octave > 31 {
+            31
+        } else {
+            mag_octave
+        };
+        let oct_bits = ((clamped_oct as i16 as u16) & 0x3F) << 8;
+        let shape14 = oct_bits | (shape as u16);
+        Self::pack_shape_quant(shape14, quant)
+    }
+
+    /// Decode the low 2 bits into balanced-ternary `{-1, 0, +1}`:
+    /// `0b00 => 0`, `0b01 => 1`, `0b10 => -1`, `0b11 => 0` (branchless 2-op ALU decode).
+    #[inline(always)]
+    pub const fn quant(&self) -> i8 {
+        ((self.shape_and_quant & 1) as i8) - (((self.shape_and_quant >> 1) & 1) as i8)
+    }
+
+    /// Extract the full 14-bit shape + octave field (`self.shape_and_quant >> 2`).
+    #[inline(always)]
+    pub const fn shape(&self) -> u16 {
+        self.shape_and_quant >> 2
+    }
+
+    /// Extract the low 8-bit morphological shape identifier (`((self.shape_and_quant >> 2) & 0xFF) as u8`).
+    #[inline(always)]
+    pub const fn shape_id(&self) -> u8 {
+        ((self.shape_and_quant >> 2) & 0xFF) as u8
+    }
+
+    /// Extract the signed 6-bit octave magnitude shift stored in the top 6 bits (`bits 10..=15`),
+    /// defaulting to `0` when a standard 8-bit shape is used.
+    #[inline(always)]
+    pub const fn magnitude_octave(&self) -> i8 {
+        ((self.shape_and_quant as i16) >> 10) as i8
+    }
+}
+
+/// Direct Digital Synthesis (DDS) integer sine lookup table size (`4096` samples per $2\pi$ period).
+pub const DDS_LUT_SIZE: usize = 4096;
+
+/// Compile-time 4096-entry pure-integer `i16` sine wave lookup table in `[-32767, 32767]`.
+///
+/// Computed via a 7th-order odd-polynomial minimax synthesis over quarter-wave symmetry
+/// in 128-bit fixed-point integer arithmetic (`Q = 2^30`) with **zero floating-point operations**.
+pub static DDS_SINE_LUT_I16: [i16; DDS_LUT_SIZE] = build_dds_sine_lut_i16();
+
+const fn build_dds_sine_lut_i16() -> [i16; DDS_LUT_SIZE] {
+    let mut lut = [0i16; DDS_LUT_SIZE];
+    // Minimax / Taylor coefficients for sin((pi/2) * z) on z = u / 1024 in [0, 1], scaled by 2^30:
+    // C1 - C3 + C5 - C7 == 2^30 = 1_073_741_824 exactly so sin(pi/2) == +32767.
+    const C1: i128 = 1_686_629_713;
+    const C3: i128 = 693_598_666;
+    const C5: i128 = 85_569_298;
+    const C7: i128 = 4_858_521;
+
+    let mut k = 0usize;
+    while k < DDS_LUT_SIZE {
+        let (u, sign): (i128, i128) = if k <= 1024 {
+            (k as i128, 1)
+        } else if k <= 2048 {
+            ((2048 - k) as i128, 1)
+        } else if k <= 3072 {
+            ((k - 2048) as i128, -1)
+        } else {
+            ((4096 - k) as i128, -1)
+        };
+
+        // Evaluate Horner polynomial in z = u / 2^10 (z^2 = u^2 / 2^20)
+        let u2 = u * u; // in [0, 2^20]
+        let p5 = C5 - ((C7 * u2) >> 20);
+        let p3 = C3 - ((p5 * u2) >> 20);
+        let p1 = C1 - ((p3 * u2) >> 20);
+        // sin_q30 in [0, 2^30]
+        let sin_q30 = (u * p1) >> 10;
+        // Scale to [0, 32767] with round-half-up
+        let mag = ((sin_q30 * 32767) + (1i128 << 29)) >> 30;
+        let clamped = if mag > 32767 { 32767 } else { mag };
+        lut[k] = (sign * clamped) as i16;
+        k += 1;
+    }
+    lut
+}
+
+/// Deterministic output of the 3-stage [`rational_wave_dds_query`] associative wave shader.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RationalWaveShaderResult {
+    /// Total cells inspected in the manifold.
+    pub total_cells: usize,
+    /// Cells surviving Stage 1 (non-zero ternary contraction gate `quant ∈ {-1, +1}`).
+    pub stage1_survivors: usize,
+    /// Cells surviving Stage 2 (`shape` mask match + `RGB565` Manhattan tolerance).
+    pub stage2_survivors: usize,
+    /// Total accumulated signed DDS resonant wave energy across Stage 2 survivors.
+    pub total_energy_i64: i64,
+    /// Energy-weighted additive RGB color blend `[R, G, B]` of resonant cells.
+    pub blended_rgb: [u8; 3],
+    /// Packed `RGB565` representation of [`Self::blended_rgb`].
+    pub blended_rgb565: u16,
+    /// Deterministic 64-bit FNV-1a state digest across all resonant wave cells.
+    pub state_digest: u64,
+}
+
+/// 3-Stage Zero-Allocation ALU-Only Direct Digital Synthesis (DDS) Wave Shader Cascade.
+///
+/// - **Stage 1 (Ternary Contraction Gate)**: checks `cell.shape_and_quant & 0b11`; if `0`
+///   (`0b00` or `0b11`), skips immediately (`1-cycle` bitwise check).
+/// - **Stage 2 (Semantic & Morphological Mask)**: checks `(cell.shape_and_quant >> 2) & shape_mask == (target_shape & shape_mask)`
+///   and `RGB565` Manhattan distance `<= color_tol`.
+/// - **Stage 3 (Direct Digital Synthesis Wave Coherence + RGB565 Additive Blending)**:
+///   - `current_phase = (((freq_p as u64 * t) / freq_q.max(1) as u64) + ((phase_p as u64 * 4096) / phase_q.max(1) as u64)) & 4095`
+///   - `lut_val = DDS_SINE_LUT_I16[current_phase as usize] as i64`
+///   - `energy = ((lut_val * amp_p as i64) / (amp_q.max(1) as i64)) <</>> mag_octave`
+///   - Applies `quant` sign (`+1` or `-1`), accumulates `total_energy_i64` and `blended_rgb`,
+///     and folds into a deterministic 64-bit FNV-1a `state_digest`.
+///
+/// Performs **zero heap allocations** and **zero floating-point operations**.
+#[inline]
+pub fn rational_wave_dds_query(
+    cells: &[RationalWaveCell],
+    t: u64,
+    target_shape: u16,
+    shape_mask: u16,
+    target_color_rgb565: u16,
+    color_tol: u16,
+) -> RationalWaveShaderResult {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01B3;
+
+    let masked_target_shape = target_shape & shape_mask;
+    let (tr, tg, tb) = RationalWaveCell::unpack_rgb565(target_color_rgb565);
+
+    let mut stage1_survivors = 0usize;
+    let mut stage2_survivors = 0usize;
+    let mut total_energy_i64 = 0i64;
+    let mut rgb_acc_r = 0u64;
+    let mut rgb_acc_g = 0u64;
+    let mut rgb_acc_b = 0u64;
+    let mut rgb_weight_sum = 0u64;
+    let mut state_digest = FNV_OFFSET_BASIS;
+
+    for cell in cells {
+        let sq = cell.shape_and_quant;
+        // Stage 1: 1-cycle branchless ternary contraction check (bit0 ^ bit1 == 1 iff quant in {-1, +1})
+        let active_bit = ((sq ^ (sq >> 1)) & 1) as usize;
+        stage1_survivors += active_bit;
+
+        // Combined Stage 1 + Stage 2 topological shape gate on the same u16 register
+        if active_bit == 0 || ((sq >> 2) & shape_mask) != masked_target_shape {
+            continue;
+        }
+
+        // Stage 2: RGB565 Manhattan distance check
+        let (cr, cg, cb) = RationalWaveCell::unpack_rgb565(cell.color);
+        let dist = (cr.abs_diff(tr) as u16) + (cg.abs_diff(tg) as u16) + (cb.abs_diff(tb) as u16);
+        if dist > color_tol {
+            continue;
+        }
+        stage2_survivors += 1;
+
+        // Stage 3: Pure-Integer Direct Digital Synthesis (DDS) Wave Coherence
+        let fq = (cell.freq_q as u64).max(1);
+        let pq = (cell.phase_q as u64).max(1);
+        let aq = (cell.amp_q as i64).max(1);
+
+        let current_phase = ((((cell.freq_p as u64).wrapping_mul(t)) / fq)
+            .wrapping_add(((cell.phase_p as u64) * (DDS_LUT_SIZE as u64)) / pq))
+            & ((DDS_LUT_SIZE as u64) - 1);
+        let lut_val = DDS_SINE_LUT_I16[current_phase as usize] as i64;
+        let base_energy = (lut_val * (cell.amp_p as i64)) / aq;
+
+        let mag_oct = cell.magnitude_octave();
+        let shifted_energy = if mag_oct >= 0 {
+            base_energy << (mag_oct.min(30) as u32)
+        } else {
+            base_energy >> ((-mag_oct).min(62) as u32)
+        };
+
+        // Apply balanced-ternary quant sign (+1 for 0b01, -1 for 0b10)
+        let signed_energy = if (sq & 0b11) == 0b01 {
+            shifted_energy
+        } else {
+            -shifted_energy
+        };
+        total_energy_i64 = total_energy_i64.wrapping_add(signed_energy);
+
+        // Constructive/resonant RGB565 additive color blending
+        let weight = signed_energy.unsigned_abs().max(1);
+        rgb_acc_r = rgb_acc_r.saturating_add((cr as u64).saturating_mul(weight));
+        rgb_acc_g = rgb_acc_g.saturating_add((cg as u64).saturating_mul(weight));
+        rgb_acc_b = rgb_acc_b.saturating_add((cb as u64).saturating_mul(weight));
+        rgb_weight_sum = rgb_weight_sum.saturating_add(weight);
+
+        // Deterministic 64-bit FNV-1a state digest
+        state_digest ^= signed_energy as u64;
+        state_digest = state_digest.wrapping_mul(FNV_PRIME);
+        state_digest ^= ((cell.color as u64) << 16) | (sq as u64);
+        state_digest = state_digest.wrapping_mul(FNV_PRIME);
+    }
+
+    let blended_rgb = if rgb_weight_sum > 0 {
+        [
+            (rgb_acc_r / rgb_weight_sum).min(255) as u8,
+            (rgb_acc_g / rgb_weight_sum).min(255) as u8,
+            (rgb_acc_b / rgb_weight_sum).min(255) as u8,
+        ]
+    } else {
+        [0, 0, 0]
+    };
+    let blended_rgb565 =
+        RationalWaveCell::pack_rgb565(blended_rgb[0], blended_rgb[1], blended_rgb[2]);
+
+    state_digest ^= ((stage1_survivors as u64) << 32) | (stage2_survivors as u64);
+    state_digest = state_digest.wrapping_mul(FNV_PRIME);
+    state_digest ^= total_energy_i64 as u64;
+    state_digest = state_digest.wrapping_mul(FNV_PRIME);
+    state_digest ^= blended_rgb565 as u64;
+    state_digest = state_digest.wrapping_mul(FNV_PRIME);
+
+    RationalWaveShaderResult {
+        total_cells: cells.len(),
+        stage1_survivors,
+        stage2_survivors,
+        total_energy_i64,
+        blended_rgb,
+        blended_rgb565,
+        state_digest,
+    }
+}

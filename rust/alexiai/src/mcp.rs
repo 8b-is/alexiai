@@ -150,6 +150,11 @@ pub const TOOLS: &[McpToolDescriptor] = &[
         provider: "mailcow-mem8-nexus (/data/standardgalactic/mailcow-mem8-nexus)",
         description: "Search decrypted Mailcow MEM|8 nexus shards (manifest.json + .md shards) using integer hit counts and return the top 3 matching email headers/snippets + shard name in < 10 ms",
     },
+    McpToolDescriptor {
+        name: "mem8_rational_wave_shader_bench",
+        provider: "gaia-mlx-quant::mlx::RationalWaveCell (16B p/q DDS Wave Shader · 4.0 structs/64B)",
+        description: "1,000,000-cell (16.0 MB) 16-byte RationalWaveCell & 24-byte WaveMemoryCell 3-stage ALU-only DDS associative shader benchmark",
+    },
 ];
 
 pub fn find_binary(name: &str) -> Option<String> {
@@ -425,6 +430,12 @@ pub fn call_tool(tool: &str, arg: &str) -> Result<McpToolRun, String> {
         }
         "mem8_archive_recall" | "mem8_recall" | "mailcow_recall" | "mailcow" => {
             run_mem8_archive_recall_tool(&target)
+        }
+        "mem8_rational_wave_shader_bench"
+        | "rational_wave_bench"
+        | "rational_wave"
+        | "wave_shader" => {
+            run_rational_wave_shader_bench_tool(&target)
         }
         "mcp_status" | "status" | "tools" => {
             let st = status();
@@ -1761,6 +1772,16 @@ fn plan_ground_tasks(segment: &str, tasks: &mut Vec<(String, String)>) {
         push_unique_task(tasks, "mlx_quant", "256");
     }
 
+    // 9b. 16-Byte RationalWaveCell & 24-Byte WaveMemoryCell DDS Associative Shader Benchmark
+    if lower.contains("rationalwavecell")
+        || lower.contains("wavememorycell")
+        || lower.contains("rational_wave")
+        || lower.contains("wave shader")
+        || lower.contains("dds_sine_lut")
+    {
+        push_unique_task(tasks, "mem8_rational_wave_shader_bench", "1000000");
+    }
+
     // 10. wupz / ULTRABACKYARDLOOP +AND~NAND / kompress-super-ultra:lossless
     if lower.contains("wupz")
         || lower.contains("pack-in-pass")
@@ -2374,6 +2395,24 @@ pub fn run_mem8_archive_recall_tool(target: &str) -> String {
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| MEM8_NEXUS_DIR.to_string());
     mem8_archive_recall_in_dir(Path::new(&dir), target)
+}
+
+pub fn run_rational_wave_shader_bench_tool(target: &str) -> String {
+    let cells = target
+        .split_whitespace()
+        .find_map(|tok| tok.replace('_', "").replace(',', "").parse::<usize>().ok())
+        .unwrap_or(1_000_000)
+        .clamp(1_000, 2_000_000);
+    let json = crate::server::run_rational_wave_bench(cells);
+    format!(
+        "=== MEM|8 16-Byte `RationalWaveCell` Direct Digital Synthesis (DDS) Associative Shader Benchmark ===\n\
+         • Struct Layout (`gaia_mlx_quant::mlx::RationalWaveCell`): `#[repr(C, align(16))]`, `size_of == 16` B, `align_of == 16` B (`4.0 structs/64B` cache line vs `WaveMemoryCell` `24` B / `2.66 structs/64B`)\n\
+         • 3-Stage Zero-Allocation ALU-Only Cascade:\n\
+           1. Stage 1 (Ternary Contraction Gate): 1-cycle bitwise check on `shape_and_quant & 0b11` (`{{-1, 0, +1}}`)\n\
+           2. Stage 2 (Semantic & Morphological Mask): 14-bit `shape` (`8-bit shape_id + signed 6-bit mag_octave`) + `RGB565` Manhattan tolerance\n\
+           3. Stage 3 (DDS Wave Coherence + RGB565 Additive Blending): 4096-entry compile-time `DDS_SINE_LUT_I16` (`[-32767, 32767]`, 0 floats) + `p/q` amplitude & octave shift + FNV-1a 64-bit state digest\n\n\
+         Live Measured Benchmark (`{cells}` cells):\n```json\n{json}\n```"
+    )
 }
 
 #[cfg(test)]

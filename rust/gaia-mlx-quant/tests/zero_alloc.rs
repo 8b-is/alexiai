@@ -382,7 +382,56 @@ fn hot_paths_perform_zero_allocations() {
         }
         assert_eq!(sliding_win.len(), 4);
         let _ = fold_to_quant_tern_pq(&fpq1);
-        std::hint::black_box((sampling(&f1), sampling(&f2), sampling_pq(&fpq1), sampling_pq(&fpq2)));
+        let wave_cells = [
+            gaia_mlx_quant::RationalWaveCell::new(
+                432,
+                1,
+                1000,
+                1,
+                512,
+                1024,
+                gaia_mlx_quant::RationalWaveCell::pack_rgb565(200, 50, 20),
+                0x02,
+                1,
+            ),
+            gaia_mlx_quant::RationalWaveCell::new(
+                528,
+                1,
+                800,
+                1,
+                256,
+                1024,
+                gaia_mlx_quant::RationalWaveCell::pack_rgb565(198, 52, 22),
+                0x02,
+                -1,
+            ),
+            gaia_mlx_quant::RationalWaveCell::new(
+                852,
+                1,
+                500,
+                1,
+                0,
+                1,
+                gaia_mlx_quant::RationalWaveCell::pack_rgb565(10, 200, 200),
+                0x05,
+                0,
+            ),
+        ];
+        let wave_res = gaia_mlx_quant::rational_wave_dds_query(
+            &wave_cells,
+            7,
+            0x02,
+            0xFF,
+            gaia_mlx_quant::RationalWaveCell::pack_rgb565(200, 50, 20),
+            32,
+        );
+        std::hint::black_box((
+            sampling(&f1),
+            sampling(&f2),
+            sampling_pq(&fpq1),
+            sampling_pq(&fpq2),
+            wave_res,
+        ));
     }
     let after = ALLOCS.load(Ordering::Relaxed);
 

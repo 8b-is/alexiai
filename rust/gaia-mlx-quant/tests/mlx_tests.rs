@@ -544,3 +544,151 @@ fn pure_integer_pq_mlx_and_transformer_primitives_operate_with_zero_floats() {
     );
     assert!(p_tf_out.iter().any(|&v| v != 0));
 }
+
+#[test]
+fn rational_wave_cell_16b_and_wave_memory_cell_24b_dds_shader_cascade() {
+    use gaia_mlx_quant::{
+        DDS_LUT_SIZE, DDS_SINE_LUT_I16, RationalWaveCell, WaveMemoryCell, rational_wave_dds_query,
+    };
+
+    assert_eq!(core::mem::size_of::<WaveMemoryCell>(), 24);
+    assert_eq!(core::mem::align_of::<WaveMemoryCell>(), 8);
+    assert_eq!(core::mem::size_of::<RationalWaveCell>(), 16);
+    assert_eq!(core::mem::align_of::<RationalWaveCell>(), 16);
+    assert_eq!(DDS_LUT_SIZE, 4096);
+
+    // Verify 24-byte WaveMemoryCell construction
+    let wmc = WaveMemoryCell::new(432.0, 1.0, 0.5, [200, 50, 20], 0x02, 1);
+    assert_eq!(wmc.shape, 0x02);
+    assert_eq!(wmc.quant, 1);
+    assert_eq!(wmc.color, [200, 50, 20]);
+
+    // Verify compile-time DDS sine LUT endpoints & quarter-wave symmetry
+    assert_eq!(DDS_SINE_LUT_I16[0], 0);
+    assert_eq!(DDS_SINE_LUT_I16[1024], 32767);
+    assert_eq!(DDS_SINE_LUT_I16[2048], 0);
+    assert_eq!(DDS_SINE_LUT_I16[3072], -32767);
+    for k in 1..1024 {
+        assert_eq!(DDS_SINE_LUT_I16[k], DDS_SINE_LUT_I16[2048 - k]);
+        assert_eq!(DDS_SINE_LUT_I16[2048 + k], -DDS_SINE_LUT_I16[k]);
+        assert_eq!(DDS_SINE_LUT_I16[4096 - k], -DDS_SINE_LUT_I16[k]);
+    }
+
+    // Verify RGB565 pack / unpack round-trip on 5-6-5 grid
+    for r5 in [0u8, 7, 16, 25, 31] {
+        for g6 in [0u8, 13, 32, 48, 63] {
+            for b5 in [0u8, 5, 15, 24, 31] {
+                let r = (r5 << 3) | (r5 >> 2);
+                let g = (g6 << 2) | (g6 >> 4);
+                let b = (b5 << 3) | (b5 >> 2);
+                let packed = RationalWaveCell::pack_rgb565(r, g, b);
+                let (ur, ug, ub) = RationalWaveCell::unpack_rgb565(packed);
+                assert_eq!((ur, ug, ub), (r, g, b));
+            }
+        }
+    }
+
+    // Verify shape, shape_id, magnitude_octave, and quant helpers
+    for &q in &[-1i8, 0, 1] {
+        let sq = RationalWaveCell::pack_shape_quant(0x0042, q);
+        let cell = RationalWaveCell {
+            freq_p: 432,
+            freq_q: 1,
+            amp_p: 1,
+            amp_q: 1,
+            phase_p: 0,
+            phase_q: 1,
+            color: 0,
+            shape_and_quant: sq,
+        };
+        assert_eq!(cell.quant(), q);
+        assert_eq!(cell.shape(), 0x0042);
+        assert_eq!(cell.shape_id(), 0x42);
+        assert_eq!(cell.magnitude_octave(), 0);
+    }
+
+    // Reserved 0b11 decodes to 0
+    let cell_res = RationalWaveCell {
+        freq_p: 1,
+        freq_q: 1,
+        amp_p: 1,
+        amp_q: 1,
+        phase_p: 0,
+        phase_q: 1,
+        color: 0,
+        shape_and_quant: 0b11,
+    };
+    assert_eq!(cell_res.quant(), 0);
+
+    // Verify signed 6-bit magnitude_octave in [-32, 31]
+    for oct in [-32i8, -7, -1, 0, 1, 5, 31] {
+        let sq = RationalWaveCell::pack_shape_mag_quant(0x2A, oct, -1);
+        let cell = RationalWaveCell {
+            freq_p: 528,
+            freq_q: 1,
+            amp_p: 100,
+            amp_q: 1,
+            phase_p: 1,
+            phase_q: 4,
+            color: RationalWaveCell::pack_rgb565(200, 50, 20),
+            shape_and_quant: sq,
+        };
+        assert_eq!(cell.shape_id(), 0x2A);
+        assert_eq!(cell.magnitude_octave(), oct);
+        assert_eq!(cell.quant(), -1);
+    }
+
+    // Verify 3-Stage DDS Shader Cascade:
+    // - Cell 0: quant=0 -> culled at Stage 1
+    // - Cell 1: quant=+1, shape=0x05 != target(0x02) -> survives Stage 1, culled at Stage 2 (shape)
+    // - Cell 2: quant=+1, shape=0x02, distant color -> survives Stage 1, culled at Stage 2 (color)
+    // - Cell 3: quant=+1, shape=0x02, matching color, phase=1/4 (peak +32767), amp=2/1, mag_octave=+1 -> +131068
+    // - Cell 4: quant=-1, shape=0x02, matching color, phase=1/4 (peak +32767), amp=1/1, mag_octave=0 -> -32767
+    let target_color = RationalWaveCell::pack_rgb565(200, 50, 20);
+    let cells = [
+        RationalWaveCell::new(432, 1, 10, 1, 1, 4, target_color, 0x02, 0),
+        RationalWaveCell::new(432, 1, 10, 1, 1, 4, target_color, 0x05, 1),
+        RationalWaveCell::new(
+            432,
+            1,
+            10,
+            1,
+            1,
+            4,
+            RationalWaveCell::pack_rgb565(0, 255, 255),
+            0x02,
+            1,
+        ),
+        RationalWaveCell {
+            freq_p: 0,
+            freq_q: 1,
+            amp_p: 2,
+            amp_q: 1,
+            phase_p: 1,
+            phase_q: 4,
+            color: target_color,
+            shape_and_quant: RationalWaveCell::pack_shape_mag_quant(0x02, 1, 1),
+        },
+        RationalWaveCell {
+            freq_p: 0,
+            freq_q: 1,
+            amp_p: 1,
+            amp_q: 1,
+            phase_p: 1,
+            phase_q: 4,
+            color: target_color,
+            shape_and_quant: RationalWaveCell::pack_shape_mag_quant(0x02, 0, -1),
+        },
+    ];
+
+    let res = rational_wave_dds_query(&cells, 10, 0x02, 0xFF, target_color, 24);
+    assert_eq!(res.total_cells, 5);
+    assert_eq!(res.stage1_survivors, 4);
+    assert_eq!(res.stage2_survivors, 2);
+    assert_eq!(res.total_energy_i64, (32767 * 2 * 2) - 32767);
+    assert_eq!(res.blended_rgb565, target_color);
+
+    // Determinism check: identical query yields identical state_digest
+    let res2 = rational_wave_dds_query(&cells, 10, 0x02, 0xFF, target_color, 24);
+    assert_eq!(res, res2);
+}

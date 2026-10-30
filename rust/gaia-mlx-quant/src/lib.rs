@@ -91,17 +91,18 @@ pub use kernel::{
 #[cfg(feature = "std")]
 pub use kernel::{Quantized, quantize_ternary};
 pub use mlx::{
-    MLX_BYTE_TRITS_I32, MLX_GROUP_SIZE, MLX_GROUP64_COMPRESSION, PQ_DEFAULT_Q, Pq, QuantMode,
-    StridedView, TRITS_PER_U32, b158_matmul_pq_i_major_into, exp_pq, gather_qmm_into,
+    DDS_LUT_SIZE, DDS_SINE_LUT_I16, MLX_BYTE_TRITS_I32, MLX_GROUP_SIZE, MLX_GROUP64_COMPRESSION,
+    PQ_DEFAULT_Q, Pq, QuantMode, RationalWaveCell, RationalWaveShaderResult, StridedView,
+    TRITS_PER_U32, WaveMemoryCell, b158_matmul_pq_i_major_into, exp_pq, gather_qmm_into,
     gather_qmm_pq_i64_into, gather_qmm_pq_into, maybe_matmul_into, maybe_matmul_pq_into,
     mergeq_matmul_into, mergeq_matmul_pq_into, mlx_code_of, mlx_dequantize_group64_into,
     mlx_dequantize_group64_pq_into, mlx_matmul_pq_group64_i64_into, mlx_matmul_pq_group64_into,
     mlx_quantize_group64_into, mlx_quantize_group64_pq_into, mlx_quantized_matmul_into,
     mlx_trit_of, quantize_bfp_i8_group64_into, quantize_bfp_i8_pq_group64_into,
-    quantize_bfp_i16_group64_into, quantize_pq_adaptive_into, quantize_pq_into, rms_norm_into,
-    rms_norm_pq_into, rope_into, rope_pq_into, sdpa_pq_i32_single_query_into,
-    sdpa_pq_single_query_into, sdpa_single_query_into, sin_cos_pq, ste_linear_backward_into,
-    ste_linear_backward_pq_into, swiglu_into, swiglu_pq_into,
+    quantize_bfp_i16_group64_into, quantize_pq_adaptive_into, quantize_pq_into,
+    rational_wave_dds_query, rms_norm_into, rms_norm_pq_into, rope_into, rope_pq_into,
+    sdpa_pq_i32_single_query_into, sdpa_pq_single_query_into, sdpa_single_query_into, sin_cos_pq,
+    ste_linear_backward_into, ste_linear_backward_pq_into, swiglu_into, swiglu_pq_into,
     ternary_bfp_adaptive_mem8_matmul_into, ternary_bfp_i8_matmul_into, ternary_bfp_i16_matmul_into,
     ternary_simd_pq_matmul_into, ternary_transformer_step_into, ternary_transformer_step_pq_into,
 };

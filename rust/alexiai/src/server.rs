@@ -9,12 +9,13 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 
 use gaia_mlx_quant::{
-    Fold, UltraBackyardLane, WUPZ_ABI_VERSION, WUPZ_DEFAULT_WINDOW_SIZE, WupzBlockDesc,
-    WupzSectionDesc, fold, fold_pq, fold_to_quant_tern_pq,
-    kompress_super_ultra_lossless_decode_into, kompress_super_ultra_lossless_encode_into,
-    sampling, ultrabackyard_fanout_into, wupz_bitplane_diff_u64, wupz_bitplane_popcount_u64,
-    wupz_byte_diff, wupz_pack_plan_into, wupz_plan_digest, wupz_plan_image_len, wupz_popcount,
-    wupz_xor_fold, wupz_xor_fold_u64,
+    DDS_LUT_SIZE, Fold, RationalWaveCell, UltraBackyardLane, WUPZ_ABI_VERSION,
+    WUPZ_DEFAULT_WINDOW_SIZE, WaveMemoryCell, WupzBlockDesc, WupzSectionDesc, fold, fold_pq,
+    fold_to_quant_tern_pq, kompress_super_ultra_lossless_decode_into,
+    kompress_super_ultra_lossless_encode_into, rational_wave_dds_query, sampling,
+    ultrabackyard_fanout_into, wupz_bitplane_diff_u64, wupz_bitplane_popcount_u64, wupz_byte_diff,
+    wupz_pack_plan_into, wupz_plan_digest, wupz_plan_image_len, wupz_popcount, wupz_xor_fold,
+    wupz_xor_fold_u64,
 };
 
 use crate::mcp;
@@ -494,6 +495,122 @@ fn synthetic(i: usize, seed: u32) -> f64 {
     ((t ^ (t >> 14)) >> 8) as f64 / 16_777_216.0 * 2.0 - 1.0
 }
 
+static RATIONAL_WAVE_1M_DATASET: std::sync::OnceLock<Vec<RationalWaveCell>> =
+    std::sync::OnceLock::new();
+
+fn build_rational_wave_dataset(num_cells: usize) -> Vec<RationalWaveCell> {
+    let mut cells = Vec::with_capacity(num_cells);
+    for i in 0..num_cells {
+        // 80% sparsity in Stage 1 (quant == 0 for 4 out of 5 cells; +1 and -1 for the remaining 20%)
+        let quant: i8 = match i % 10 {
+            0 => 1,
+            5 => -1,
+            _ => 0,
+        };
+        // Among the 20% active cells, 10% carry target shape 0x02 and warm resonant RGB near [200, 50, 20]
+        let is_resonant_cluster = (i % 5 == 0) && ((i / 5) % 10 == 0);
+        let shape_id: u8 = if is_resonant_cluster {
+            0x02
+        } else {
+            ((i % 14) as u8).wrapping_add(3)
+        };
+        let mag_octave: i8 = ((i % 5) as i8) - 2; // in [-2, +2]
+        let color = if is_resonant_cluster {
+            let r = 200u8.wrapping_sub((i % 9) as u8);
+            let g = 50u8.wrapping_add((i % 7) as u8);
+            let b = 20u8.wrapping_add((i % 5) as u8);
+            RationalWaveCell::pack_rgb565(r, g, b)
+        } else {
+            let r = ((i * 37) & 0xFF) as u8;
+            let g = ((i * 73) & 0xFF) as u8;
+            let b = ((i * 109) & 0xFF) as u8;
+            RationalWaveCell::pack_rgb565(r, g, b)
+        };
+        let freq_p = (432 + (i % 97)) as u16;
+        let freq_q = (1 + (i % 16)) as u16;
+        let amp_p = (64 + (i % 192)) as u16;
+        let amp_q = (1 + (i % 8)) as u16;
+        let phase_p = (i % 1024) as u16;
+        let phase_q = 1024u16;
+
+        cells.push(RationalWaveCell {
+            freq_p,
+            freq_q,
+            amp_p,
+            amp_q,
+            phase_p,
+            phase_q,
+            color,
+            shape_and_quant: RationalWaveCell::pack_shape_mag_quant(shape_id, mag_octave, quant),
+        });
+    }
+    cells
+}
+
+/// Real 1,000,000-cell (`16.0 MB`) `RationalWaveCell` 3-Stage Direct Digital Synthesis (DDS)
+/// associative shader benchmark (`GET /api/rational-wave-bench` and `mem8_rational_wave_shader_bench`).
+pub fn run_rational_wave_bench(num_cells: usize) -> String {
+    use std::time::Instant;
+
+    let n = if num_cells == 0 { 1_000_000 } else { num_cells };
+    let owned_custom;
+    let cells: &[RationalWaveCell] = if n == 1_000_000 {
+        RATIONAL_WAVE_1M_DATASET
+            .get_or_init(|| build_rational_wave_dataset(1_000_000))
+            .as_slice()
+    } else {
+        owned_custom = build_rational_wave_dataset(n);
+        owned_custom.as_slice()
+    };
+
+    let target_color = RationalWaveCell::pack_rgb565(200, 50, 20);
+    // Warmup pass
+    let mut result = rational_wave_dds_query(cells, 7, 0x02, 0xFF, target_color, 40);
+
+    // Measure best of 5 contiguous cache-warm passes
+    let mut best_ns = u64::MAX;
+    for _ in 0..5 {
+        let t0 = Instant::now();
+        let r = std::hint::black_box(rational_wave_dds_query(
+            std::hint::black_box(cells),
+            7,
+            0x02,
+            0xFF,
+            target_color,
+            40,
+        ));
+        let ns = t0.elapsed().as_nanos() as u64;
+        if ns < best_ns {
+            best_ns = ns;
+        }
+        result = r;
+    }
+
+    let elapsed_ns = best_ns.max(1);
+    let elapsed_us_whole = elapsed_ns / 1000;
+    let elapsed_us_frac = (elapsed_ns % 1000) / 10;
+    let qps = 1_000_000_000u64 / elapsed_ns;
+    let cell_bytes = core::mem::size_of::<RationalWaveCell>();
+    let cell_align = core::mem::align_of::<RationalWaveCell>();
+    let wave_mem_cell_bytes = core::mem::size_of::<WaveMemoryCell>();
+    let dataset_bytes = cells.len() * cell_bytes;
+    let mb_whole = dataset_bytes / 1_000_000;
+    let mb_tenths = (dataset_bytes % 1_000_000) / 100_000;
+
+    format!(
+        r#"{{"ok":true,"engine":"gaia-mlx-quant::RationalWaveCell (16B Pure-Integer p/q DDS Associative Wave Shader)","datasetCells":{},"rationalWaveCellBytes":{cell_bytes},"rationalWaveCellAlign":{cell_align},"waveMemoryCellBytes":{wave_mem_cell_bytes},"datasetBytes":{dataset_bytes},"datasetFootprint":"{mb_whole}.{mb_tenths} MB","cacheLineDensity":"4.0 structs/64B","waveMemoryCellCacheLineDensity":"2.66 structs/64B","ddsLutEntries":{DDS_LUT_SIZE},"fpuUtilization":"0.0% (Pure Integer ALU)","elapsedNs":{elapsed_ns},"elapsedUs":{elapsed_us_whole}.{elapsed_us_frac:02},"elapsedUsPq":"{elapsed_ns}/1000","qps":{qps},"stage1Survivors":{},"stage2Survivors":{},"totalEnergyI64":{},"blendedRgb":[{},{},{}],"blendedRgb565":{},"stateDigest":"0x{:016x}"}}"#,
+        result.total_cells,
+        result.stage1_survivors,
+        result.stage2_survivors,
+        result.total_energy_i64,
+        result.blended_rgb[0],
+        result.blended_rgb[1],
+        result.blended_rgb[2],
+        result.blended_rgb565,
+        result.state_digest,
+    )
+}
+
 /// Deterministic emotional state folded from the GAIA field and prompt resonance.
 #[derive(Debug, Clone)]
 pub struct Affect {
@@ -890,6 +1007,17 @@ fn handle_connection(mut stream: std::net::TcpStream, adapter: &Osarous) -> Resu
         ("GET", "/api/bench") => {
             let dim = query_param(&query, "dim").and_then(|d| d.parse().ok()).unwrap_or(256);
             write_response(&mut stream, 200, "application/json", run_bench(dim).as_bytes())
+        }
+        ("GET", "/api/rational-wave-bench") => {
+            let cells = query_param(&query, "cells")
+                .and_then(|c| c.parse().ok())
+                .unwrap_or(1_000_000);
+            write_response(
+                &mut stream,
+                200,
+                "application/json",
+                run_rational_wave_bench(cells).as_bytes(),
+            )
         }
         ("GET", "/api/mcp") => {
             let st = mcp::status();
@@ -1304,6 +1432,13 @@ mod tests {
         assert!(json.contains(r#""dim":64"#));
         assert!(json.contains(r#""compression""#));
         assert!(json.contains(r#""relativeError""#));
+
+        let wave_json = run_rational_wave_bench(10_000);
+        assert!(wave_json.contains(r#""datasetCells":10000"#));
+        assert!(wave_json.contains(r#""rationalWaveCellBytes":16"#));
+        assert!(wave_json.contains(r#""waveMemoryCellBytes":24"#));
+        assert!(wave_json.contains(r#""cacheLineDensity":"4.0 structs/64B""#));
+        assert!(wave_json.contains(r#""stateDigest":"0x"#));
     }
 
     #[test]
