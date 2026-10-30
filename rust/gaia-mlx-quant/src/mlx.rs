@@ -3111,15 +3111,11 @@ pub fn rational_wave_dds_query(
         state_digest = state_digest.wrapping_mul(FNV_PRIME);
     }
 
-    let blended_rgb = if rgb_weight_sum > 0 {
-        [
-            (rgb_acc_r / rgb_weight_sum).min(255) as u8,
-            (rgb_acc_g / rgb_weight_sum).min(255) as u8,
-            (rgb_acc_b / rgb_weight_sum).min(255) as u8,
-        ]
-    } else {
-        [0, 0, 0]
-    };
+    let blended_rgb = [
+        rgb_acc_r.checked_div(rgb_weight_sum).unwrap_or(0).min(255) as u8,
+        rgb_acc_g.checked_div(rgb_weight_sum).unwrap_or(0).min(255) as u8,
+        rgb_acc_b.checked_div(rgb_weight_sum).unwrap_or(0).min(255) as u8,
+    ];
     let blended_rgb565 =
         RationalWaveCell::pack_rgb565(blended_rgb[0], blended_rgb[1], blended_rgb[2]);
 
@@ -3437,7 +3433,7 @@ pub fn ayeos_lmhead_q4_g64_topk_sample<const K: usize>(
     let mut x_i8 = [0i8; 4096];
     let mut x_scales = [0.0f32; 64];
 
-    for g in 0..num_groups {
+    for (g, x_scale_slot) in x_scales.iter_mut().enumerate().take(num_groups) {
         let base = g * 64;
         let mut amax = 1e-6f32;
         for i in 0..64 {
@@ -3448,7 +3444,7 @@ pub fn ayeos_lmhead_q4_g64_topk_sample<const K: usize>(
         }
         let s = amax / 127.0f32;
         let inv_s = 127.0f32 / amax;
-        x_scales[g] = s;
+        *x_scale_slot = s;
         for i in 0..64 {
             let scaled = x_norm[base + i] * inv_s;
             let rounded = if scaled >= 0.0 {
@@ -3612,7 +3608,7 @@ pub fn fold_int8_to_wave_cell(
     let sign_select = if is_inhibitory { -1i8 } else { 1i8 };
     let quant = active_gate * sign_select;
 
-    let shape_4b = (((band_signed[0] >= 0) as u16) << 0)
+    let shape_4b = ((band_signed[0] >= 0) as u16)
         | (((band_signed[1] >= 0) as u16) << 1)
         | (((band_signed[2] >= 0) as u16) << 2)
         | (((band_signed[3] >= 0) as u16) << 3);
@@ -3761,8 +3757,8 @@ pub fn route_resonant_kv<const N: usize, const WORDS: usize, const M: usize>(
     color_tolerance: u32,
 ) -> InRegisterTopK<M> {
     let mut top_slots = InRegisterTopK::<M>::new();
-    let q_p = (probe.phase_pq >> 4) as u16;
-    let q_q = (probe.phase_pq & 0x0F) as u16;
+    let q_p = probe.phase_pq >> 4;
+    let q_q = probe.phase_pq & 0x0F;
     let query_phase = q_p >> q_q;
     let scan_words = max_populated_word.min(WORDS);
 
@@ -3914,11 +3910,147 @@ pub fn ayeos_wave_routed_attention_step<const N: usize, const WORDS: usize, cons
     }
 
     let inv_sum = 1.0f32 / running_sum.max(1e-9);
-    for d in 0..AYEOS_HEAD_DIM {
-        attn_out_f32[d] *= inv_sum;
+    for slot in attn_out_f32.iter_mut().take(AYEOS_HEAD_DIM) {
+        *slot *= inv_sum;
     }
 
     resonant_topk
+}
+
+// ============================================================================
+// 10. Burn (`tracel-ai/burn`) QuantScheme (Q2S / Q4S U32) <-> AyeOS Bridge
+// ============================================================================
+
+/// Transcodes a single Group-64 block (`[u32; 4]`) from `burn-tensor`'s `QuantValue::Q2S`
+/// (`QuantStore::U32`, offset `+1`: `-1 -> 0b00, 0 -> 0b01, +1 -> 0b10`) into `ayeOS`'s
+/// 16-byte branchless `I2_S` layout (`0b00 -> 0, 0b01 -> +1, 0b10 -> -1`).
+///
+/// Zero heap allocations, `const fn`, `#![no_std]`.
+#[inline(always)]
+pub const fn burn_q2s_u32_to_ayeos_i2s_g64(burn_u32: &[u32; 4]) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    let mut w = 0usize;
+    while w < 4 {
+        let word = burn_u32[w];
+        let mut b_idx = 0usize;
+        while b_idx < 4 {
+            let byte_in = ((word >> (b_idx * 8)) & 0xFF) as u8;
+            let mut byte_out = 0u8;
+            let mut lane = 0usize;
+            while lane < 4 {
+                let b_code = (byte_in >> (lane * 2)) & 0x03;
+                let trit = (b_code as i8) - 1;
+                let a_code = ((trit == 1) as u8) | (((trit == -1) as u8) << 1);
+                byte_out |= a_code << (lane * 2);
+                lane += 1;
+            }
+            out[w * 4 + b_idx] = byte_out;
+            b_idx += 1;
+        }
+        w += 1;
+    }
+    out
+}
+
+/// Inverse of [`burn_q2s_u32_to_ayeos_i2s_g64`]: transcodes an `ayeOS` 16-byte `I2_S` Group-64
+/// block (`0b00 -> 0, 0b01 -> +1, 0b10 -> -1`) back into `burn-tensor`'s `QuantValue::Q2S`
+/// `[u32; 4]` (`QuantStore::U32`, offset `+1`: `-1 -> 0b00, 0 -> 0b01, +1 -> 0b10`).
+#[inline(always)]
+pub const fn ayeos_i2s_g64_to_burn_q2s_u32(ayeos_16b: &[u8; 16]) -> [u32; 4] {
+    let mut out = [0u32; 4];
+    let mut w = 0usize;
+    while w < 4 {
+        let mut word = 0u32;
+        let mut b_idx = 0usize;
+        while b_idx < 4 {
+            let byte_in = ayeos_16b[w * 4 + b_idx];
+            let mut lane = 0usize;
+            while lane < 4 {
+                let a_code = (byte_in >> (lane * 2)) & 0x03;
+                let trit = ((a_code & 1) as i8) - ((a_code >> 1) as i8);
+                let b_code = ((trit + 1) as u32) & 0x03;
+                let bit_shift = (b_idx * 4 + lane) * 2;
+                word |= b_code << bit_shift;
+                lane += 1;
+            }
+            b_idx += 1;
+        }
+        out[w] = word;
+        w += 1;
+    }
+    out
+}
+
+/// Transcodes a single Group-64 block (`[u32; 8]`) from `burn-tensor`'s sequential `QuantValue::Q4S`
+/// (`QuantStore::U32`, offset `+7` for symmetric `[-7, +7]`) into `ayeOS`'s 32-byte
+/// **Zero-Shuffle Block-Planar `Q4_G64`** layout (offset `+8`):
+/// - `planar_32b[0..16]`: low nibble = `w[0..16]`, high nibble = `w[16..32]`
+/// - `planar_32b[16..32]`: low nibble = `w[32..48]`, high nibble = `w[48..64]`
+#[inline(always)]
+pub const fn burn_q4s_u32_to_ayeos_q4_g64(burn_u32: &[u32; 8]) -> [u8; 32] {
+    let mut weights_i8 = [0i8; 64];
+    let mut w = 0usize;
+    while w < 8 {
+        let word = burn_u32[w];
+        let mut k = 0usize;
+        while k < 8 {
+            let nibble = ((word >> (k * 4)) & 0x0F) as i8;
+            weights_i8[w * 8 + k] = nibble - 7;
+            k += 1;
+        }
+        w += 1;
+    }
+
+    let mut planar = [0u8; 32];
+    let mut i = 0usize;
+    while i < 16 {
+        let q0 = ((weights_i8[i] + 8) as u8) & 0x0F;
+        let q1 = ((weights_i8[16 + i] + 8) as u8) & 0x0F;
+        let q2 = ((weights_i8[32 + i] + 8) as u8) & 0x0F;
+        let q3 = ((weights_i8[48 + i] + 8) as u8) & 0x0F;
+        planar[i] = q0 | (q1 << 4);
+        planar[16 + i] = q2 | (q3 << 4);
+        i += 1;
+    }
+    planar
+}
+
+/// Inverse of [`burn_q4s_u32_to_ayeos_q4_g64`]: transcodes an `ayeOS` 32-byte
+/// **Zero-Shuffle Block-Planar `Q4_G64`** block (offset `+8`) back into `burn-tensor`'s
+/// sequential `QuantValue::Q4S` `[u32; 8]` (`QuantStore::U32`, offset `+7`, clamped to `[-7, +7]`).
+#[inline(always)]
+pub const fn ayeos_q4_g64_to_burn_q4s_u32(planar_32b: &[u8; 32]) -> [u32; 8] {
+    let mut weights_i8 = [0i8; 64];
+    let mut i = 0usize;
+    while i < 16 {
+        let b_lo = planar_32b[i];
+        let b_hi = planar_32b[16 + i];
+        let q0 = ((b_lo & 0x0F) as i8) - 8;
+        let q1 = ((b_lo >> 4) as i8) - 8;
+        let q2 = ((b_hi & 0x0F) as i8) - 8;
+        let q3 = ((b_hi >> 4) as i8) - 8;
+
+        weights_i8[i] = if q0 < -7 { -7 } else if q0 > 7 { 7 } else { q0 };
+        weights_i8[16 + i] = if q1 < -7 { -7 } else if q1 > 7 { 7 } else { q1 };
+        weights_i8[32 + i] = if q2 < -7 { -7 } else if q2 > 7 { 7 } else { q2 };
+        weights_i8[48 + i] = if q3 < -7 { -7 } else if q3 > 7 { 7 } else { q3 };
+        i += 1;
+    }
+
+    let mut out = [0u32; 8];
+    let mut w = 0usize;
+    while w < 8 {
+        let mut word = 0u32;
+        let mut k = 0usize;
+        while k < 8 {
+            let b_nib = ((weights_i8[w * 8 + k] + 7) as u32) & 0x0F;
+            word |= b_nib << (k * 4);
+            k += 1;
+        }
+        out[w] = word;
+        w += 1;
+    }
+    out
 }
 
 #[cfg(test)]
@@ -4037,5 +4169,50 @@ mod ayeos_tests {
         let routed_ids: [u32; 8] = core::array::from_fn(|i| topk.items[i].token_id);
         assert!(routed_ids.contains(&17), "Expected resonant slot 17 in {routed_ids:?}");
         assert!(attn_out[0] > 4.0, "Expected high-salience value contribution from slot 17, got {}", attn_out[0]);
+    }
+
+    #[test]
+    fn test_burn_q2s_and_q4s_ayeos_zero_shuffle_bridge_roundtrip() {
+        // 1. Q2S <-> AyeOS I2_S_G64 round-trip
+        // Burn Q2S codes: -1 -> 0b00, 0 -> 0b01, +1 -> 0b10
+        let expected_trits: [i8; 64] = core::array::from_fn(|i| match i % 3 {
+            0 => -1,
+            1 => 0,
+            _ => 1,
+        });
+        let mut burn_q2s = [0u32; 4];
+        for w in 0..4 {
+            let mut word = 0u32;
+            for k in 0..16 {
+                let b_code = (expected_trits[w * 16 + k] + 1) as u32;
+                word |= (b_code & 0x03) << (k * 2);
+            }
+            burn_q2s[w] = word;
+        }
+        let ayeos_16b = burn_q2s_u32_to_ayeos_i2s_g64(&burn_q2s);
+        let unpacked_trits = ayeos_unpack_group64_branchless(&ayeos_16b);
+        assert_eq!(unpacked_trits, expected_trits);
+        let roundtrip_q2s = ayeos_i2s_g64_to_burn_q2s_u32(&ayeos_16b);
+        assert_eq!(roundtrip_q2s, burn_q2s);
+
+        // 2. Q4S <-> AyeOS Zero-Shuffle Block-Planar Q4_G64 round-trip
+        let expected_q4: [i8; 64] = core::array::from_fn(|i| ((i as i8) % 15) - 7);
+        let mut burn_q4s = [0u32; 8];
+        for w in 0..8 {
+            let mut word = 0u32;
+            for k in 0..8 {
+                let b_nib = (expected_q4[w * 8 + k] + 7) as u32;
+                word |= (b_nib & 0x0F) << (k * 4);
+            }
+            burn_q4s[w] = word;
+        }
+        let planar_32b = burn_q4s_u32_to_ayeos_q4_g64(&burn_q4s);
+        let mut emb_out = [0.0f32; 64];
+        ayeos_embed_lookup_q4_g64_planar(0, &planar_32b, &[1.0f32], 64, &mut emb_out);
+        for i in 0..64 {
+            assert_eq!(emb_out[i] as i8, expected_q4[i]);
+        }
+        let roundtrip_q4s = ayeos_q4_g64_to_burn_q4s_u32(&planar_32b);
+        assert_eq!(roundtrip_q4s, burn_q4s);
     }
 }
