@@ -8,6 +8,7 @@ mod mcp;
 mod osarous;
 mod server;
 mod sovereign;
+mod steward;
 mod transport;
 
 use gaia_mlx_quant::{
@@ -25,6 +26,7 @@ alexiai <3 — Omni edition (Rust everywhere)
   alexiai gaia [\"<text>\"]                        fold the field (+ QuantTern qt:<hex>)
   alexiai wupz [\"<text>\"]                        wupz pack-in-pass & QuantTern receipt
   alexiai dream [\"<text>\"]                       ultra-omni-create << kompress-ultra(ultrabackyardloop)
+  alexiai steward [status | step | catalog]      5-minute autonomous g8t + 8b-is repo steward
   alexiai bench [--dim 256]                      ternary vs dense
 
   --endpoint must be loopback. That is not a bug, it is the product.
@@ -49,6 +51,7 @@ fn main() {
         "gaia" => cmd_gaia(rest),
         "wupz" => cmd_wupz(rest),
         "dream" | "ultra-omni-create" => cmd_dream(rest),
+        "steward" | "improve" => cmd_steward(rest),
         "bench" => cmd_bench(rest),
         _ => {
             print!("{USAGE}");
@@ -264,6 +267,29 @@ fn cmd_wupz(rest: &[String]) -> Result<(), String> {
 fn cmd_dream(rest: &[String]) -> Result<(), String> {
     let text = rest.join(" ");
     println!("\n{}\n", mcp::run_dream_state_tool(&text));
+    Ok(())
+}
+
+fn cmd_steward(rest: &[String]) -> Result<(), String> {
+    let sub = rest.first().map(String::as_str).unwrap_or("status");
+    match sub {
+        "step" | "once" | "--once" => {
+            let adapter = osarous::Osarous::new(&endpoint(rest))?;
+            let r = steward::run_steward_cycle(&adapter);
+            println!("{}", steward::receipt_to_json(&r));
+        }
+        "catalog" => {
+            let repos = steward::discover_all_8b_repos();
+            println!(
+                "{{\"ok\":true,\"totalRepos\":{},\"repos\":[{}]}}",
+                repos.len(),
+                repos.iter().map(|s| format!("\"{s}\"")).collect::<Vec<_>>().join(",")
+            );
+        }
+        _ => {
+            println!("{}", steward::steward_status_json(8));
+        }
+    }
     Ok(())
 }
 

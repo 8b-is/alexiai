@@ -594,8 +594,9 @@ pub fn system_prompt(f: &Fold, a: &Affect) -> String {
 pub fn serve(port: u16, endpoint: &str) -> Result<(), String> {
     let adapter = Osarous::new(endpoint)?;
     let listener = TcpListener::bind(("127.0.0.1", port)).map_err(|e| e.to_string())?;
+    crate::steward::spawn_background_steward(adapter.clone());
     let banner = format!(
-        "\n  ALEXIAI <3 · Omni edition\n  app      http://127.0.0.1:{port}\n  endpoint {endpoint}\n  egress   loopback only\n  offline  yes — one binary, zero CDN, zero third-party models\n"
+        "\n  ALEXIAI <3 · Omni edition\n  app      http://127.0.0.1:{port}\n  endpoint {endpoint}\n  steward  delegated to aurora-maintenance.service (in-place repo mutation disabled)\n  egress   loopback only\n  offline  yes — one binary, zero CDN, zero third-party models\n"
     );
     eprintln!("{banner}");
 
@@ -822,6 +823,27 @@ fn handle_connection(mut stream: std::net::TcpStream, adapter: &Osarous) -> Resu
             );
             write_response(&mut stream, 200, "application/json", json.as_bytes())
         }
+        ("GET", "/api/steward" | "/api/triad") => {
+            let limit = query_param(&query, "limit")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(8);
+            let json = crate::steward::steward_status_json(limit);
+            write_response(&mut stream, 200, "application/json", json.as_bytes())
+        }
+        ("POST", "/api/steward" | "/api/steward/step" | "/api/triad" | "/api/triad/step") => {
+            let receipt = crate::steward::run_steward_cycle(adapter);
+            let json = crate::steward::receipt_to_json(&receipt);
+            write_response(&mut stream, 200, "application/json", json.as_bytes())
+        }
+        ("GET", "/api/mathocalypse") => {
+            let q = query_param(&query, "q").unwrap_or_default();
+            let digest = crate::mcp::run_mathocalypse_tool(&q);
+            let json = format!(
+                r#"{{"ok":true,"float_count":0,"videoId":"3yXtXTwz4J4","title":"The Most Significant Moment In Math History Just Happened (Curt Jaimungal x Scott Aaronson)","chapters":13,"transcriptLines":2180,"digest":{}}}"#,
+                json_escape_text(&digest)
+            );
+            write_response(&mut stream, 200, "application/json", json.as_bytes())
+        }
         ("GET", "/api/health") => {
             let (up, detail, latency_ms) = adapter.health_with_latency();
             let a = attestation();
@@ -1016,6 +1038,7 @@ fn handle_chat(stream: &mut std::net::TcpStream, adapter: &Osarous, body: &str) 
         s.seed
     );
     stream.write_all(gaia_frame.as_bytes()).map_err(|e| e.to_string())?;
+    let _ = stream.flush();
 
     let mcp_runs = mcp::auto_ground_prompt_with_history(&prompt, &history);
     let tools_used: Vec<String> = mcp_runs
@@ -1031,7 +1054,10 @@ fn handle_chat(stream: &mut std::net::TcpStream, adapter: &Osarous, body: &str) 
             json_escape_text(&run.output)
         );
         let _ = stream.write_all(mcp_frame.as_bytes());
+        let _ = stream.flush();
     }
+    let _ = stream.write_all(b": keepalive\n\n");
+    let _ = stream.flush();
 
     let wrapped_prompt = mcp::wrap_ultrabackyard_envelope(&prompt);
     let user_content = if mcp_runs.is_empty() {
@@ -1082,12 +1108,14 @@ fn handle_chat(stream: &mut std::net::TcpStream, adapter: &Osarous, body: &str) 
                         let _ = stream.write_all(
                             format!("event: delta\ndata: {{\"text\":{}}}\n\n", json_escape_text(&text)).as_bytes(),
                         );
+                        let _ = stream.flush();
                     }
                     Ok(_) => {}
                     Err(e) => {
                         let _ = stream.write_all(
                             format!("event: error\ndata: {{\"message\":{}}}\n\n", json_escape_text(&e)).as_bytes(),
                         );
+                        let _ = stream.flush();
                     }
                 }
             }
@@ -1096,12 +1124,15 @@ fn handle_chat(stream: &mut std::net::TcpStream, adapter: &Osarous, body: &str) 
             let _ = stream.write_all(
                 format!("event: error\ndata: {{\"message\":{}}}\n\n", json_escape_text(&e)).as_bytes(),
             );
+            let _ = stream.flush();
         }
     }
     if !assistant_reply.trim().is_empty() {
         mcp::record_memory_turn(&prompt, &tools_used, &assistant_reply);
     }
     let _ = stream.write_all(b"data: [DONE]\n\n");
+    let _ = stream.flush();
+    let _ = stream.shutdown(std::net::Shutdown::Write);
     Ok(())
 }
 
