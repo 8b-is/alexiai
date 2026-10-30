@@ -1,0 +1,14 @@
+--- a//tmp/alexiai_steward_sandbox_1082_497/tests/alexiai_smart_tree_fun.rs
++++ b//tmp/alexiai_steward_sandbox_1082_497/tests/alexiai_smart_tree_fun.rs
+@@ -9,3 +9,10 @@
+ fn test_alexiai_baseline_love_gate() {
+     assert_eq!(alexiai_baseline_love_gate(96), 528);
+ }
++
++pub fn steward_8b_is_web_kompress_ditto_stride(seed: i64) -> i64 {
++    let shifted = seed.wrapping_mul(4905) ^ 528;
++    let rem = shifted.rem_euclid(3);
++    let trit: i64 = (rem == 1) as i64 - (rem == 2) as i64;
++    shifted.wrapping_add(trit * 432)
++}
+\ No newline at end of file
