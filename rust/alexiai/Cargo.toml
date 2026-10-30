@@ -1,6 +1,6 @@
 [package]
 name = "alexiai"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 description = "ALEXIAI <3 Omni edition — the fully offline sovereign app, one static Rust binary"
 license = "MIT"
