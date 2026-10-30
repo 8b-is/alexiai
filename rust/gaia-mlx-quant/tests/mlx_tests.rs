@@ -692,3 +692,97 @@ fn rational_wave_cell_16b_and_wave_memory_cell_24b_dds_shader_cascade() {
     let res2 = rational_wave_dds_query(&cells, 10, 0x02, 0xFF, target_color, 24);
     assert_eq!(res, res2);
 }
+
+#[test]
+fn ayeos_m158_header_and_branchless_unpack_and_q4_g64_lmhead() {
+    use gaia_mlx_quant::{
+        AYEOS_M158_MAGIC, InRegisterTopK, ayeos_embed_lookup_q4_g64_planar,
+        ayeos_lmhead_q4_g64_topk_sample, ayeos_parse_m158_header, ayeos_unpack_group64_branchless,
+    };
+
+    // 1. Verify 0b00 -> 0, 0b01 -> +1, 0b10 -> -1 across all 64 lanes
+    let mut packed_16b = [0u8; 16];
+    let expected: [i8; 64] = core::array::from_fn(|idx| match idx % 3 {
+        0 => 0,
+        1 => 1,
+        _ => -1,
+    });
+    for i in 0..16 {
+        let mut b = 0u8;
+        for lane in 0..4 {
+            let t = expected[i * 4 + lane];
+            let code: u8 = if t == 1 {
+                0b01
+            } else if t == -1 {
+                0b10
+            } else {
+                0b00
+            };
+            b |= code << (lane * 2);
+        }
+        packed_16b[i] = b;
+    }
+    let unpacked = ayeos_unpack_group64_branchless(&packed_16b);
+    assert_eq!(unpacked, expected);
+
+    // 2. Verify reading m000.bin's 64-byte AYEM158\0 header from disk if present
+    let m000_path = std::path::Path::new("/data/8b-is/training-pipeline/out/ayeos/m000.bin");
+    if m000_path.exists() {
+        let bytes = std::fs::read(m000_path).expect("read m000.bin");
+        assert!(bytes.len() > 80);
+        let mut hdr_bytes = [0u8; 64];
+        hdr_bytes.copy_from_slice(&bytes[..64]);
+        let hdr = ayeos_parse_m158_header(&hdr_bytes).expect("valid AYEM158\\0 header");
+        assert_eq!(hdr.magic, AYEOS_M158_MAGIC);
+        assert_eq!(hdr.version, 1);
+        assert_eq!(hdr.matrix_idx, 0);
+        assert_eq!(hdr.rows, 1536);
+        assert_eq!(hdr.cols, 1536);
+        assert_eq!(hdr.group_size, 64);
+
+        let mut first_group = [0u8; 16];
+        first_group.copy_from_slice(&bytes[64..80]);
+        let trits = ayeos_unpack_group64_branchless(&first_group);
+        assert!(trits.iter().all(|&t| t == -1 || t == 0 || t == 1));
+        assert!(trits.iter().any(|&t| t != 0));
+    }
+
+    // 3. Verify InRegisterTopK<K> + Gumbel-Max + Zero-Shuffle Block-Planar Q4_G64 LM-Head
+    let mut topk = InRegisterTopK::<4>::new();
+    topk.push(1.5, 10);
+    topk.push(9.2, 42);
+    topk.push(3.1, 7);
+    topk.push(5.0, 99);
+    topk.push(0.2, 1);
+    assert_eq!(topk.items[0].token_id, 42);
+    assert_eq!(topk.items[1].token_id, 99);
+    assert_eq!(topk.items[2].token_id, 7);
+    assert_eq!(topk.items[3].token_id, 10);
+
+    let mut rng = 123456789u64;
+    assert_eq!(topk.sample_gumbel_max(0.0, &mut rng), 42);
+
+    let vocab_size = 8usize;
+    let hidden_dim = 64usize;
+    let mut q4 = vec![0x88u8; vocab_size * 32];
+    for b in &mut q4[5 * 32..6 * 32] {
+        *b = 0xEE; // +6 in both low and high nibbles
+    }
+    let scales = vec![0.25f32; vocab_size];
+    let mut row5 = [0.0f32; 64];
+    ayeos_embed_lookup_q4_g64_planar(5, &q4, &scales, hidden_dim, &mut row5);
+    assert!((row5[0] - 1.5).abs() < 1e-6);
+    assert!((row5[63] - 1.5).abs() < 1e-6);
+
+    let x_norm = [1.0f32; 64];
+    let (best_tok, _) = ayeos_lmhead_q4_g64_topk_sample::<4>(
+        &x_norm,
+        &q4,
+        &scales,
+        vocab_size,
+        hidden_dim,
+        0.0,
+        &mut rng,
+    );
+    assert_eq!(best_tok, 5);
+}

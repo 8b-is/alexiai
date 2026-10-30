@@ -91,20 +91,31 @@ pub use kernel::{
 #[cfg(feature = "std")]
 pub use kernel::{Quantized, quantize_ternary};
 pub use mlx::{
-    DDS_LUT_SIZE, DDS_SINE_LUT_I16, MLX_BYTE_TRITS_I32, MLX_GROUP_SIZE, MLX_GROUP64_COMPRESSION,
+    AYEOS_EQ4G_MAGIC, AYEOS_HEAD_DIM, AYEOS_LOCAL_WINDOW, AYEOS_M158_MAGIC, AYEOS_RESONANT_TOP_M,
+    AlignedLut64, AyeOsMatrixHeader, DDS_LUT_SIZE, DDS_SINE_LUT_I16, InRegisterTopK,
+    KompressedWaveStore, MLX_BYTE_TRITS_I32, MLX_GROUP_SIZE, MLX_GROUP64_COMPRESSION,
     PQ_DEFAULT_Q, Pq, QuantMode, RationalWaveCell, RationalWaveShaderResult, StridedView,
-    TRITS_PER_U32, WaveMemoryCell, b158_matmul_pq_i_major_into, exp_pq, gather_qmm_into,
-    gather_qmm_pq_i64_into, gather_qmm_pq_into, maybe_matmul_into, maybe_matmul_pq_into,
-    mergeq_matmul_into, mergeq_matmul_pq_into, mlx_code_of, mlx_dequantize_group64_into,
-    mlx_dequantize_group64_pq_into, mlx_matmul_pq_group64_i64_into, mlx_matmul_pq_group64_into,
-    mlx_quantize_group64_into, mlx_quantize_group64_pq_into, mlx_quantized_matmul_into,
-    mlx_trit_of, quantize_bfp_i8_group64_into, quantize_bfp_i8_pq_group64_into,
-    quantize_bfp_i16_group64_into, quantize_pq_adaptive_into, quantize_pq_into,
-    rational_wave_dds_query, rms_norm_into, rms_norm_pq_into, rope_into, rope_pq_into,
-    sdpa_pq_i32_single_query_into, sdpa_pq_single_query_into, sdpa_single_query_into, sin_cos_pq,
-    ste_linear_backward_into, ste_linear_backward_pq_into, swiglu_into, swiglu_pq_into,
-    ternary_bfp_adaptive_mem8_matmul_into, ternary_bfp_i8_matmul_into, ternary_bfp_i16_matmul_into,
-    ternary_simd_pq_matmul_into, ternary_transformer_step_into, ternary_transformer_step_pq_into,
+    TRITS_PER_U32, TokenLogit, WAVE_LUT_64, WaveMemoryCell, WaveProbe,
+    ayeos_embed_lookup_q4_g64_planar, ayeos_f16_bits_to_f32, ayeos_lmhead_q4_g64_topk_sample,
+    ayeos_parse_m158_header, ayeos_unpack_group64_branchless, ayeos_wave_routed_attention_step,
+    b158_matmul_pq_i_major_into, eval_dyadic_wave_survivor, exp_pq, fold_int8_to_wave_cell,
+    gather_qmm_into, gather_qmm_pq_i64_into, gather_qmm_pq_into, maybe_matmul_into,
+    maybe_matmul_pq_into, mergeq_matmul_into, mergeq_matmul_pq_into, mlx_code_of,
+    mlx_dequantize_group64_into, mlx_dequantize_group64_pq_into,
+    mlx_matmul_pq_group64_i64_into, mlx_matmul_pq_group64_into, mlx_quantize_group64_into,
+    mlx_quantize_group64_pq_into, mlx_quantized_matmul_into, mlx_trit_of,
+    pack_dyadic_branchless, plane1_morph_color_match, quantize_bfp_i8_group64_into,
+    quantize_bfp_i8_pq_group64_into, quantize_bfp_i16_group64_into, quantize_pq_adaptive_into,
+    quantize_pq_into, rational_wave_dds_query, rms_norm_into, rms_norm_pq_into, rope_into,
+    rope_pq_into, route_resonant_kv, sdpa_pq_i32_single_query_into, sdpa_pq_single_query_into,
+    sdpa_single_query_into, sin_cos_pq, ste_linear_backward_into, ste_linear_backward_pq_into,
+    swiglu_into, swiglu_pq_into, ternary_bfp_adaptive_mem8_matmul_into,
+    ternary_bfp_i8_matmul_into, ternary_bfp_i16_matmul_into, ternary_simd_pq_matmul_into,
+    ternary_transformer_step_into, ternary_transformer_step_pq_into,
+};
+#[cfg(target_arch = "aarch64")]
+pub use mlx::{
+    ayeos_embed_lookup_q4_g64_neon, ayeos_lmhead_q4_g64_topk_sample_neon, ayeos_unpack_group64_neon,
 };
 #[cfg(feature = "std")]
 pub use mlx::MlxQuantizedMatrix;
