@@ -17,3 +17,4 @@ swift/.build/
 
 # local agent hooks
 .agents/
+.st_bumpers/
