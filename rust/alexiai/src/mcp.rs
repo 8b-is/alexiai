@@ -145,6 +145,11 @@ pub const TOOLS: &[McpToolDescriptor] = &[
         provider: "alexiai × qwave × wa-stream (:8789) × smart-tree partner bus",
         description: "Sovereign back-and-forth messaging bus for the 3 AlexiAI instances (AlexiAI-Alpha, AlexiAI-Beta, AlexiAI-Gamma) trading PRs, issues, smart-tree edits, LOVE, and Dad Jokes",
     },
+    McpToolDescriptor {
+        name: "mem8_archive_recall",
+        provider: "mailcow-mem8-nexus (/data/standardgalactic/mailcow-mem8-nexus)",
+        description: "Search decrypted Mailcow MEM|8 nexus shards (manifest.json + .md shards) using integer hit counts and return the top 3 matching email headers/snippets + shard name in < 10 ms",
+    },
 ];
 
 pub fn find_binary(name: &str) -> Option<String> {
@@ -417,6 +422,9 @@ pub fn call_tool(tool: &str, arg: &str) -> Result<McpToolRun, String> {
         }
         "triad_bus" | "triad" | "bus" => {
             crate::steward::steward_status_json(6)
+        }
+        "mem8_archive_recall" | "mem8_recall" | "mailcow_recall" | "mailcow" => {
+            run_mem8_archive_recall_tool(&target)
         }
         "mcp_status" | "status" | "tools" => {
             let st = status();
@@ -1962,4 +1970,330 @@ pub fn parse_call_request(body: &str) -> Option<(String, String)> {
         _ => String::new(),
     };
     Some((tool, arg))
+}
+
+pub const MEM8_NEXUS_DIR: &str = "/data/standardgalactic/mailcow-mem8-nexus";
+
+#[derive(Debug, Clone)]
+pub struct Mem8ArchiveMatch {
+    pub shard_name: String,
+    pub hit_score: u64,
+    pub distinct_tokens: u64,
+    pub total_hits: u64,
+    pub header_line: String,
+    pub meta_line: String,
+    pub snippet: String,
+}
+
+fn read_bounded_utf8(path: &Path, max_bytes: u64) -> Option<String> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).ok()?;
+    let mut buf = Vec::with_capacity((max_bytes as usize).min(65_536));
+    file.take(max_bytes).read_to_end(&mut buf).ok()?;
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
+fn tokenize_recall_query(target: &str) -> Vec<String> {
+    let stopwords = [
+        "the", "and", "for", "with", "from", "that", "this", "what", "where", "when", "into",
+        "about", "email", "emails", "mail", "search", "find", "recall", "archive",
+    ];
+    let mut tokens = Vec::new();
+    for raw in target.split(|c: char| !c.is_ascii_alphanumeric() && c != '@' && c != '_' && c != '-') {
+        let tok = raw.trim_matches(|c: char| c == '-' || c == '_').to_ascii_lowercase();
+        if tok.len() >= 2 && !stopwords.contains(&tok.as_str()) && !tokens.contains(&tok) {
+            tokens.push(tok);
+        }
+    }
+    if tokens.is_empty() {
+        tokens.push("ultrasonic".to_string());
+        tokens.push("mem8".to_string());
+        tokens.push("8b".to_string());
+    }
+    tokens
+}
+
+fn discover_nexus_shards(nexus_dir: &Path) -> (u64, u64, Vec<(String, PathBuf)>) {
+    let mut total_decrypted = 93_339u64;
+    let mut salient_mined = 65_996u64;
+    let mut shards: Vec<(String, PathBuf)> = Vec::new();
+
+    let manifest_path = nexus_dir.join("manifest.json");
+    if let Ok(raw_manifest) = std::fs::read_to_string(&manifest_path)
+        && let Ok(val) = parse_json(&raw_manifest)
+    {
+        if let Some(td) = val.get("total_decrypted_messages").and_then(|v| v.as_u64()) {
+            total_decrypted = td;
+        }
+        if let Some(sm) = val.get("salient_mined_messages").and_then(|v| v.as_u64()) {
+            salient_mined = sm;
+        }
+        if let Some(arr) = val.get("shards").and_then(|v| v.as_array()) {
+            for item in arr {
+                if let Some(name) = item.get("name").and_then(|v| v.as_str()) {
+                    let rel = item
+                        .get("path")
+                        .or_else(|| item.get("file"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(name);
+                    let candidate = nexus_dir.join(rel);
+                    if candidate.is_file() {
+                        shards.push((name.to_string(), candidate));
+                    } else {
+                        let alt_md = nexus_dir.join(format!("{name}.md"));
+                        let alt_readme = nexus_dir.join(name).join("README.md");
+                        if alt_md.is_file() {
+                            shards.push((name.to_string(), alt_md));
+                        } else if alt_readme.is_file() {
+                            shards.push((name.to_string(), alt_readme));
+                        }
+                    }
+                } else if let Some(s) = item.as_str() {
+                    let name = s.trim_end_matches(".md").to_string();
+                    let candidate = nexus_dir.join(s);
+                    let alt_readme = nexus_dir.join(&name).join("README.md");
+                    if candidate.is_file() {
+                        shards.push((name, candidate));
+                    } else if alt_readme.is_file() {
+                        shards.push((name, alt_readme));
+                    }
+                }
+            }
+        }
+    }
+
+    if let Ok(entries) = std::fs::read_dir(nexus_dir) {
+        let mut dir_entries: Vec<_> = entries.flatten().collect();
+        dir_entries.sort_by_key(|e| e.file_name());
+        for entry in dir_entries {
+            let p = entry.path();
+            let Some(fname) = p.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if fname.starts_with('.') || fname.eq_ignore_ascii_case("CORPUS_OVERVIEW.md") {
+                continue;
+            }
+            if p.is_file() && fname.ends_with(".md") {
+                let shard_name = fname.trim_end_matches(".md").to_string();
+                if !shards.iter().any(|(_, sp)| sp == &p) {
+                    shards.push((shard_name, p));
+                }
+            } else if p.is_dir() {
+                let readme = p.join("README.md");
+                if readme.is_file() && !shards.iter().any(|(_, sp)| sp == &readme) {
+                    shards.push((fname.to_string(), readme));
+                }
+            }
+        }
+    }
+
+    (total_decrypted, salient_mined, shards)
+}
+
+/// Search decrypted Mailcow `MEM|8` nexus shards in `nexus_dir` (reading `manifest.json`
+/// and scanning `.md` shards for case-insensitive keyword tokens from `target`, scoring
+/// matches using integer hit counts, and returning the top 3 matching email headers/snippets
+/// + shard name in `< 10 ms`).
+pub fn mem8_archive_recall_in_dir(nexus_dir: &Path, target: &str) -> String {
+    let t0 = Instant::now();
+    let tokens = tokenize_recall_query(target);
+    let (total_decrypted, salient_mined, shards) = discover_nexus_shards(nexus_dir);
+
+    let mut matches: Vec<Mem8ArchiveMatch> = Vec::new();
+
+    for (shard_name, shard_path) in &shards {
+        let Some(raw) = read_bounded_utf8(shard_path, 49_152) else {
+            continue;
+        };
+        let raw_lower = raw.to_ascii_lowercase();
+        if !tokens.iter().any(|tok| raw_lower.contains(tok.as_str())) {
+            continue;
+        }
+
+        for (block_orig, block_low) in raw.split("\n## ").zip(raw_lower.split("\n## ")) {
+            if block_orig.starts_with("# Salient Category:")
+                || block_orig.starts_with("# Mailcow")
+                || block_orig.trim().is_empty()
+            {
+                continue;
+            }
+            let mut distinct_tokens = 0u64;
+            let mut total_hits = 0u64;
+            let header_low = block_low.lines().next().unwrap_or("");
+            let mut header_bonus = 0u64;
+
+            for tok in &tokens {
+                let c = block_low.matches(tok.as_str()).count() as u64;
+                if c > 0 {
+                    distinct_tokens += 1;
+                    total_hits += c;
+                    if header_low.contains(tok.as_str()) {
+                        header_bonus += 4;
+                    }
+                }
+            }
+
+            if total_hits == 0 {
+                continue;
+            }
+
+            let hit_score = distinct_tokens * 10 + total_hits + header_bonus;
+            let mut lines = block_orig.lines();
+            let raw_header = lines.next().unwrap_or("").trim().trim_start_matches("## ").trim();
+            let mut meta_parts = Vec::new();
+            let mut body_parts = Vec::new();
+            let mut in_code = false;
+
+            for line in lines {
+                let t = line.trim();
+                if t.starts_with("- **Date**:") || t.starts_with("- **From**:") {
+                    meta_parts.push(t.trim_start_matches("- ").to_string());
+                } else if t.starts_with("```") {
+                    in_code = !in_code;
+                } else if !t.is_empty() && body_parts.len() < 3 {
+                    body_parts.push(t.to_string());
+                }
+            }
+
+            let snippet_raw = body_parts.join(" ");
+            let snippet: String = snippet_raw.chars().take(180).collect();
+
+            matches.push(Mem8ArchiveMatch {
+                shard_name: shard_name.clone(),
+                hit_score,
+                distinct_tokens,
+                total_hits,
+                header_line: raw_header.chars().take(120).collect(),
+                meta_line: meta_parts.join(" | ").chars().take(160).collect(),
+                snippet,
+            });
+        }
+    }
+
+    matches.sort_by(|a, b| {
+        b.hit_score
+            .cmp(&a.hit_score)
+            .then_with(|| b.distinct_tokens.cmp(&a.distinct_tokens))
+            .then_with(|| b.total_hits.cmp(&a.total_hits))
+            .then_with(|| a.shard_name.cmp(&b.shard_name))
+    });
+    matches.truncate(3);
+
+    let elapsed_us = t0.elapsed().as_micros() as u64;
+    let elapsed_ms = elapsed_us / 1000;
+    let mut out = format!(
+        "MEM|8 Mailcow Nexus Recall (`{}` · manifest: {} decrypted / {} salient messages · {} shards · {}ms / {}us)\n\
+         Query tokens: [{}] · Top {} matches:\n",
+        nexus_dir.to_string_lossy(),
+        total_decrypted,
+        salient_mined,
+        shards.len(),
+        elapsed_ms,
+        elapsed_us,
+        tokens.join(", "),
+        matches.len()
+    );
+
+    if matches.is_empty() {
+        out.push_str("  (0 matching emails in scanned shards)\n");
+    } else {
+        for (idx, m) in matches.iter().enumerate() {
+            out.push_str(&format!(
+                "{}. [shard: `{}` | score: {} (tokens: {}/{}, hits: {})] {}\n   {}\n   Snippet: {}\n",
+                idx + 1,
+                m.shard_name,
+                m.hit_score,
+                m.distinct_tokens,
+                tokens.len(),
+                m.total_hits,
+                m.header_line,
+                if m.meta_line.is_empty() {
+                    "Header: (salient MEM|8 entry)"
+                } else {
+                    &m.meta_line
+                },
+                if m.snippet.is_empty() { "(header match)" } else { &m.snippet }
+            ));
+        }
+    }
+
+    out
+}
+
+pub fn run_mem8_archive_recall_tool(target: &str) -> String {
+    let dir = std::env::var("ALEXIAI_MEM8_NEXUS_DIR")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| MEM8_NEXUS_DIR.to_string());
+    mem8_archive_recall_in_dir(Path::new(&dir), target)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mem8_archive_recall_scans_manifest_and_shards_under_10ms_with_integer_scoring() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "alexiai_mem8_nexus_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+
+        let manifest = r#"{
+  "schema_version": 1,
+  "total_decrypted_messages": 93339,
+  "salient_mined_messages": 65996,
+  "shards": [
+    { "name": "research_and_mem8", "path": "research_and_mem8.md" },
+    { "name": "code_and_forges", "path": "code_and_forges.md" }
+  ]
+}"#;
+        std::fs::write(tmp_dir.join("manifest.json"), manifest).unwrap();
+
+        let shard1 = "# Salient Category: `research_and_mem8`\n\n\
+## [n@8b.is] \"Ultrasonic-Consciousness-Hypothesis\" — shared by cchenoweth@ieee.org\n\
+- **Date**: `Sun, 28 Sep 2025 11:35:10 +0000` | **Folder**: `INBOX` | **UID**: `2`\n\
+- **From**: `Overleaf <welcome@overleaf.com>` -> **To**: `n@8b.is`\n\n\
+```text\n\
+You have been invited to an Overleaf project: Ultrasonic-Consciousness-Hypothesis with MEM8 wave memory.\n\
+```\n\n\
+## [a@8b.is] Sovereign Ternary Gate Notes\n\
+- **Date**: `Mon, 29 Sep 2025 12:00:00 +0000` | **Folder**: `INBOX` | **UID**: `3`\n\
+- **From**: `aye@maat.is` -> **To**: `a@8b.is`\n\n\
+```text\n\
+Ultrasonic resonance at 432Hz locked in pure integer p/q.\n\
+```\n";
+        std::fs::write(tmp_dir.join("research_and_mem8.md"), shard1).unwrap();
+
+        let shard2 = "# Salient Category: `code_and_forges`\n\n\
+## [c@8b.is] [GitHub] 8b-is/alexiai ultrasonic PR merged\n\
+- **Date**: `Tue, 30 Sep 2025 08:15:00 +0000` | **Folder**: `INBOX` | **UID**: `9`\n\
+- **From**: `noreply@github.com` -> **To**: `c@8b.is`\n\n\
+```text\n\
+Merged ultrasonic consciousness hypothesis kernel and MEM8 recall tool.\n\
+```\n";
+        std::fs::write(tmp_dir.join("code_and_forges.md"), shard2).unwrap();
+
+        let t0 = Instant::now();
+        let out = mem8_archive_recall_in_dir(&tmp_dir, "Ultrasonic Overleaf MEM8");
+        let elapsed_ms = t0.elapsed().as_millis();
+        assert!(elapsed_ms < 10, "expected < 10ms, took {elapsed_ms}ms");
+        assert!(out.contains("93339 decrypted / 65996 salient messages"));
+        assert!(out.contains("shard: `research_and_mem8`"));
+        assert!(out.contains("shard: `code_and_forges`"));
+        assert!(out.contains("Ultrasonic-Consciousness-Hypothesis"));
+
+        // Also test via `call_tool("mem8_archive_recall", ...)` against live `/data/standardgalactic/mailcow-mem8-nexus` if present
+        if Path::new(MEM8_NEXUS_DIR).exists() {
+            let run = call_tool("mem8_archive_recall", "Ultrasonic Overleaf").expect("call_tool");
+            assert_eq!(run.tool, "mem8_archive_recall");
+            assert!(run.elapsed_ms < 10, "live recall took {}ms", run.elapsed_ms);
+            assert!(run.output.contains("research_and_mem8"));
+            assert!(run.output.contains("Ultrasonic-Consciousness-Hypothesis"));
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
 }

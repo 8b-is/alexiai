@@ -12,6 +12,8 @@
 //!    and `/home/hue/8b-is/g8t/ALEXIAI_STEWARD_LEDGER.md`.
 
 use std::fs;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -23,6 +25,8 @@ use crate::server;
 
 pub const STEWARD_INTERVAL_SECS: u64 = 300;
 pub const WORKSPACE_ROOT: &str = "/home/hue/8b-is";
+pub const DEFAULT_VLAN4010_STEWARD_ENDPOINT: &str = "http://10.101.40.8:11434";
+pub const STEWARD_LAST_HASH_PATH: &str = "/tmp/alexiai-steward-last-hash.txt";
 
 #[derive(Debug, Clone)]
 pub struct RepoAudit {
@@ -105,6 +109,226 @@ pub struct StewardCycleReceipt {
     pub alexiai_instances: Vec<AlexiAiAgentInstance>,
     pub smart_tree_edit: SmartTreeEditReceipt,
     pub git_lifecycle: GitLifecycleReceipt,
+    pub vlan4010_gpu_online: bool,
+    pub vlan4010_endpoint: String,
+    pub state_delta_hash: String,
+    pub state_changed: bool,
+}
+
+#[allow(dead_code)]
+pub type StewardReceipt = StewardCycleReceipt;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoSyncState {
+    pub eligible: bool,
+    pub dirty: bool,
+    pub diverged: bool,
+    pub ff_synced: bool,
+    pub head_rev: String,
+    pub status_output: String,
+}
+
+/// Resolve the VLAN 4010 background steward endpoint from `ALEXIAI_STEWARD_ENDPOINT`
+/// or default to `http://10.101.40.8:11434` (RTX 4000 SFF Ada node).
+pub fn resolve_steward_vlan4010_endpoint() -> String {
+    let raw = std::env::var("ALEXIAI_STEWARD_ENDPOINT")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_VLAN4010_STEWARD_ENDPOINT.to_string());
+    normalize_vlan4010_endpoint(&raw)
+}
+
+pub fn normalize_vlan4010_endpoint(endpoint: &str) -> String {
+    let trimmed = endpoint.trim().trim_end_matches('/');
+    let without_tags = trimmed.strip_suffix("/api/tags").unwrap_or(trimmed);
+    without_tags.trim_end_matches('/').to_string()
+}
+
+/// Probe `http://10.101.40.8:11434/api/tags` (or configured `ALEXIAI_STEWARD_ENDPOINT`)
+/// with a 250ms TCP connect check for steward Dual-GPU VLAN 4010 lane-splitting telemetry.
+pub fn probe_vlan4010_steward_gpu(endpoint: &str) -> (String, bool) {
+    let base = normalize_vlan4010_endpoint(endpoint);
+    let rest = base
+        .strip_prefix("http://")
+        .or_else(|| base.strip_prefix("https://"))
+        .unwrap_or(&base);
+    let authority = rest.split(['/', '?']).next().unwrap_or("10.101.40.8:11434");
+    let addr_str = if authority.contains(':') {
+        authority.to_string()
+    } else {
+        format!("{authority}:11434")
+    };
+    let timeout = Duration::from_millis(250);
+    let Ok(sock_addr) = addr_str.parse::<SocketAddr>() else {
+        return (base, false);
+    };
+    let Ok(mut stream) = TcpStream::connect_timeout(&sock_addr, timeout) else {
+        return (base, false);
+    };
+    let _ = stream.set_read_timeout(Some(timeout));
+    let _ = stream.set_write_timeout(Some(timeout));
+    let req = format!(
+        "GET /api/tags HTTP/1.0\r\nHost: {authority}\r\nConnection: close\r\n\r\n"
+    );
+    let _ = stream.write_all(req.as_bytes());
+    let mut buf = [0u8; 64];
+    let _ = stream.read(&mut buf);
+    (base, true)
+}
+
+/// Compute a deterministic 64-bit FNV-1a hex digest (`0x<16-hex>`).
+pub fn compute_fnv1a64_hex(input: &[u8]) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in input {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("0x{hash:016x}")
+}
+
+/// Before `run_steward_cycle` modifies or audits a candidate repository:
+/// 1. Run `git -C <repo> fetch origin --quiet` and `git -C <repo> merge --ff-only @{u}`
+///    (ignoring errors if offline).
+/// 2. Inspect working tree status and upstream divergence (`[ahead, behind]`) so `steward`
+///    skips any repo that is dirty or diverged and NEVER commits on top of a diverged branch.
+pub fn sync_and_check_repo_eligibility(repo_path: &Path) -> RepoSyncState {
+    let repo_str = repo_path.to_string_lossy().to_string();
+    if !repo_path.join(".git").exists() {
+        return RepoSyncState {
+            eligible: false,
+            dirty: false,
+            diverged: false,
+            ff_synced: false,
+            head_rev: "000000000000".to_string(),
+            status_output: String::new(),
+        };
+    }
+
+    // Best-effort fast-forward sync with origin when a remote is configured
+    let has_origin = Command::new("git")
+        .args(["-C", &repo_str, "remote", "get-url", "origin"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    let mut ff_synced = false;
+    if has_origin && std::env::var("ALEXIAI_STEWARD_SKIP_FETCH").as_deref() != Ok("1") {
+        let _ = Command::new("git")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .args([
+                "-C",
+                &repo_str,
+                "-c",
+                "http.lowSpeedLimit=1000",
+                "-c",
+                "http.lowSpeedTime=2",
+                "fetch",
+                "origin",
+                "--quiet",
+            ])
+            .output();
+        ff_synced = Command::new("git")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .args(["-C", &repo_str, "merge", "--ff-only", "@{u}"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+    }
+
+    let head_rev = Command::new("git")
+        .args(["-C", &repo_str, "rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "8b150000c640".to_string());
+
+    let status_sb = Command::new("git")
+        .args(["-C", &repo_str, "status", "--porcelain", "-b"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+
+    let mut branch_header = String::new();
+    let mut dirty = false;
+    for line in status_sb.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with("## ") {
+            branch_header = trimmed.to_string();
+            continue;
+        }
+        // Ignore Smart-Tree metadata folder `.st/` when checking repo cleanliness
+        if trimmed.ends_with(" .st/") || trimmed.ends_with(" .st") || trimmed.contains(" .st/") {
+            continue;
+        }
+        dirty = true;
+    }
+
+    let mut diverged = branch_header.contains("ahead ") && branch_header.contains("behind ");
+    if !diverged
+        && let Ok(out) = Command::new("git")
+            .args(["-C", &repo_str, "rev-list", "--left-right", "--count", "HEAD...@{u}"])
+            .output()
+        && out.status.success()
+    {
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut parts = text.split_whitespace();
+        let ahead = parts.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+        let behind = parts.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+        if ahead > 0 && behind > 0 {
+            diverged = true;
+        }
+    }
+
+    RepoSyncState {
+        eligible: !dirty && !diverged,
+        dirty,
+        diverged,
+        ff_synced,
+        head_rev,
+        status_output: status_sb,
+    }
+}
+
+/// Compute a deterministic 64-bit FNV-1a hex digest (`state_delta_hash`) over the repo's
+/// HEAD revision and status, and compare/persist against `last_hash_file`
+/// (`/tmp/alexiai-steward-last-hash.txt`).
+pub fn compute_repo_state_delta(repo_path: &Path, last_hash_file: &Path) -> (String, bool) {
+    let sync_state = if repo_path.join(".git").exists() {
+        let repo_str = repo_path.to_string_lossy().to_string();
+        let head = Command::new("git")
+            .args(["-C", &repo_str, "rev-parse", "HEAD"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+        let status = Command::new("git")
+            .args(["-C", &repo_str, "status", "--porcelain", "-b"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+        format!("head={head}\nstatus={status}")
+    } else {
+        format!("path={}", repo_path.to_string_lossy())
+    };
+    let state_delta_hash = compute_fnv1a64_hex(sync_state.as_bytes());
+    let prev_hash = fs::read_to_string(last_hash_file)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    let state_changed = prev_hash != state_delta_hash;
+    let _ = fs::write(last_hash_file, format!("{state_delta_hash}\n"));
+    (state_delta_hash, state_changed)
 }
 
 fn now_secs() -> u64 {
@@ -733,34 +957,38 @@ pub fn execute_git_and_runner_lifecycle(
     let mut pushed = false;
 
     if allow_inplace && rustc_test_passed && repo_path.join(".git").exists() {
-        let commit_msg = scrub_float_literals(&format!(
-            "feat({slug}): AlexiAI Triad + Smart-Tree AST `{fn_name}` ({version_tag}) <3 — {dad_joke}"
-        ));
-        let _ = Command::new("git")
-            .args(["-C", &repo_str, "add", "tests/alexiai_smart_tree_fun.rs"])
-            .output();
-        let _ = Command::new("git")
-            .args([
-                "-C",
-                &repo_str,
-                "-c",
-                "user.name=AlexiAI-Triad-Council",
-                "-c",
-                "user.email=alexiai@8b.is",
-                "commit",
-                "--quiet",
-                "-m",
-                &commit_msg,
-            ])
-            .output();
-        pr_merged = true;
+        let sync_state = sync_and_check_repo_eligibility(repo_path);
+        // Never commit on top of a diverged branch (`[ahead, behind]`)
+        if !sync_state.diverged {
+            let commit_msg = scrub_float_literals(&format!(
+                "feat({slug}): AlexiAI Triad + Smart-Tree AST `{fn_name}` ({version_tag}) <3 — {dad_joke}"
+            ));
+            let _ = Command::new("git")
+                .args(["-C", &repo_str, "add", "tests/alexiai_smart_tree_fun.rs"])
+                .output();
+            let _ = Command::new("git")
+                .args([
+                    "-C",
+                    &repo_str,
+                    "-c",
+                    "user.name=AlexiAI-Triad-Council",
+                    "-c",
+                    "user.email=alexiai@8b.is",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    &commit_msg,
+                ])
+                .output();
+            pr_merged = true;
 
-        if live_git_enabled {
-            pushed = Command::new("git")
-                .args(["-C", &repo_str, "push", "--quiet"])
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false);
+            if live_git_enabled {
+                pushed = Command::new("git")
+                    .args(["-C", &repo_str, "push", "--quiet"])
+                    .output()
+                    .map(|o| o.status.success())
+                    .unwrap_or(false);
+            }
         }
     }
 
@@ -820,12 +1048,27 @@ pub fn run_steward_cycle(adapter: &Osarous) -> StewardCycleReceipt {
     let total_repos = repos.len().max(1);
     let (prev_cycle, prev_cursor) = load_steward_cursor();
     let cycle_id = prev_cycle + 1;
-    let cursor_index = prev_cursor % total_repos;
+    let mut cursor_index = prev_cursor % total_repos;
 
-    let target_slug = repos
+    // Upgrade #4: Before modifying or auditing a candidate repository, fetch/fast-forward
+    // (`git -C <repo> fetch origin --quiet` + `git -C <repo> merge --ff-only @{u}`) and skip
+    // any repo that is dirty or diverged (`[ahead, behind]`).
+    let mut target_slug = repos
         .get(cursor_index)
         .cloned()
         .unwrap_or_else(|| "g8t".to_string());
+    let max_probes = total_repos.min(16);
+    for step in 0..max_probes {
+        let idx = (prev_cursor + step) % total_repos;
+        let candidate_slug = &repos[idx];
+        let candidate_path = resolve_repo_path(candidate_slug);
+        let sync_state = sync_and_check_repo_eligibility(&candidate_path);
+        if sync_state.eligible {
+            cursor_index = idx;
+            target_slug = candidate_slug.clone();
+            break;
+        }
+    }
 
     let mut cohort_slugs = vec!["g8t".to_string()];
     for offset in 0..4 {
@@ -839,6 +1082,10 @@ pub fn run_steward_cycle(adapter: &Osarous) -> StewardCycleReceipt {
     let target_audit = audit_repository(&target_slug, cycle_id);
     let room_seat_pq = read_room_seat_pq();
     let repo_path = resolve_repo_path(&target_slug);
+    let (state_delta_hash, state_changed) =
+        compute_repo_state_delta(&repo_path, Path::new(STEWARD_LAST_HASH_PATH));
+    let steward_ep = resolve_steward_vlan4010_endpoint();
+    let (vlan4010_endpoint, vlan4010_gpu_online) = probe_vlan4010_steward_gpu(&steward_ep);
 
     let fold_seed_text = format!(
         "steward:{}:{}:{}:{}:{}",
@@ -1119,6 +1366,10 @@ pub fn run_steward_cycle(adapter: &Osarous) -> StewardCycleReceipt {
         alexiai_instances,
         smart_tree_edit: st_edit_receipt,
         git_lifecycle,
+        vlan4010_gpu_online,
+        vlan4010_endpoint,
+        state_delta_hash,
+        state_changed,
     };
 
     persist_steward_receipt(&receipt);
@@ -1239,9 +1490,13 @@ pub fn receipt_to_json(r: &StewardCycleReceipt) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!(
-        r#"{{"ok":true,"float_count":0,"cycleId":{},"timestampSecs":{},"intervalSecs":{STEWARD_INTERVAL_SECS},"totalReposDiscovered":{},"cursorIndex":{},"g8tCommit":{},"g8tLoc":{},"cohort":[{cohort_json}],"targetRepo":{{"slug":{},"title":{},"category":{},"languageLane":{},"gitCommit":{},"commitSubject":{},"locEstimate":{},"rustFiles":{},"floatTokens":{},"integerPqTokens":{},"purityPq":{},"healthTrit":{},"candidateCapsuleFn":{},"candidateCapsuleSig":{},"candidateCapsuleCode":{}}},"gaiaDominant":{},"quantTern":{},"wupzXorFold":{},"roomSeatPq":{},"modelUsed":{},"improvementThought":{},"dadJoke":{},"alexiaiInstances":[{instances_json}],"smartTreeEdit":{{"filePath":{},"operation":{},"functionName":{},"astVerified":{},"rustcTestPassed":{},"diffStored":{},"stOutputPreview":{}}},"gitLifecycle":{{"pulledRebased":{},"issueId":{},"issueTitle":{},"issueStatus":{},"prBranch":{},"prMerged":{},"versionTag":{},"pushed":{},"runnerHealthPq":{},"cleanedRunnerArtifacts":{}}}}}"#,
+        r#"{{"ok":true,"float_count":0,"cycleId":{},"timestampSecs":{},"intervalSecs":{STEWARD_INTERVAL_SECS},"vlan4010_gpu_online":{},"vlan4010_endpoint":{},"stateDeltaHash":{},"stateChanged":{},"totalReposDiscovered":{},"cursorIndex":{},"g8tCommit":{},"g8tLoc":{},"cohort":[{cohort_json}],"targetRepo":{{"slug":{},"title":{},"category":{},"languageLane":{},"gitCommit":{},"commitSubject":{},"locEstimate":{},"rustFiles":{},"floatTokens":{},"integerPqTokens":{},"purityPq":{},"healthTrit":{},"candidateCapsuleFn":{},"candidateCapsuleSig":{},"candidateCapsuleCode":{}}},"gaiaDominant":{},"quantTern":{},"wupzXorFold":{},"roomSeatPq":{},"modelUsed":{},"improvementThought":{},"dadJoke":{},"alexiaiInstances":[{instances_json}],"smartTreeEdit":{{"filePath":{},"operation":{},"functionName":{},"astVerified":{},"rustcTestPassed":{},"diffStored":{},"stOutputPreview":{}}},"gitLifecycle":{{"pulledRebased":{},"issueId":{},"issueTitle":{},"issueStatus":{},"prBranch":{},"prMerged":{},"versionTag":{},"pushed":{},"runnerHealthPq":{},"cleanedRunnerArtifacts":{}}}}}"#,
         r.cycle_id,
         r.timestamp_secs,
+        r.vlan4010_gpu_online,
+        escape_json_str(&r.vlan4010_endpoint),
+        escape_json_str(&r.state_delta_hash),
+        r.state_changed,
         r.total_repos_discovered,
         r.cursor_index,
         escape_json_str(&r.g8t_commit),
@@ -1308,8 +1563,15 @@ pub fn steward_status_json(limit: usize) -> String {
         .get(cursor_index % repos.len().max(1))
         .cloned()
         .unwrap_or_else(|| "g8t".to_string());
+    let next_repo_path = resolve_repo_path(&next_slug);
+    let (state_delta_hash, state_changed) =
+        compute_repo_state_delta(&next_repo_path, Path::new(STEWARD_LAST_HASH_PATH));
+    let steward_ep = resolve_steward_vlan4010_endpoint();
+    let (vlan4010_endpoint, vlan4010_gpu_online) = probe_vlan4010_steward_gpu(&steward_ep);
     format!(
-        r#"{{"ok":true,"active":true,"float_count":0,"intervalSecs":{STEWARD_INTERVAL_SECS},"totalReposDiscovered":{},"completedCycles":{cycle_id},"cursorIndex":{cursor_index},"primaryHub":"g8t","nextTargetRepo":{},"agents":["AlexiAI-Alpha (Aye · Architect & Issue Opener)","AlexiAI-Beta (Cheet · Adversarial Verifier & PR Reviewer)","AlexiAI-Gamma (Omni · Smart-Tree AST Modifier, Merger & Runner Steward)"],"knowledgeAnchor":"mathocalypse-3yXtXTwz4J4","triadBusMessages":[{recent_bus}],"recentCycles":[{recent}]}}"#,
+        r#"{{"ok":true,"active":true,"float_count":0,"intervalSecs":{STEWARD_INTERVAL_SECS},"vlan4010_gpu_online":{vlan4010_gpu_online},"vlan4010_endpoint":{},"stateDeltaHash":{},"stateChanged":{state_changed},"totalReposDiscovered":{},"completedCycles":{cycle_id},"cursorIndex":{cursor_index},"primaryHub":"g8t","nextTargetRepo":{},"agents":["AlexiAI-Alpha (Aye · Architect & Issue Opener)","AlexiAI-Beta (Cheet · Adversarial Verifier & PR Reviewer)","AlexiAI-Gamma (Omni · Smart-Tree AST Modifier, Merger & Runner Steward)"],"knowledgeAnchor":"mathocalypse-3yXtXTwz4J4","triadBusMessages":[{recent_bus}],"recentCycles":[{recent}]}}"#,
+        escape_json_str(&vlan4010_endpoint),
+        escape_json_str(&state_delta_hash),
         repos.len(),
         escape_json_str(&next_slug),
     )
@@ -1467,5 +1729,89 @@ mod tests {
         assert!(run.status.success());
 
         let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn vlan4010_steward_probe_and_state_delta_hash_work_with_zero_floats() {
+        use std::net::TcpListener;
+
+        let (def_ep, _online) = probe_vlan4010_steward_gpu(DEFAULT_VLAN4010_STEWARD_ENDPOINT);
+        assert_eq!(def_ep, "http://10.101.40.8:11434");
+
+        // Spin up a local ephemeral TCP listener to verify 250ms probe marks GPU online
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let _ = s.write_all(b"HTTP/1.0 200 OK\r\n\r\n{\"models\":[]}");
+            }
+        });
+        let probe_url = format!("http://127.0.0.1:{port}/api/tags");
+        let (norm_ep, is_online) = probe_vlan4010_steward_gpu(&probe_url);
+        assert_eq!(norm_ep, format!("http://127.0.0.1:{port}"));
+        assert!(is_online);
+
+        // Verify deterministic FNV-1a 64-bit state_delta_hash and stateChanged tracking
+        let pid = std::process::id();
+        let tmp_dir = std::env::temp_dir().join(format!("alexiai_steward_delta_test_{pid}"));
+        let hash_file = std::env::temp_dir().join(format!("alexiai_steward_hash_test_{pid}.txt"));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        let _ = fs::remove_file(&hash_file);
+        fs::create_dir_all(&tmp_dir).unwrap();
+
+        let _ = Command::new("git")
+            .args(["init", "--quiet", &tmp_dir.to_string_lossy()])
+            .output();
+        fs::write(tmp_dir.join("lib.rs"), "pub fn pure_int() -> i64 { 432 }\n").unwrap();
+        let _ = Command::new("git")
+            .args(["-C", &tmp_dir.to_string_lossy(), "add", "lib.rs"])
+            .output();
+        let _ = Command::new("git")
+            .args([
+                "-C",
+                &tmp_dir.to_string_lossy(),
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@8b.is",
+                "commit",
+                "--quiet",
+                "-m",
+                "init",
+            ])
+            .output();
+
+        let (h1, changed1) = compute_repo_state_delta(&tmp_dir, &hash_file);
+        assert!(h1.starts_with("0x") && h1.len() == 18);
+        assert!(changed1);
+
+        let (h2, changed2) = compute_repo_state_delta(&tmp_dir, &hash_file);
+        assert_eq!(h1, h2);
+        assert!(!changed2);
+
+        // Clean repo is eligible
+        let clean_sync = sync_and_check_repo_eligibility(&tmp_dir);
+        assert!(clean_sync.eligible);
+        assert!(!clean_sync.dirty);
+        assert!(!clean_sync.diverged);
+
+        // Dirty repo is skipped (not eligible) and changes stateDeltaHash
+        fs::write(tmp_dir.join("lib.rs"), "pub fn pure_int() -> i64 { 528 }\n").unwrap();
+        let dirty_sync = sync_and_check_repo_eligibility(&tmp_dir);
+        assert!(!dirty_sync.eligible);
+        assert!(dirty_sync.dirty);
+
+        let (h3, changed3) = compute_repo_state_delta(&tmp_dir, &hash_file);
+        assert_ne!(h1, h3);
+        assert!(changed3);
+
+        let status_json = steward_status_json(2);
+        assert!(status_json.contains("\"vlan4010_gpu_online\":"));
+        assert!(status_json.contains("\"vlan4010_endpoint\":\"http://10.101.40.8:11434\""));
+        assert!(status_json.contains("\"stateDeltaHash\":\"0x"));
+        assert!(status_json.contains("\"stateChanged\":"));
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+        let _ = fs::remove_file(&hash_file);
     }
 }
