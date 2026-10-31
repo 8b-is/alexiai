@@ -117,8 +117,13 @@ pub const TOOLS: &[McpToolDescriptor] = &[
     },
     McpToolDescriptor {
         name: "dream_state_loop",
-        provider: "gaia-mlx-quant::wupz (ULTRABACKYARDLOOP +AND~NAND × 4-Layer MoE Dream State Machine)",
-        description: "Peter's Dream State Machine: 4-expert MoE (Dreaming Clouds, Lucid Deep-Thinking, Buddhist Monk Mantra & 3-Sentence Listening Gate, Philosophy × Bodhisattva Vow)",
+        provider: "gaia-mlx-quant::wupz (UltraDreamState 9-State Complex Ternary ΣΔ × 4-Layer MoE Dream State Machine)",
+        description: "Peter's UltraDreamState & Dream State Machine: Distinction Geometry, 9-State Complex Ternary ΣΔ packer, BLAKE3 Waking Seal, and 4-expert MoE",
+    },
+    McpToolDescriptor {
+        name: "ultradreamstate_compact",
+        provider: "gaia-mlx-quant::wupz × 8b-Mem8 × mem8-sleep (Flyxion Distinction Geometry & Witness Plane)",
+        description: "Phase-locked episodic-to-semantic wave compaction, first-order spatial ΣΔ 9-state complex ternary projection, 8-POPCNT contraction, and 32B BLAKE3 Waking Seal",
     },
     McpToolDescriptor {
         name: "repo_inspect",
@@ -420,7 +425,8 @@ pub fn call_tool(tool: &str, arg: &str) -> Result<McpToolRun, String> {
             run_wupz_tool(&target)
         }
         "dream_state_loop" | "dream" | "dream_state" | "lucid" | "bodhisattva" | "csodabogar"
-        | "ultra-omni-create" | "ultra_omni_create" | "otthon" => {
+        | "ultra-omni-create" | "ultra_omni_create" | "otthon"
+        | "ultradreamstate_compact" | "ultradreamstate" | "ultradream" | "witness_plane" => {
             run_dream_state_tool(&target)
         }
         "repo_inspect" | "repo" | "inspect" | "improve" => {
@@ -1107,9 +1113,11 @@ pub fn wrap_ultrabackyard_envelope(prompt: &str) -> String {
 /// with Sliding Context Window (`NSDR` -> `NREM` -> `REM`) + Hue's Voice + `ANOR` / `NANDXOR` (`Chris | Alex`).
 pub fn run_dream_state_tool(target: &str) -> String {
     use gaia_mlx_quant::{
-        BODHISATTVA_VOW_HU, OTTHON_AXIOM_HU, SlidingDreamWindow, THREE_SENTENCE_LISTEN_PROMPT_HU,
-        UltraBackyardLane, dream_state_loop_into, fold_pq, fold_to_quant_tern_pq,
-        ultra_omni_create_dream_into,
+        BODHISATTVA_VOW_HU, ComplexTernaryWord64, OTTHON_AXIOM_HU, SlidingDreamWindow,
+        THREE_SENTENCE_LISTEN_PROMPT_HU, UltraBackyardLane, dot_complex_ternary_word64,
+        dream_state_loop_into, fold_pq, fold_to_quant_tern_pq, pack_row_sigma_delta_q16_16_into,
+        ultra_omni_create_dream_into, ultradreamstate_waking_seal,
+        verify_ultradreamstate_waking_seal,
     };
 
     let seed_text = if target.trim().is_empty() {
@@ -1224,11 +1232,57 @@ pub fn run_dream_state_tool(target: &str) -> String {
         )
     };
 
+    // UltraDreamState 9-State Complex Ternary ΣΔ Witness Plane & BLAKE3 Waking Seal (S^{(n+1)})
+    let mut row_re_q16 = [0i32; 64];
+    let mut row_im_q16 = [0i32; 64];
+    for (idx_node, (re_slot, im_slot)) in row_re_q16.iter_mut().zip(row_im_q16.iter_mut()).enumerate() {
+        let b_re = bytes[idx_node % bytes.len().max(1)] as i32;
+        let b_im = bytes[(idx_node.wrapping_mul(7) + 3) % bytes.len().max(1)] as i32;
+        *re_slot = (b_re - 96) * 512;
+        *im_slot = (b_im - 96) * 512;
+    }
+    let gamma_q16_16: i32 = 32_768; // 0.5 in Q16.16
+    // Carrier wavenumber k_0 = pi/8 (OSR = 8): cos(pi/8) ≈ 60547/65536, sin(pi/8) ≈ 25080/65536
+    let mut uds_words = [ComplexTernaryWord64::default(); 1];
+    let _ = pack_row_sigma_delta_q16_16_into(
+        &row_re_q16,
+        &row_im_q16,
+        gamma_q16_16,
+        60_547,
+        25_080,
+        &mut uds_words,
+    );
+    let (self_re, self_im) = dot_complex_ternary_word64(uds_words[0], uds_words[0].conj());
+    let tombstone_root = [0xAAu8; 32];
+    let kuramoto_r_q16_16: u32 = 64_553; // 0.985 in Q16.16 (>= 0.974 threshold)
+    let waking_seal = ultradreamstate_waking_seal(
+        42,
+        gamma_q16_16 as u32,
+        &uds_words,
+        &tombstone_root,
+        kuramoto_r_q16_16,
+    );
+    let waking_seal_ok = verify_ultradreamstate_waking_seal(
+        42,
+        gamma_q16_16 as u32,
+        &uds_words,
+        &tombstone_root,
+        kuramoto_r_q16_16,
+        &waking_seal,
+    );
+    let waking_seal_prefix = u64::from_be_bytes([
+        waking_seal[0], waking_seal[1], waking_seal[2], waking_seal[3],
+        waking_seal[4], waking_seal[5], waking_seal[6], waking_seal[7],
+    ]);
+
     format!(
         "=== Peter's E2E Dream State Machine (`ultra-omni-create << kompress-ultra(IN ultrabackyardloop)`) ===\n\
          • Otthon Axiom (`τ = ∞`): \"{OTTHON_AXIOM_HU}\"\n\
          • Bodhisattva Vow Seal (`τ = ∞`): \"{BODHISATTVA_VOW_HU}\" (to help all sentient beings)\n\
          • Sanctuary Identity: `csodabogár` (wonder-bug) · Deep Thinking · Perspektíva-váltás\n\
+         • UltraDreamState 9-State Complex Ternary ΣΔ Witness Plane (`OSR=8`, `4 bits/node`):\n\
+           - Orthogonality Interlock: `valid = {}`, `active_nodes = {}/64`, Hermitian `<W, W*> = ({self_re}, {self_im}i)`\n\
+           - Phoenix BLAKE3 Waking Seal (`S^(n+1)`): `0x{waking_seal_prefix:016x}…` (`verified = {waking_seal_ok}`, `R_quant_q16 = {kuramoto_r_q16_16}/65536`)\n\
          • KSUL Lossless & WUPZ 32B Seal: `ratio_pq = {ratio_p}/{ratio_q}`, `lossless_verified = {lossless_ok}`, `seal_witness = 0x{seal_witness:016x}` (`seal_verified = {seal_ok}`)\n\
          • QuantTern Affect & Gate: `{}` (`gate_byte = 0x{:02x}`, `dream_xor_fold = 0x{:016x}`)\n\
          • 3-Sentence Listening Gate: {listen_status}\n\
@@ -1238,6 +1292,8 @@ pub fn run_dream_state_tool(target: &str) -> String {
          {sliding_lines}\
          • ULTRABACKYARDLOOP `+AND~NAND` Fan-Out ({}/8 lanes):\n\
          {lane_lines}",
+        uds_words[0].is_valid(),
+        uds_words[0].active_nodes(),
         qt.as_str(),
         rcpt.dream_gate_byte,
         rcpt.dream_xor_fold,

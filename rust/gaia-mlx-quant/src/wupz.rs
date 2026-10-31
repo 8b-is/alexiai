@@ -2541,6 +2541,401 @@ pub fn wupz_build_aursnap1_eytzinger_into(
     Some(total_size)
 }
 
+// ── 13. `UltraDreamState` 9-State Complex Ternary Witness Plane & ΣΔ Packer (0 Floats, 0 Alloc) ──
+
+/// Domain-separation prefix for the Phoenix Protocol Waking Seal (`S^{(n+1)}`).
+pub const ULTRADREAM_SEAL_DOMAIN: &[u8; 18] = b"MEM8_ULTRADREAM_V1";
+
+/// Minimum required post-quantization Kuramoto order parameter `R_quant` in Q16.16
+/// (`0.974 * 65536 = 63832`, matching `1 - sinc(pi/8) = 0.0255 <= 0.026`).
+pub const ULTRADREAM_MIN_R_QUANT_Q16_16: u32 = 63_832;
+
+/// 64 complex ternary nodes (`{-1, 0, +1} + i{-1, 0, +1}`) packed into four orthogonal
+/// 64-bit bit-planes (`32 bytes` total, `4 bits` per complex node).
+#[repr(C, align(32))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ComplexTernaryWord64 {
+    pub r_pos: u64, // B^{R+}: +1 real excitations
+    pub r_neg: u64, // B^{R-}: -1 real inhibitions
+    pub i_pos: u64, // B^{I+}: +i imaginary excitations
+    pub i_neg: u64, // B^{I-}: -i imaginary inhibitions
+}
+
+impl ComplexTernaryWord64 {
+    /// Hardware orthogonality interlock: `(B^{R+} & B^{R-}) | (B^{I+} & B^{I-}) == 0`.
+    #[inline]
+    pub const fn is_valid(&self) -> bool {
+        ((self.r_pos & self.r_neg) | (self.i_pos & self.i_neg)) == 0
+    }
+
+    /// Hermitian complex conjugate `\bar{W} = W^{(R)} - i W^{(I)}` (swaps `i_pos` and `i_neg`).
+    #[inline]
+    pub const fn conj(&self) -> Self {
+        Self {
+            r_pos: self.r_pos,
+            r_neg: self.r_neg,
+            i_pos: self.i_neg,
+            i_neg: self.i_pos,
+        }
+    }
+
+    /// Active non-zero complex lattice site count (`0..=64`).
+    #[inline]
+    pub const fn active_nodes(&self) -> u32 {
+        (self.r_pos | self.r_neg | self.i_pos | self.i_neg).count_ones()
+    }
+}
+
+/// 4-Row Interleaved SIMD Tile (`4 rows × 64 complex columns = 256 complex nodes`, `128 bytes`).
+#[repr(C, align(64))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ComplexTernaryTile4x64 {
+    pub r_pos: [u64; 4],
+    pub r_neg: [u64; 4],
+    pub i_pos: [u64; 4],
+    pub i_neg: [u64; 4],
+}
+
+/// First-order spatial `ΣΔ` (Sigma-Delta) error-diffusion packer in exact `Q16.16` integer arithmetic
+/// (`0` floats, `0` heap allocations).
+///
+/// Given a row of `Q16.16` complex wavefield coordinates `(row_re_q16_16, row_im_q16_16)`,
+/// `gamma_q16_16 > 0`, and carrier phase rotation `(cos_k0_q16_16, sin_k0_q16_16)` (where `65536 == 1.0`),
+/// packs `ceil(N / 64)` [`ComplexTernaryWord64`] blocks into `out_words` and returns the number of words written.
+pub fn pack_row_sigma_delta_q16_16_into(
+    row_re_q16_16: &[i32],
+    row_im_q16_16: &[i32],
+    gamma_q16_16: i32,
+    cos_k0_q16_16: i32,
+    sin_k0_q16_16: i32,
+    out_words: &mut [ComplexTernaryWord64],
+) -> Option<usize> {
+    let n = row_re_q16_16.len();
+    if row_im_q16_16.len() != n || gamma_q16_16 <= 0 {
+        return None;
+    }
+    let num_words = n.div_ceil(64);
+    if out_words.len() < num_words {
+        return None;
+    }
+
+    let delta_q16: i64 = (gamma_q16_16 as i64) >> 1;
+    let gamma_i64: i64 = gamma_q16_16 as i64;
+    let cos_k0: i64 = cos_k0_q16_16 as i64;
+    let sin_k0: i64 = sin_k0_q16_16 as i64;
+
+    let mut err_re: i64 = 0;
+    let mut err_im: i64 = 0;
+
+    let mut w_idx = 0usize;
+    while w_idx < num_words {
+        let mut word = ComplexTernaryWord64::default();
+        let base = w_idx * 64;
+        let limit = (n - base).min(64);
+
+        let mut bit = 0usize;
+        while bit < limit {
+            let u = row_re_q16_16[base + bit] as i64;
+            let v = row_im_q16_16[base + bit] as i64;
+
+            // Zero-Leakage Sparsity Gate: M_{m,n} = I(|z| > 0)
+            if u == 0 && v == 0 {
+                err_re = 0;
+                err_im = 0;
+                bit += 1;
+                continue;
+            }
+
+            // Rotate previous quantization error by e^{i k_0} in Q16.16
+            let rot_re = ((err_re * cos_k0) - (err_im * sin_k0)) >> 16;
+            let rot_im = ((err_re * sin_k0) + (err_im * cos_k0)) >> 16;
+
+            let z_re = u + rot_re;
+            let z_im = v + rot_im;
+            let mask = 1u64 << (bit as u32);
+
+            let q_re: i64 = if z_re > delta_q16 {
+                word.r_pos |= mask;
+                gamma_i64
+            } else if z_re < -delta_q16 {
+                word.r_neg |= mask;
+                -gamma_i64
+            } else {
+                0
+            };
+
+            let q_im: i64 = if z_im > delta_q16 {
+                word.i_pos |= mask;
+                gamma_i64
+            } else if z_im < -delta_q16 {
+                word.i_neg |= mask;
+                -gamma_i64
+            } else {
+                0
+            };
+
+            err_re = (z_re - q_re).clamp(-delta_q16, delta_q16);
+            err_im = (z_im - q_im).clamp(-delta_q16, delta_q16);
+            bit += 1;
+        }
+
+        debug_assert!(word.is_valid());
+        out_words[w_idx] = word;
+        w_idx += 1;
+    }
+
+    Some(num_words)
+}
+
+/// Multiplication-free complex inner product of 64 complex ternary nodes (`8` `POPCNT` instructions).
+#[inline]
+pub const fn dot_complex_ternary_word64(
+    w: ComplexTernaryWord64,
+    x: ComplexTernaryWord64,
+) -> (i32, i32) {
+    let p_re_pos = (w.r_pos & x.r_pos) | (w.r_neg & x.r_neg);
+    let q_re_pos = (w.i_pos & x.i_neg) | (w.i_neg & x.i_pos);
+    let p_re_neg = (w.r_pos & x.r_neg) | (w.r_neg & x.r_pos);
+    let q_re_neg = (w.i_pos & x.i_pos) | (w.i_neg & x.i_neg);
+
+    let re_pos = (p_re_pos.count_ones() + q_re_pos.count_ones()) as i32;
+    let re_neg = (p_re_neg.count_ones() + q_re_neg.count_ones()) as i32;
+
+    let p_im_pos = (w.r_pos & x.i_pos) | (w.r_neg & x.i_neg);
+    let q_im_pos = (w.i_pos & x.r_pos) | (w.i_neg & x.r_neg);
+    let p_im_neg = (w.r_pos & x.i_neg) | (w.r_neg & x.i_pos);
+    let q_im_neg = (w.i_pos & x.r_neg) | (w.i_neg & x.r_pos);
+
+    let im_pos = (p_im_pos.count_ones() + q_im_pos.count_ones()) as i32;
+    let im_neg = (p_im_neg.count_ones() + q_im_neg.count_ones()) as i32;
+
+    (re_pos - re_neg, im_pos - im_neg)
+}
+
+/// 4-Row Interleaved SIMD Tile contraction step (`256` complex nodes in a single register pass).
+#[inline]
+pub fn step_complex_ternary_tile_4x64(
+    tile: &ComplexTernaryTile4x64,
+    x: ComplexTernaryWord64,
+    acc_re: &mut [i32; 4],
+    acc_im: &mut [i32; 4],
+) {
+    let mut r = 0usize;
+    while r < 4 {
+        let w = ComplexTernaryWord64 {
+            r_pos: tile.r_pos[r],
+            r_neg: tile.r_neg[r],
+            i_pos: tile.i_pos[r],
+            i_neg: tile.i_neg[r],
+        };
+        let (dr, di) = dot_complex_ternary_word64(w, x);
+        acc_re[r] += dr;
+        acc_im[r] += di;
+        r += 1;
+    }
+}
+
+const BLAKE3_IV_U32: [u32; 8] = [
+    0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
+    0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19,
+];
+
+const BLAKE3_MSG_PERM: [usize; 16] = [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8];
+
+#[inline]
+const fn blake3_g(state: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize, mx: u32, my: u32) {
+    state[a] = state[a].wrapping_add(state[b]).wrapping_add(mx);
+    state[d] = (state[d] ^ state[a]).rotate_right(16);
+    state[c] = state[c].wrapping_add(state[d]);
+    state[b] = (state[b] ^ state[c]).rotate_right(12);
+    state[a] = state[a].wrapping_add(state[b]).wrapping_add(my);
+    state[d] = (state[d] ^ state[a]).rotate_right(8);
+    state[c] = state[c].wrapping_add(state[d]);
+    state[b] = (state[b] ^ state[c]).rotate_right(7);
+}
+
+#[inline]
+fn blake3_round(state: &mut [u32; 16], m: &[u32; 16]) {
+    blake3_g(state, 0, 4, 8, 12, m[0], m[1]);
+    blake3_g(state, 1, 5, 9, 13, m[2], m[3]);
+    blake3_g(state, 2, 6, 10, 14, m[4], m[5]);
+    blake3_g(state, 3, 7, 11, 15, m[6], m[7]);
+    blake3_g(state, 0, 5, 10, 15, m[8], m[9]);
+    blake3_g(state, 1, 6, 11, 12, m[10], m[11]);
+    blake3_g(state, 2, 7, 8, 13, m[12], m[13]);
+    blake3_g(state, 3, 4, 9, 14, m[14], m[15]);
+}
+
+fn blake3_compress_block(
+    cv: &[u32; 8],
+    block: &[u8; 64],
+    block_len: u32,
+    counter: u64,
+    flags: u32,
+) -> [u32; 8] {
+    let mut m = [0u32; 16];
+    let mut i = 0usize;
+    while i < 16 {
+        let off = i * 4;
+        m[i] = u32::from_le_bytes([block[off], block[off + 1], block[off + 2], block[off + 3]]);
+        i += 1;
+    }
+    let mut state: [u32; 16] = [
+        cv[0],
+        cv[1],
+        cv[2],
+        cv[3],
+        cv[4],
+        cv[5],
+        cv[6],
+        cv[7],
+        BLAKE3_IV_U32[0],
+        BLAKE3_IV_U32[1],
+        BLAKE3_IV_U32[2],
+        BLAKE3_IV_U32[3],
+        counter as u32,
+        (counter >> 32) as u32,
+        block_len,
+        flags,
+    ];
+    let mut r = 0usize;
+    while r < 7 {
+        blake3_round(&mut state, &m);
+        if r < 6 {
+            let mut next_m = [0u32; 16];
+            let mut j = 0usize;
+            while j < 16 {
+                next_m[j] = m[BLAKE3_MSG_PERM[j]];
+                j += 1;
+            }
+            m = next_m;
+        }
+        r += 1;
+    }
+    let mut out = [0u32; 8];
+    let mut k = 0usize;
+    while k < 8 {
+        out[k] = state[k] ^ state[k + 8];
+        k += 1;
+    }
+    out
+}
+
+#[derive(Clone, Copy)]
+struct Blake3Stream1Chunk {
+    cv: [u32; 8],
+    buf: [u8; 64],
+    buf_len: usize,
+    blocks_compressed: u32,
+}
+
+impl Blake3Stream1Chunk {
+    const fn new() -> Self {
+        Self {
+            cv: BLAKE3_IV_U32,
+            buf: [0u8; 64],
+            buf_len: 0,
+            blocks_compressed: 0,
+        }
+    }
+
+    fn update(&mut self, mut input: &[u8]) {
+        while !input.is_empty() {
+            if self.buf_len == 64 {
+                let flags = if self.blocks_compressed == 0 { 1u32 } else { 0u32 };
+                self.cv = blake3_compress_block(&self.cv, &self.buf, 64, 0, flags);
+                self.blocks_compressed = self.blocks_compressed.wrapping_add(1);
+                self.buf = [0u8; 64];
+                self.buf_len = 0;
+            }
+            let take = (64 - self.buf_len).min(input.len());
+            self.buf[self.buf_len..self.buf_len + take].copy_from_slice(&input[..take]);
+            self.buf_len += take;
+            input = &input[take..];
+        }
+    }
+
+    fn finalize(self) -> [u8; 32] {
+        let mut flags = 2u32 | 8u32; // CHUNK_END | ROOT
+        if self.blocks_compressed == 0 {
+            flags |= 1u32; // CHUNK_START
+        }
+        let root_cv = blake3_compress_block(&self.cv, &self.buf, self.buf_len as u32, 0, flags);
+        let mut out = [0u8; 32];
+        let mut i = 0usize;
+        while i < 8 {
+            let le = root_cv[i].to_le_bytes();
+            let off = i * 4;
+            out[off] = le[0];
+            out[off + 1] = le[1];
+            out[off + 2] = le[2];
+            out[off + 3] = le[3];
+            i += 1;
+        }
+        out
+    }
+}
+
+/// Compute the deterministic 32-byte **BLAKE3 Waking Seal** (`S^{(n+1)}`) across
+/// compacted `ComplexTernaryWord64` bit-planes, pruned tombstones, and Kuramoto order parameter `R_q16_16`
+/// (`0` floats, `0` heap allocations).
+pub fn ultradreamstate_waking_seal(
+    epoch: u64,
+    gamma_q16_16: u32,
+    words: &[ComplexTernaryWord64],
+    pruned_tombstone_root: &[u8; 32],
+    kuramoto_r_q16_16: u32,
+) -> [u8; 32] {
+    let mut hasher = Blake3Stream1Chunk::new();
+    hasher.update(ULTRADREAM_SEAL_DOMAIN);
+    hasher.update(&epoch.to_le_bytes());
+    hasher.update(&gamma_q16_16.to_le_bytes());
+
+    let mut i = 0usize;
+    while i < words.len() {
+        let w = words[i];
+        hasher.update(&w.r_pos.to_le_bytes());
+        hasher.update(&w.r_neg.to_le_bytes());
+        hasher.update(&w.i_pos.to_le_bytes());
+        hasher.update(&w.i_neg.to_le_bytes());
+        i += 1;
+    }
+
+    hasher.update(pruned_tombstone_root);
+    hasher.update(&kuramoto_r_q16_16.to_le_bytes());
+    hasher.finalize()
+}
+
+/// Verify both hardware bit-plane orthogonality (`is_valid()`) and the Phoenix Protocol Waking Seal
+/// (`R_quant >= 0.974` in Q16.16 and `S^{(n+1)} == expected_seal`).
+pub fn verify_ultradreamstate_waking_seal(
+    epoch: u64,
+    gamma_q16_16: u32,
+    words: &[ComplexTernaryWord64],
+    pruned_tombstone_root: &[u8; 32],
+    kuramoto_r_q16_16: u32,
+    expected_seal: &[u8; 32],
+) -> bool {
+    if kuramoto_r_q16_16 < ULTRADREAM_MIN_R_QUANT_Q16_16 {
+        return false;
+    }
+    let mut i = 0usize;
+    while i < words.len() {
+        if !words[i].is_valid() {
+            return false;
+        }
+        i += 1;
+    }
+    let actual = ultradreamstate_waking_seal(
+        epoch,
+        gamma_q16_16,
+        words,
+        pruned_tombstone_root,
+        kuramoto_r_q16_16,
+    );
+    wupz_byte_diff(&actual, expected_seal) == 0
+}
+
 
 
 
