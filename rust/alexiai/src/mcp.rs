@@ -155,6 +155,16 @@ pub const TOOLS: &[McpToolDescriptor] = &[
         provider: "gaia-mlx-quant::mlx::RationalWaveCell (16B p/q DDS Wave Shader · 4.0 structs/64B)",
         description: "1,000,000-cell (16.0 MB) 16-byte RationalWaveCell & 24-byte WaveMemoryCell 3-stage ALU-only DDS associative shader benchmark",
     },
+    McpToolDescriptor {
+        name: "vision_inspect",
+        provider: "ollama::qwen3.8:27b (127.0.0.1:11434) × s3://whatsapp-sovereign-archive",
+        description: "Loopback multimodal vision OCR & diagram/clipping analysis on WhatsApp S3 images and local media",
+    },
+    McpToolDescriptor {
+        name: "ultrafoldpop_8b_audit",
+        provider: "8b-is/securaye × 8b-is/aurora × 8b-is/alexiai (303 repos)",
+        description: "UltraFoldPOP 6-stage cyberdefense orchestrator (JPCERT/CC EN/JA advisories) & 8b-is 303-repo README/chore cleanup auditor",
+    },
 ];
 
 pub fn find_binary(name: &str) -> Option<String> {
@@ -436,6 +446,12 @@ pub fn call_tool(tool: &str, arg: &str) -> Result<McpToolRun, String> {
         | "rational_wave"
         | "wave_shader" => {
             run_rational_wave_shader_bench_tool(&target)
+        }
+        "vision_inspect" | "vision" | "image" => {
+            run_vision_inspect_tool(&target)
+        }
+        "ultrafoldpop_8b_audit" | "ultrafoldpop" | "cleanup" | "8b_audit" => {
+            run_ultrafoldpop_8b_audit_tool(&target)
         }
         "mcp_status" | "status" | "tools" => {
             let st = status();
@@ -1842,7 +1858,33 @@ fn plan_ground_tasks(segment: &str, tasks: &mut Vec<(String, String)>) {
         push_unique_task(tasks, "memory_ledger", "");
     }
 
-    // 14. General MCP / tools inquiry or diagnostic test
+    // 14. Multimodal Vision / Image OCR (`qwen3.8:27b` + S3 WhatsApp media archive)
+    if lower.contains("[🖼️")
+        || lower.contains("image/jpeg")
+        || lower.contains("image/png")
+        || lower.contains("image/vision")
+        || lower.contains("vision model")
+        || lower.contains("japan times")
+    {
+        push_unique_task(tasks, "vision_inspect", trimmed);
+    }
+
+    // 15. UltraFoldPOP Cyberdefense / 8b-is Organization Repo & README Chore Cleanup / Aurora & AlexiAI
+    if lower.contains("ultrafoldpop")
+        || lower.contains("jpcert")
+        || lower.contains("cleanup")
+        || lower.contains("clean up")
+        || lower.contains("chore")
+        || lower.contains("readme")
+        || lower.contains("8b-is")
+        || lower.contains("aurora")
+        || lower.contains("alexai")
+        || lower.contains("alexiai")
+    {
+        push_unique_task(tasks, "ultrafoldpop_8b_audit", trimmed);
+    }
+
+    // 16. General MCP / tools inquiry or diagnostic test
     if (lower.contains("mcp") || lower.contains("tools") || lower.contains("tool "))
         && tasks.len() == initial_len
     {
@@ -2412,6 +2454,80 @@ pub fn run_rational_wave_shader_bench_tool(target: &str) -> String {
            2. Stage 2 (Semantic & Morphological Mask): 14-bit `shape` (`8-bit shape_id + signed 6-bit mag_octave`) + `RGB565` Manhattan tolerance\n\
            3. Stage 3 (DDS Wave Coherence + RGB565 Additive Blending): 4096-entry compile-time `DDS_SINE_LUT_I16` (`[-32767, 32767]`, 0 floats) + `p/q` amplitude & octave shift + FNV-1a 64-bit state digest\n\n\
          Live Measured Benchmark (`{cells}` cells):\n```json\n{json}\n```"
+    )
+}
+
+pub fn run_vision_inspect_tool(target: &str) -> String {
+    let script = r#"
+import base64, json, pathlib, urllib.request
+
+s3_root = pathlib.Path("/data/s3/whatsapp-sovereign-archive")
+imgs = sorted(
+    [p for p in s3_root.rglob("*.jpg") if p.is_file()],
+    key=lambda p: p.stat().st_mtime,
+    reverse=True,
+)[:3]
+out_lines = [
+    "=== Sovereign Multimodal Vision Pipeline (`qwen3.8:27b` on `127.0.0.1:11434` × `s3://whatsapp-sovereign-archive`) ===",
+    f"Recent archived WhatsApp images found: {len(imgs)}",
+]
+for p in imgs:
+    meta_p = p.with_suffix(p.suffix + ".meta.json")
+    meta = {}
+    if meta_p.is_file():
+        try:
+            meta = json.loads(meta_p.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    out_lines.append(f"- Image: `{p}` (`{p.stat().st_size}` bytes, sender=`{meta.get('sender', 'peterlodri')}`)")
+if imgs:
+    b64 = base64.b64encode(imgs[0].read_bytes()).decode("ascii")
+    payload = json.dumps({
+        "model": "qwen3.8:27b",
+        "messages": [{"role": "user", "content": "Transcribe headline and highlighted text concisely.", "images": [b64]}],
+        "think": False,
+        "stream": False,
+    }).encode("utf-8")
+    req = urllib.request.Request("http://127.0.0.1:11434/api/chat", data=payload, headers={"Content-Type": "application/json"})
+    try:
+        resp = json.loads(urllib.request.urlopen(req, timeout=20).read())
+        vtxt = resp.get("message", {}).get("content", "").strip()
+        out_lines.append(f"Live `qwen3.8:27b` Vision OCR on `{imgs[0].name}`:\n{vtxt}")
+    except Exception as e:
+        out_lines.append(f"Vision fallback note: {e}")
+print("\n".join(out_lines))
+"#;
+    let _ = target;
+    run_cmd("python3", &["-c", script], WORKSPACE_ROOT)
+        .unwrap_or_else(|e| format!("vision_inspect fallback: {e}"))
+}
+
+pub fn run_ultrafoldpop_8b_audit_tool(target: &str) -> String {
+    let _ = target;
+    let ufp = run_cmd(
+        "python3",
+        &["-m", "sec_audit.ultrafoldpop_orchestrator", "--self-test"],
+        "/data/8b-is/securaye",
+    )
+    .unwrap_or_else(|e| format!("ultrafoldpop error: {e}"));
+
+    let repo_audit = run_cmd(
+        "python3",
+        &[
+            "-c",
+            "import pathlib; root=pathlib.Path('/data/8b-is'); repos=[p for p in sorted(root.iterdir()) if (p/'.git').exists()]; with_readme=[p.name for p in repos if (p/'README.md').is_file()]; missing=[p.name for p in repos if not (p/'README.md').is_file()]; print(f'Total /data/8b-is git repos: {len(repos)} | With README.md: {len(with_readme)} | Missing README.md ({len(missing)}): {missing[:15]}')",
+        ],
+        "/data/8b-is",
+    )
+    .unwrap_or_default();
+
+    format!(
+        "=== 8b-is Organization Audit (`aurora`, `alexiai`, `securaye`) + Project UltraFoldPOP (Agents 00..06) ===\n\
+         • `8b-is/aurora` (`/data/8b-is/aurora`): Sovereign 10-crate Rust workspace (`aurora-core`, `aurora-infer`, `aurora-mem8`, `aurora-dharma-quantum`, `aurora-phoenix`, `aurora-voice-shell`, `aurora-consolidation`, `aurora-storage`, `aurora-dyad`, `aurora-cli`)\n\
+         • `8b-is/alexiai` (`/data/8b-is/alexiai`): Pure-Rust Sovereign Partner & MCP Bridge (`rust/alexiai`, `gaia-mlx-quant`, `qwen3.8:27b` vision_inspect + `ultrafoldpop_8b_audit`)\n\
+         • `8b-is/securaye` (`/data/8b-is/securaye/sec_audit`): Project UltraFoldPOP 6-stage supply-chain & 3-pass call-graph folding engine + bilingual (EN/JA) JPCERT/CC & IPA early-warning generator\n\
+         • Organization Repo & README Audit: {repo_audit}\n\n\
+         UltraFoldPOP Live E2E Self-Test Output:\n{ufp}"
     )
 }
 
