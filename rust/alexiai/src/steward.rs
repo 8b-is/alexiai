@@ -1648,6 +1648,13 @@ mod tests {
 
     #[test]
     fn smart_tree_edit_insert_replace_delete_get_functions_and_batch_rustc_verified() {
+        let daemon_addr: std::net::SocketAddr = "127.0.0.1:28428".parse().expect("addr");
+        if std::net::TcpStream::connect_timeout(&daemon_addr, std::time::Duration::from_millis(200))
+            .is_err()
+        {
+            eprintln!("skipping live Smart Tree HTTP daemon test (127.0.0.1:28428 not listening)");
+            return;
+        }
         let tmp_dir = std::env::temp_dir().join(format!(
             "alexiai_st_full_matrix_{}",
             std::process::id()
