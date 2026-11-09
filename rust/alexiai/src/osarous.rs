@@ -309,15 +309,10 @@ impl Osarous {
 
     /// Reconcile & share optimal models across reachable loopback mesh nodes (`:11434` Local,
     /// `:11436` cheet.is RTX 6000 Ada, `:11435` MacBook). Safe when severed (skips unreachable peers).
+    /// Compact/PQM models (`gemma4:latest`, `aye-deepseek-pqm:latest`, `st-deepseek-pqm:latest`) are
+    /// replicated onto local `:11434` (8GB RTX 4070 VRAM), while heavy 26B-35B models stay on
+    /// high-VRAM peers (`:11436` / `:11435`).
     pub fn sync_mesh_models(&self) -> Vec<String> {
-        let optimal_shared = [
-            "aye-deepseek-pqm:latest",
-            "st-deepseek-pqm:latest",
-            "gemma4:latest",
-            "gemma4:26b",
-            "qwen3.6:35b",
-            "aye-deepseek:32b",
-        ];
         let mut report = Vec::new();
         let mut node_catalogs: Vec<(String, Vec<String>)> = Vec::new();
         for ep in [OLLAMA_BASE_URL, OLLAMA_CHEET_BRIDGE_URL, OLLAMA_MACBOOK_BRIDGE_URL] {
@@ -332,22 +327,54 @@ impl Osarous {
                 }
             }
         }
-        for model in optimal_shared {
-            let holders: Vec<&str> = node_catalogs
+        let compact_shared = [
+            "gemma4:latest",
+            "aye-deepseek-pqm:latest",
+            "st-deepseek-pqm:latest",
+        ];
+        for model in compact_shared {
+            let holder = node_catalogs
                 .iter()
-                .filter(|(_, ids)| ids.iter().any(|id| id == model))
-                .map(|(ep, _)| ep.as_str())
-                .collect();
-            if holders.is_empty() {
+                .find(|(_, ids)| ids.iter().any(|id| id == model))
+                .map(|(ep, _)| ep.clone());
+            let Some(source_ep) = holder else {
                 continue;
-            }
+            };
             for (ep, ids) in &node_catalogs {
-                if !ids.iter().any(|id| id == model) {
+                if ids.iter().any(|id| id == model) {
+                    continue;
+                }
+                // First try direct registry/peer pull for base models like gemma4:latest
+                if !model.contains("-pqm") {
                     let pull_body = format!(r#"{{"name":"{}","stream":false}}"#, model);
-                    let status = transport::request(&format!("{ep}/api/pull"), "POST", Some(&pull_body))
+                    if let Ok(r) = transport::request(&format!("{ep}/api/pull"), "POST", Some(&pull_body))
+                        && r.status == 200
+                    {
+                        report.push(format!("shared {model} -> {ep} (pulled HTTP 200)"));
+                        continue;
+                    }
+                }
+                // Replicate custom sovereign persona (`aye-deepseek-pqm`, `st-deepseek-pqm`) from peer `/api/show` -> `/api/create`
+                let show_body = format!(r#"{{"name":"{}"}}"#, model);
+                if let Ok(show_resp) = transport::request(&format!("{source_ep}/api/show"), "POST", Some(&show_body))
+                    && show_resp.status == 200
+                    && let Ok(show_json) = serde_json_lite::parse_json(&show_resp.body_utf8())
+                {
+                    let system_prompt = show_json
+                        .get("system")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("You are Aye, the 8b-is Sovereign Intelligence.");
+                    let create_body = format!(
+                        r#"{{"model":"{}","from":"gemma4:latest","system":{},"stream":false}}"#,
+                        model,
+                        json_escape(system_prompt)
+                    );
+                    let status = transport::request(&format!("{ep}/api/create"), "POST", Some(&create_body))
                         .map(|r| format!("HTTP {}", r.status))
                         .unwrap_or_else(|e| e);
-                    report.push(format!("shared {model} -> {ep} ({status})"));
+                    report.push(format!(
+                        "replicated sovereign persona {model} ({source_ep} -> {ep} on gemma4:latest · {status})"
+                    ));
                 }
             }
         }
