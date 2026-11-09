@@ -84,26 +84,88 @@ impl Osarous {
 
     pub fn health_with_latency(&self) -> (bool, String, u64) {
         let t0 = std::time::Instant::now();
-        match transport::request(&format!("{}/health", self.base_url), "GET", None) {
-            Ok(resp) if resp.status == 200 => (
-                true,
-                format!("HTTP {}", resp.status),
-                t0.elapsed().as_millis() as u64,
-            ),
-            Ok(resp) => match transport::request(&format!("{}/v1/models", self.base_url), "GET", None) {
-                Ok(mresp) if mresp.status == 200 => (
-                    true,
-                    format!("HTTP {}", mresp.status),
-                    t0.elapsed().as_millis() as u64,
-                ),
-                _ => (
-                    false,
-                    format!("HTTP {}", resp.status),
-                    t0.elapsed().as_millis() as u64,
-                ),
-            },
-            Err(e) => (false, e, t0.elapsed().as_millis() as u64),
+        for candidate in self.mesh_endpoints() {
+            if let Ok(resp) = transport::request(&format!("{candidate}/health"), "GET", None)
+                && resp.status == 200
+            {
+                let note = if candidate == self.base_url {
+                    format!("HTTP {}", resp.status)
+                } else {
+                    format!("HTTP {} (failover {candidate})", resp.status)
+                };
+                return (true, note, t0.elapsed().as_millis() as u64);
+            }
+            if let Ok(mresp) = transport::request(&format!("{candidate}/v1/models"), "GET", None)
+                && mresp.status == 200
+            {
+                let note = if candidate == self.base_url {
+                    format!("HTTP {}", mresp.status)
+                } else {
+                    format!("HTTP {} (failover {candidate})", mresp.status)
+                };
+                return (true, note, t0.elapsed().as_millis() as u64);
+            }
         }
+        (false, "all loopback mesh endpoints unreachable".to_string(), t0.elapsed().as_millis() as u64)
+    }
+
+    /// Ordered loopback mesh endpoints: primary `base_url`, `cheet.is` A6000 bridge (`:11436`),
+    /// MacBook bridge (`:11435`), and local Ollama (`:11434`).
+    pub fn mesh_endpoints(&self) -> Vec<String> {
+        let mut out = vec![self.base_url.clone()];
+        for ep in [OLLAMA_CHEET_BRIDGE_URL, OLLAMA_MACBOOK_BRIDGE_URL, OLLAMA_BASE_URL] {
+            if !out.iter().any(|x| x == ep) {
+                out.push(ep.to_string());
+            }
+        }
+        out
+    }
+
+    /// True if `model` is a heavy 24B-35B model that prefers 48GB VRAM on `cheet.is` (`:11436`)
+    /// when connected, while compact/PQM models fit directly inside the laptop's 8GB RTX 4070 (`:11434`).
+    fn is_heavy_vram_model(model: &str) -> bool {
+        matches!(
+            model,
+            "qwen3.6:35b"
+                | "aye-qwen36:35b-16k"
+                | "aye-deepseek:32b"
+                | "cheet-deepseek:32b"
+                | "deepseek-r1:32b"
+                | "granite4.2:30b"
+                | "qwen3.8:27b"
+                | "gemma4:26b"
+                | "aye-gemma4:26b-16k"
+                | "devstral:24b"
+        )
+    }
+
+    /// Pick the best fast model installed on local `OLLAMA_BASE_URL` (`127.0.0.1:11434`) when
+    /// a remote bridge (`:11436` / `:11435`) is severed.
+    pub fn resolve_local_fallback_model(&self, requested: &str) -> String {
+        if let Ok(local) = Self::fetch_models_from(OLLAMA_BASE_URL) {
+            if !Self::is_heavy_vram_model(requested)
+                && local.iter().any(|m| m.id == requested)
+            {
+                return requested.to_string();
+            }
+            for fast_local in [
+                "aye-deepseek-pqm:latest",
+                "st-deepseek-pqm:latest",
+                "gemma4:latest",
+                "cheet-deepseek-v2:16b",
+                "deepseek-v2:16b",
+                "gemma4:26b",
+                "aye-deepseek:32b",
+            ] {
+                if let Some(found) = local.iter().find(|m| m.id == fast_local) {
+                    return found.id.clone();
+                }
+            }
+            if let Some(first) = local.first() {
+                return first.id.clone();
+            }
+        }
+        requested.to_string()
     }
 
     pub fn resolve_model(&self, preferred: Option<&str>) -> String {
@@ -115,18 +177,37 @@ impl Osarous {
         {
             return m.to_string();
         }
+        let cheet_up = Self::fetch_models_from(OLLAMA_CHEET_BRIDGE_URL).is_ok();
         let catalog = self.models().unwrap_or_default();
-        // Prefer our fine-tuned Aye & cheet.is RTX 6000 Ada models when available
-        for fav in [
-            "aye-gemma4:26b-16k",
-            "aye-qwen36:35b-16k",
-            "gemma4:26b",
-            "qwen3.6:35b",
-            "aye-deepseek:32b",
-            "cheet-deepseek:32b",
-            "gemma:latest",
-        ] {
-            if let Some(found) = catalog.iter().find(|m| m.id == fav) {
+        // When cheet.is RTX 6000 Ada (48GB VRAM) is reachable, prefer flagship 26B-35B models;
+        // when severed/offline, prefer local RTX 4070 PQM/compact models for instant response.
+        let priority: &[&str] = if cheet_up {
+            &[
+                "aye-gemma4:26b-16k",
+                "aye-qwen36:35b-16k",
+                "gemma4:26b",
+                "qwen3.6:35b",
+                "aye-deepseek:32b",
+                "cheet-deepseek:32b",
+                "aye-deepseek-pqm:latest",
+                "st-deepseek-pqm:latest",
+                "gemma4:latest",
+                "gemma:latest",
+            ]
+        } else {
+            &[
+                "aye-deepseek-pqm:latest",
+                "st-deepseek-pqm:latest",
+                "gemma4:latest",
+                "cheet-deepseek-v2:16b",
+                "deepseek-v2:16b",
+                "gemma4:26b",
+                "aye-deepseek:32b",
+                "gemma:latest",
+            ]
+        };
+        for fav in priority {
+            if let Some(found) = catalog.iter().find(|m| m.id == *fav) {
                 return found.id.clone();
             }
         }
@@ -159,67 +240,62 @@ impl Osarous {
     }
 
     /// Resolve which loopback endpoint (`127.0.0.1:11436` cheet.is bridge, `127.0.0.1:11435` MacBook bridge,
-    /// or `self.base_url`) hosts `model`. Strictly loopback-validated.
+    /// or `127.0.0.1:11434` local Ollama) should execute `model`.
+    /// Heavy 24B-35B models prefer `:11436` (48GB VRAM); compact/PQM models prefer `:11434` (local low-latency)
+    /// when `base_url` is local, and all models fall back to `:11434` if remote bridges are severed.
     pub fn endpoint_for_model(&self, model: &str) -> String {
-        if (self.base_url == OLLAMA_BASE_URL || self.base_url == DEFAULT_BASE_URL || self.base_url == OLLAMA_CHEET_BRIDGE_URL)
-            && let Ok(cheet) = Self::fetch_models_from(OLLAMA_CHEET_BRIDGE_URL)
+        if !Self::is_heavy_vram_model(model)
+            && let Ok(local) = Self::fetch_models_from(OLLAMA_BASE_URL)
+            && local.iter().any(|m| m.id == model)
+        {
+            return OLLAMA_BASE_URL.to_string();
+        }
+        if let Ok(cheet) = Self::fetch_models_from(OLLAMA_CHEET_BRIDGE_URL)
             && cheet.iter().any(|m| m.id == model)
         {
             return OLLAMA_CHEET_BRIDGE_URL.to_string();
+        }
+        if let Ok(bridged) = Self::fetch_models_from(OLLAMA_MACBOOK_BRIDGE_URL)
+            && bridged.iter().any(|m| m.id == model)
+        {
+            return OLLAMA_MACBOOK_BRIDGE_URL.to_string();
+        }
+        if let Ok(local) = Self::fetch_models_from(OLLAMA_BASE_URL)
+            && local.iter().any(|m| m.id == model)
+        {
+            return OLLAMA_BASE_URL.to_string();
         }
         if let Ok(primary) = Self::fetch_models_from(&self.base_url)
             && primary.iter().any(|m| m.id == model)
         {
             return self.base_url.clone();
         }
-        if (self.base_url == OLLAMA_BASE_URL || self.base_url == DEFAULT_BASE_URL)
-            && let Ok(bridged) = Self::fetch_models_from(OLLAMA_MACBOOK_BRIDGE_URL)
-            && bridged.iter().any(|m| m.id == model)
-        {
-            return OLLAMA_MACBOOK_BRIDGE_URL.to_string();
-        }
-        self.base_url.clone()
+        OLLAMA_BASE_URL.to_string()
     }
 
     pub fn models(&self) -> Result<Vec<CatalogModel>, String> {
         let mut models = Vec::new();
-        if (self.base_url == OLLAMA_BASE_URL || self.base_url == DEFAULT_BASE_URL || self.base_url == OLLAMA_CHEET_BRIDGE_URL)
-            && let Ok(cheet) = Self::fetch_models_from(OLLAMA_CHEET_BRIDGE_URL)
-        {
-            for cm in cheet {
-                if !models.iter().any(|m: &CatalogModel| m.id == cm.id) {
-                    models.push(cm);
-                }
-            }
-        }
-        if (self.base_url == OLLAMA_BASE_URL || self.base_url == DEFAULT_BASE_URL)
-            && let Ok(bridged) = Self::fetch_models_from(OLLAMA_MACBOOK_BRIDGE_URL)
-        {
-            for bm in bridged {
-                if !models.iter().any(|m: &CatalogModel| m.id == bm.id) {
-                    models.push(bm);
-                }
-            }
-        }
-        if let Ok(local) = Self::fetch_models_from(&self.base_url) {
-            for lm in local {
-                if !models.iter().any(|m: &CatalogModel| m.id == lm.id) {
-                    models.push(lm);
+        for ep in self.mesh_endpoints() {
+            if let Ok(list) = Self::fetch_models_from(&ep) {
+                for item in list {
+                    if !models.iter().any(|m: &CatalogModel| m.id == item.id) {
+                        models.push(item);
+                    }
                 }
             }
         }
         models.sort_by_key(|m| match m.id.as_str() {
-            "aye-gemma4:26b-16k" => 0,
-            "aye-qwen36:35b-16k" => 1,
-            "gemma4:26b" => 2,
-            "qwen3.6:35b" => 3,
-            "aye-deepseek:32b" => 4,
-            "cheet-deepseek:32b" => 5,
-            _ => 6,
+            "aye-deepseek-pqm:latest" => 0,
+            "st-deepseek-pqm:latest" => 1,
+            "gemma4:latest" => 2,
+            "aye-gemma4:26b-16k" => 3,
+            "aye-qwen36:35b-16k" => 4,
+            "gemma4:26b" => 5,
+            "qwen3.6:35b" => 6,
+            "aye-deepseek:32b" => 7,
+            "cheet-deepseek:32b" => 8,
+            _ => 9,
         });
-        if models.is_empty() && self.base_url != OLLAMA_BASE_URL && self.base_url != DEFAULT_BASE_URL {
-            return Self::fetch_models_from(&self.base_url);
-        }
         Ok(if models.is_empty() {
             vec![CatalogModel {
                 id: "local-model".to_string(),
@@ -229,6 +305,53 @@ impl Osarous {
         } else {
             models
         })
+    }
+
+    /// Reconcile & share optimal models across reachable loopback mesh nodes (`:11434` Local,
+    /// `:11436` cheet.is RTX 6000 Ada, `:11435` MacBook). Safe when severed (skips unreachable peers).
+    pub fn sync_mesh_models(&self) -> Vec<String> {
+        let optimal_shared = [
+            "aye-deepseek-pqm:latest",
+            "st-deepseek-pqm:latest",
+            "gemma4:latest",
+            "gemma4:26b",
+            "qwen3.6:35b",
+            "aye-deepseek:32b",
+        ];
+        let mut report = Vec::new();
+        let mut node_catalogs: Vec<(String, Vec<String>)> = Vec::new();
+        for ep in [OLLAMA_BASE_URL, OLLAMA_CHEET_BRIDGE_URL, OLLAMA_MACBOOK_BRIDGE_URL] {
+            match Self::fetch_models_from(ep) {
+                Ok(list) => {
+                    let ids: Vec<String> = list.into_iter().map(|m| m.id).collect();
+                    report.push(format!("node {ep}: online ({} models)", ids.len()));
+                    node_catalogs.push((ep.to_string(), ids));
+                }
+                Err(_) => {
+                    report.push(format!("node {ep}: severed/offline (autonomous fallback active)"));
+                }
+            }
+        }
+        for model in optimal_shared {
+            let holders: Vec<&str> = node_catalogs
+                .iter()
+                .filter(|(_, ids)| ids.iter().any(|id| id == model))
+                .map(|(ep, _)| ep.as_str())
+                .collect();
+            if holders.is_empty() {
+                continue;
+            }
+            for (ep, ids) in &node_catalogs {
+                if !ids.iter().any(|id| id == model) {
+                    let pull_body = format!(r#"{{"name":"{}","stream":false}}"#, model);
+                    let status = transport::request(&format!("{ep}/api/pull"), "POST", Some(&pull_body))
+                        .map(|r| format!("HTTP {}", r.status))
+                        .unwrap_or_else(|e| e);
+                    report.push(format!("shared {model} -> {ep} ({status})"));
+                }
+            }
+        }
+        report
     }
 
     /// Build the OpenAI-compatible request body.
@@ -272,11 +395,24 @@ impl Osarous {
     ) -> Result<(String, String, String), String> {
         let body = self.build_body(model, messages, false, sampling);
         let endpoint = self.endpoint_for_model(model);
-        let resp = transport::request(
+        let resp = match transport::request(
             &format!("{endpoint}/v1/chat/completions"),
             "POST",
             Some(&body),
-        )?;
+        ) {
+            Ok(r) if r.status == 200 => r,
+            _ if endpoint != OLLAMA_BASE_URL => {
+                let fallback_model = self.resolve_local_fallback_model(model);
+                let fallback_body = self.build_body(&fallback_model, messages, false, sampling);
+                transport::request(
+                    &format!("{OLLAMA_BASE_URL}/v1/chat/completions"),
+                    "POST",
+                    Some(&fallback_body),
+                )?
+            }
+            Ok(r) => r,
+            Err(e) => return Err(e),
+        };
         if resp.status != 200 {
             return Err(format!("HTTP {}: {}", resp.status, resp.body_utf8().chars().take(200).collect::<String>()));
         }
@@ -313,7 +449,17 @@ impl Osarous {
         let body = self.build_body(model, messages, true, sampling);
         let endpoint = self.endpoint_for_model(model);
         let url = format!("{endpoint}/v1/chat/completions");
-        Ok(transport::sse(&url, "POST", Some(&body))?.map(|frame| -> Result<(String, String), String> {
+        let sse_iter = match transport::sse(&url, "POST", Some(&body)) {
+            Ok(it) => it,
+            Err(_) if endpoint != OLLAMA_BASE_URL => {
+                let fallback_model = self.resolve_local_fallback_model(model);
+                let fallback_body = self.build_body(&fallback_model, messages, true, sampling);
+                let fallback_url = format!("{OLLAMA_BASE_URL}/v1/chat/completions");
+                transport::sse(&fallback_url, "POST", Some(&fallback_body))?
+            }
+            Err(e) => return Err(e),
+        };
+        Ok(sse_iter.map(|frame| -> Result<(String, String), String> {
             let frame: SseEvent = frame?;
             if frame.event == "error" {
                 return Err(frame.data);

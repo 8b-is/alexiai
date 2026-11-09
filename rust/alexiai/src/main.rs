@@ -147,9 +147,16 @@ fn cmd_doctor(rest: &[String]) -> Result<(), String> {
 
 fn cmd_models(rest: &[String]) -> Result<(), String> {
     let adapter = osarous::Osarous::new(&endpoint(rest))?;
+    if rest.iter().any(|a| a == "--sync") {
+        println!("\n  mesh model federation & offline-resilience check");
+        for line in adapter.sync_mesh_models() {
+            println!("    {line}");
+        }
+    }
     println!("\n  {}", adapter.base_url);
     for m in adapter.models()? {
-        println!("\n  {}  {} ctx", m.id, m.context_window);
+        let routed = adapter.endpoint_for_model(&m.id);
+        println!("\n  {:<28}  {} ctx  ->  {}", m.id, m.context_window, routed);
     }
     println!();
     Ok(())
