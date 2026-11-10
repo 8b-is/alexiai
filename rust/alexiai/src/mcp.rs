@@ -538,6 +538,9 @@ pub fn run_st_smart_edit_mcp(arguments_json: &str) -> Result<String, String> {
         .find(|l| l.contains("\"id\":2") || l.contains("\"result\""))
         .unwrap_or_else(|| stdout_str.trim());
 
+    if last_line.contains("\"error\"") {
+        return Err(truncate_output(last_line, 512));
+    }
     if let Ok(val) = parse_json(last_line)
         && let Some(res) = val.get("result")
         && let Some(arr) = res.get("content").and_then(|c| c.as_array())
